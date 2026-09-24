@@ -42,7 +42,7 @@ from urllib.parse import urlsplit
 
 from playwright.async_api import Frame
 
-from config import MAX_ELEMENTS
+from config import FINISH_DENY_SUBSTRINGS, MAX_ELEMENTS
 from models import ElementKind, FolderState, PageState, ParsedElement, normalize_text
 
 logger = logging.getLogger("twork.dom_parser")
@@ -1074,13 +1074,27 @@ class DomParser:
 # Представление для LLM
 # ---------------------------------------------------------------------------
 
+def is_denied_button(el: ParsedElement) -> bool:
+    """Кнопка из стоп-списка FINISH_DENY_SUBSTRINGS («Завершить смену», «Выйти» …):
+    LLM её не видит, агент её не нажимает. Строки дерева (OPTION/FOLDER) не затрагиваются —
+    категория «Выходная обувь» остаётся доступной."""
+    if el.kind not in (ElementKind.BUTTON, ElementKind.OTHER):
+        return False
+    label = normalize_text(el.text)
+    return any(deny in label for deny in FINISH_DENY_SUBSTRINGS)
+
+
 def select_for_prompt(
     elements: list[ParsedElement], limit: int = MAX_ELEMENTS,
 ) -> tuple[list[ParsedElement], int]:
     """Выбрать элементы для промпта. В v2 обрезка шла по порядку документа,
     и при большом раскрытом дереве из списка пропадала кнопка «Завершить».
-    Теперь кнопки/поля/выбранные/папки сохраняются всегда."""
-    visible = [e for e in elements if not (e.is_disabled and e.kind == ElementKind.OTHER)]
+    Теперь кнопки/поля/выбранные/папки сохраняются всегда, а кнопки из
+    стоп-списка не показываются вовсе."""
+    visible = [
+        e for e in elements
+        if not (e.is_disabled and e.kind == ElementKind.OTHER) and not is_denied_button(e)
+    ]
     if len(visible) <= limit:
         return visible, 0
 

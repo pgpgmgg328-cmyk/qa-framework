@@ -40,7 +40,7 @@ from config import (
     START_BUTTON_TEXTS,
     SUBMIT_WAIT,
 )
-from dom_parser import DomParser
+from dom_parser import DomParser, is_denied_button
 from models import (
     FLAG_DISABLED,
     FLAG_IN_DIALOG,
@@ -340,6 +340,9 @@ class Agent:
         kinds = _ACTION_KINDS[action]
         fallback = _FALLBACK_KINDS.get(action, set())
         by_index = state.by_index(decision.target_index)
+        if by_index is not None and is_denied_button(by_index):
+            logger.warning("LLM указала кнопку из стоп-списка «%s» — игнорирую", by_index.label())
+            by_index = None
         text = _clean_target_text(decision.target_text or "")
 
         # 1. Индекс и текст согласованы
@@ -353,7 +356,7 @@ class Agent:
             for allowed in (kinds, fallback):
                 scored = [
                     (_similarity(e.text or e.placeholder, text), e)
-                    for e in state.elements if e.kind in allowed
+                    for e in state.elements if e.kind in allowed and not is_denied_button(e)
                 ]
                 good = [(s, e) for s, e in scored if s >= _MATCH_THRESHOLD]
                 if not good:
@@ -438,6 +441,9 @@ class Agent:
             return
         mem.invalid_targets = 0
 
+        if is_denied_button(target):
+            mem.add(action, target, result="⛔ кнопка из стоп-списка — агент её не нажимает")
+            return
         if target.is_disabled:
             mem.add(action, target, result="✗ элемент неактивен — нажать нельзя")
             mem.mark_no_effect(action, target.key)
@@ -601,7 +607,8 @@ class Agent:
         «Чтобы приступить…» нажимались бесконечно, LLM не получала управления.
         """
         enabled_buttons = [
-            e for e in state.elements if e.kind == ElementKind.BUTTON and not e.is_disabled and not e.occluded
+            e for e in state.elements
+            if e.kind == ElementKind.BUTTON and not e.is_disabled and not e.occluded and not is_denied_button(e)
         ]
         dialog_buttons = [b for b in enabled_buttons if b.container == "dialog"]
         working = [

@@ -258,3 +258,35 @@ def test_selected_checkbox_can_be_unchecked_but_radio_is_protected():
         decision = LLMDecision(reasoning="", action="click", target_index=idx, target_text=text)
         run(agent._execute(None, decision, agent._resolve_target(decision, state), state))
     assert agent._browser.clicks == [("Чекбокс", False)]
+
+
+# --------------------------------------------------------------------- стоп-список кнопок
+
+def test_deny_list_buttons_are_hidden_and_never_resolved():
+    state = page(
+        el(0, "Смартфоны"),
+        el(1, "Завершить смену", ElementKind.BUTTON),
+        el(2, "Выйти", ElementKind.BUTTON),
+        el(3, "Выходная обувь"),                        # категория, а не кнопка — остаётся
+        el(4, "Сменить категорию", ElementKind.BUTTON),  # «смен» раньше задевало и её
+        el(5, "Начать работу", ElementKind.BUTTON),      # «работу» раньше задевало и её
+    )
+    prompt = build_elements_prompt(state.elements)
+    assert "Завершить смену" not in prompt and "«Выйти»" not in prompt
+    assert "Выходная обувь" in prompt and "Сменить категорию" in prompt and "Начать работу" in prompt
+    # ни по номеру, ни по тексту, ни по нечёткому совпадению «Завершить» ≈ «Завершить смену»
+    assert resolve({"action": "click", "target_index": 1, "target_text": "Завершить смену"}, state) is None
+    assert resolve({"action": "click", "target_index": None, "target_text": "Завершить"}, state) is None
+
+
+def test_execute_refuses_denied_button_even_if_resolved():
+    from tests.helpers import run
+
+    agent = Agent.__new__(Agent)
+    agent._memory = TaskMemory()
+    agent._browser = _FakeBrowser()
+    state = page(el(0, "Завершить смену", ElementKind.BUTTON))
+    decision = LLMDecision(reasoning="", action="click", target_index=0)
+    run(agent._execute(None, decision, state.elements[0], state))
+    assert agent._browser.clicks == []
+    assert "стоп-списка" in agent._memory.history[-1].result
