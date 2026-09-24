@@ -273,6 +273,7 @@ def test_deny_list_buttons_are_hidden_and_never_resolved():
     )
     prompt = build_elements_prompt(state.elements)
     assert "Завершить смену" not in prompt and "«Выйти»" not in prompt
+    assert "═══ ЭЛЕМЕНТЫ (4) ═══" in oc.LLMConnector.build_user_message(state, DecisionContext())
     assert "Выходная обувь" in prompt and "Сменить категорию" in prompt and "Начать работу" in prompt
     # ни по номеру, ни по тексту, ни по нечёткому совпадению «Завершить» ≈ «Завершить смену»
     assert resolve({"action": "click", "target_index": 1, "target_text": "Завершить смену"}, state) is None

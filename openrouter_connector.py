@@ -35,7 +35,7 @@ from config import (
     OPENAI_BASE_URL,
     OPENROUTER_REFERER,
 )
-from dom_parser import build_elements_prompt
+from dom_parser import build_elements_prompt, select_for_prompt
 from models import (
     FLAG_DISABLED,
     FLAG_IN_DIALOG,
@@ -354,7 +354,8 @@ class LLMConnector:
         if status:
             parts += ["", "═══ СОСТОЯНИЕ ═══"] + status
 
-        parts += ["", f"═══ ЭЛЕМЕНТЫ ({len(state.elements)}) ═══", build_elements_prompt(state.elements)]
+        shown, _ = select_for_prompt(state.elements)   # число строк, которые реально увидит модель
+        parts += ["", f"═══ ЭЛЕМЕНТЫ ({len(shown)}) ═══", build_elements_prompt(state.elements)]
 
         if context.history:
             parts += ["", f"═══ ИСТОРИЯ (шаг {context.step_in_task} этого задания) ═══"] + context.history
