@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>Плоское дерево с aria-level</title>
+<style> .node { height: 24px; cursor: pointer; } .l2 { padding-left: 20px; } </style>
+</head>
+<body>
+<p class="question">Выберите раздел</p>
+<div role="tree">
+  <div role="treeitem" aria-level="1" aria-expanded="true" class="node">Электроника</div>
+  <div role="treeitem" aria-level="2" class="node l2">Смартфоны</div>
+  <div role="treeitem" aria-level="2" aria-expanded="false" class="node l2">Аксессуары</div>
+  <div role="treeitem" aria-level="1" aria-expanded="false" class="node">Одежда</div>
+</div>
+</body>
+</html>

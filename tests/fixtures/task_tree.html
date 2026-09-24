@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Задание: дерево категорий</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 10px; }
+  .row { display: flex; align-items: center; gap: 6px; height: 28px; }
+  .child__children { padding-left: 20px; }
+  .collapsed { height: 0; overflow: hidden; }          /* как tui-expand: узлы в DOM, но не видны */
+  .sr { position: absolute; opacity: 0; width: 1px; height: 1px; }
+  .child__expand { width: 22px; }
+  .hidden-btn { display: none; }
+</style>
+</head>
+<body>
+<div class="task">
+  <p class="question" id="q">Выберите категорию для товара: смартфон Apple iPhone 15</p>
+  <img id="pic" width="160" height="120" alt="товар"
+       src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='120'><rect width='160' height='120' fill='%23cccccc'/></svg>">
+  <span class="timer">00:59</span>
+</div>
+<button class="hidden-btn" type="button">Скрытая кнопка</button>
+<div class="tree">
+  <div class="child">
+    <div class="child__header row"><button class="child__expand" type="button">›</button><span>Одежда</span></div>
+    <div class="child__children collapsed">
+      <label class="t-item row"><input type="radio" name="c" class="sr" value="jackets"><span>Куртки</span></label>
+      <label class="t-item row"><input type="radio" name="c" class="sr" value="other-clothes"><span>Другое</span></label>
+    </div>
+  </div>
+  <div class="child">
+    <div class="child__header row"><button class="child__expand" type="button">›</button><span>Электроника</span></div>
+    <div class="child__children collapsed">
+      <label class="t-item row"><input type="radio" name="c" class="sr" value="phones"><span>Смартфоны</span></label>
+      <label class="t-item row"><input type="radio" name="c" class="sr" value="laptops"><span>Ноутбуки</span></label>
+      <label class="t-item row"><input type="radio" name="c" class="sr" value="other-electronics"><span>Другое</span></label>
+    </div>
+  </div>
+</div>
+<div class="footer">
+  <button class="submit" type="button" disabled>Завершить</button>
+  <button class="end-shift" type="button">Завершить смену</button>
+</div>
+<script>
+  window.__log = [];
+  const submit = document.querySelector('.submit');
+  document.querySelectorAll('.child__expand').forEach((b) => b.addEventListener('click', () => {
+    b.closest('.child').querySelector('.child__children').classList.toggle('collapsed');
+    window.__log.push('toggle:' + b.nextElementSibling.textContent);
+  }));
+  document.addEventListener('change', () => {
+    submit.disabled = !document.querySelector('input[name=c]:checked');
+  });
+  document.querySelector('.end-shift').addEventListener('click', () => window.__log.push('END-SHIFT'));
+  let taskNo = 1;
+  submit.addEventListener('click', () => {
+    const checked = document.querySelector('input[name=c]:checked');
+    window.__log.push('submit:' + (checked ? checked.value : 'none'));
+    taskNo += 1;
+    // следующее задание приходит асинхронно: новый вопрос и картинка, дерево свёрнуто
+    setTimeout(() => {
+      const jacket = taskNo % 2 === 0;
+      document.getElementById('q').textContent = jacket
+        ? 'Выберите категорию для товара: куртка зимняя, задание ' + taskNo
+        : 'Выберите категорию для товара: смартфон, задание ' + taskNo;
+      const svg = "<svg xmlns='http://www.w3.org/2000/svg' width='160' height='120'>"
+        + "<rect width='160' height='120' fill='%23" + (100000 + taskNo) + "'/></svg>";
+      document.getElementById('pic').setAttribute('src', 'data:image/svg+xml;utf8,' + svg);
+      document.querySelectorAll('input[name=c]').forEach((i) => { i.checked = false; });
+      document.querySelectorAll('.child__children').forEach((c) => c.classList.add('collapsed'));
+      submit.disabled = true;
+    }, 300);
+  });
+</script>
+</body>
+</html>

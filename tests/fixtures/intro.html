@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>Заставка</title>
+<style>
+  .sr { position: absolute; opacity: 0; }
+  .t-item { display: flex; height: 28px; align-items: center; }
+  .overlay { position: fixed; inset: 0; background: rgba(0, 0, 0, .4); display: flex; align-items: center; justify-content: center; }
+  .modal { background: #fff; padding: 20px; }
+</style>
+</head>
+<body>
+<div class="task">
+  <p class="question">Выберите вариант</p>
+  <label class="t-item"><input type="radio" name="x" class="sr"><span>Вариант А</span></label>
+  <label class="t-item"><input type="radio" name="x" class="sr"><span>Вариант Б</span></label>
+</div>
+<div class="overlay">
+  <div class="modal">
+    <p>Перед началом прочитайте инструкцию</p>
+    <button type="button" class="start">Приступить к заданию</button>
+  </div>
+</div>
+<script>
+  document.querySelector('.start').addEventListener('click', () => document.querySelector('.overlay').remove());
+</script>
+</body>
+</html>

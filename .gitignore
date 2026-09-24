@@ -1,0 +1,12 @@
+# секреты и локальные настройки
+.env
+
+# профиль браузера (USER_DATA_DIR) — содержит куки и сессию T-Work
+.browser-profile/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

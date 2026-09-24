@@ -1,14 +1,37 @@
-"""browser_controller.py v2 — управление браузером: точные клики + JS-фоллбэк."""
+"""browser_controller.py v3 — управление браузером.
+
+Цепочка клика v3:
+  метка data-agent-id → scroll_into_view → click(trial=True) — проверка, что элемент
+  видим, стабилен (анимация tui-expand закончилась), активен и НЕ перекрыт →
+  плавное движение мыши + mousedown/mouseup → при неудаче JS-фоллбэк (PointerEvent + el.click()).
+
+Главные исправления относительно v2:
+- клик по стабильной метке снимка, а не по `.nth(index)` другого селектора
+  (индексы парсера и контроллера расходились);
+- JS-фоллбэк реально срабатывает: v2 переходил на него только при исключении
+  mouse.*, а перекрытый элемент исключений не даёт — клик молча уходил в оверлей;
+- масштаб 75% — через device_scale_factor и увеличенный viewport: CSS-zoom на
+  body ломал координаты Playwright внутри iframe (проверено: клик по bbox
+  «Завершить» попадал в пустую область, а locator.click() падал по таймауту);
+- ожидание стабилизации DOM (MutationObserver) вместо фиксированных sleep;
+- постоянный профиль браузера (логин переживает перезапуск).
+"""
 
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
-from typing import Optional
+import random
+import re
+import time
+from dataclasses import dataclass
+from typing import Awaitable, Callable, Optional
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
+    Error as PlaywrightError,
     Frame,
     Locator,
     Page,
@@ -17,109 +40,216 @@ from playwright.async_api import (
 )
 
 from config import (
-    ACTION_WAIT,
-    FINISH_BUTTON_TEXTS,
+    ALLOW_MAIN_FRAME,
+    BROWSER_CHANNEL,
+    CAPTCHA_URL_KEYWORDS,
+    CLICK_TIMEOUT_MS,
     FRAME_IGNORE_KEYWORDS,
     FRAME_KEYWORDS,
     FRAME_LOAD_WAIT,
     HEADLESS,
     MOUSE_MOVE_STEPS,
-    PAGE_ZOOM,
+    PAGE_ZOOM_FACTOR,
+    SETTLE_QUIET_MS,
+    SETTLE_TIMEOUT_MS,
     SLOW_MO,
-    START_BUTTON_TEXTS,
-    SUBMIT_WAIT,
     TARGET_URL,
+    TYPE_DELAY_MS,
+    USER_AGENT,
+    USER_DATA_DIR,
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
 )
+from dom_parser import INTERACTIVE_SELECTOR
+from models import ElementKind, ParsedElement, normalize_text
 
 logger = logging.getLogger("twork.browser")
 
-# CSS-селектор всех интерактивных элементов
-_INTERACTIVE_SELECTOR = ", ".join([
-    "button",
-    "a[href]",
-    "[role='option']",
-    "[role='menuitem']",
-    "[role='treeitem']",
-    "[role='combobox']",
-    "tui-select",
-    ".t-select",
-    "tui-radio-labeled",
-    "tui-checkbox-labeled",
-    "label.t-item",
-    ".tui-tree-item__content",
-    ".tui-tree-item",
-    "div[class*='child__header']",
-    "button[class*='expand']",
-    "[class*='tree-item']",
-    "[class*='category-item']",
-    "[class*='list-item']",
-    "input:not([type='hidden'])",
-    "textarea",
-    "[contenteditable='true']",
-])
+
+@dataclass
+class ActionOutcome:
+    """Результат действия в браузере."""
+    ok: bool
+    stale: bool = False     # метка исчезла: DOM перерисован, нужен новый снимок
+    method: str = ""        # mouse / js / type / wheel
+    detail: str = ""
+
+
+def _short(exc: BaseException) -> str:
+    return str(exc).strip().splitlines()[0][:160] if str(exc).strip() else exc.__class__.__name__
+
+
+def _compact(value: str) -> str:
+    """Для сравнения введённого значения: без пробелов и регистра (маски «1 000»)."""
+    return re.sub(r"\s+", "", value or "").lower()
+
+
+# Ждём, пока DOM «успокоится»: нет мутаций quietMs подряд (свои метки не в счёт)
+_JS_SETTLE = """
+({ quietMs, timeoutMs }) => new Promise((resolve) => {
+    let quietTimer = null;
+    const finish = (reason) => {
+        observer.disconnect(); clearTimeout(quietTimer); clearTimeout(hardTimer); resolve(reason);
+    };
+    const observer = new MutationObserver((mutations) => {
+        const relevant = mutations.some((m) => !(m.type === 'attributes'
+            && m.attributeName && m.attributeName.startsWith('data-agent')));
+        if (!relevant) return;
+        clearTimeout(quietTimer);
+        quietTimer = setTimeout(() => finish('quiet'), quietMs);
+    });
+    observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+    quietTimer = setTimeout(() => finish('quiet'), quietMs);
+    const hardTimer = setTimeout(() => finish('timeout'), timeoutMs);
+})
+"""
+
+# JS-клик: полноценная последовательность событий. v2 создавал 'pointerdown'
+# через new MouseEvent (без pointerId/pointerType) и не вызывал el.click(),
+# поэтому label не активировал свой radio.
+_JS_CLICK = """
+el => {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    const base = { bubbles: true, cancelable: true, composed: true, view: window,
+                   clientX: x, clientY: y, button: 0 };
+    const ptr = { ...base, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    el.dispatchEvent(new PointerEvent('pointerover', ptr));
+    el.dispatchEvent(new MouseEvent('mouseover', base));
+    el.dispatchEvent(new PointerEvent('pointerdown', { ...ptr, buttons: 1 }));
+    el.dispatchEvent(new MouseEvent('mousedown', { ...base, buttons: 1 }));
+    if (typeof el.focus === 'function') el.focus({ preventScroll: true });
+    el.dispatchEvent(new PointerEvent('pointerup', ptr));
+    el.dispatchEvent(new MouseEvent('mouseup', base));
+    if (typeof el.click === 'function') el.click();
+    else el.dispatchEvent(new MouseEvent('click', base));
+    return true;
+}
+"""
+
+# Кто перекрывает центр элемента (для логов и истории)
+_JS_BLOCKER = """
+el => {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2, y = r.top + r.height / 2;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) return 'вне видимой области';
+    let hit = document.elementFromPoint(x, y);
+    while (hit && hit.shadowRoot) {
+        const inner = hit.shadowRoot.elementFromPoint(x, y);
+        if (!inner || inner === hit) break;
+        hit = inner;
+    }
+    if (!hit || el === hit || el.contains(hit) || hit.contains(el)) return '';
+    const cls = (hit.getAttribute('class') || '').split(/\\s+/).filter(Boolean).slice(0, 2).join('.');
+    const txt = (hit.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 60);
+    return hit.tagName.toLowerCase() + (cls ? '.' + cls : '') + (txt ? ' «' + txt + '»' : '');
+}
+"""
+
+_JS_READ_VALUE = """
+e => (typeof e.value === 'string') ? e.value : (e.innerText || '')
+"""
 
 
 class BrowserController:
     """Обёртка Playwright для T-Work.
 
     Ключевые особенности:
-    - ignore_https_errors=True (сертификаты Минцифры)
-    - zoom 75% (кнопки «завершить» влезают в экран)
-    - Цепочка клика: scroll → bounding_box → mouse.move → mousedown/up → JS-фоллбэк
+    - ignore_https_errors=True (сертификаты Минцифры; надёжнее — установить их корневой сертификат)
+    - масштаб PAGE_ZOOM через device_scale_factor (координаты кликов остаются точными)
+    - клик только по метке текущего снимка, с проверкой кликабельности и JS-фоллбэком
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self, *, on_context: Optional[Callable[[BrowserContext], Awaitable[None]]] = None,
+    ) -> None:
         self._playwright: Optional[Playwright] = None
-        self._browser:   Optional[Browser]     = None
-        self._context:   Optional[BrowserContext] = None
-        self._page:      Optional[Page]         = None
+        self._browser:    Optional[Browser] = None
+        self._context:    Optional[BrowserContext] = None
+        self._page:       Optional[Page] = None
+        self._last_frame_warning = 0.0
+        # хук после создания контекста: маршруты (тесты, блокировка аналитики), куки и т.п.
+        self._on_context = on_context
 
     # ------------------------------------------------------------------
     # Жизненный цикл
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        logger.info("Старт Playwright: headless=%s url=%s", HEADLESS, TARGET_URL)
+        zoom = PAGE_ZOOM_FACTOR
+        # «Отдалить» страницу = больше CSS-пикселей в том же окне
+        viewport = {"width": round(VIEWPORT_WIDTH / zoom), "height": round(VIEWPORT_HEIGHT / zoom)}
+        logger.info(
+            "Старт Playwright: headless=%s url=%s viewport=%s zoom=%.2f profile=%s",
+            HEADLESS, TARGET_URL, viewport, zoom, USER_DATA_DIR or "—",
+        )
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=HEADLESS,
-            slow_mo=SLOW_MO,
-            args=[
+        launch_opts: dict = {
+            "headless": HEADLESS,
+            "slow_mo": SLOW_MO,
+            "args": [
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
                 "--disable-dev-shm-usage",
             ],
-        )
-        self._context = await self._browser.new_context(
-            viewport={"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT},
-            ignore_https_errors=True,  # КРИТИЧНО: российские SSL
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        )
-        self._page = await self._context.new_page()
+        }
+        if BROWSER_CHANNEL:
+            launch_opts["channel"] = BROWSER_CHANNEL
+        context_opts: dict = {
+            "viewport": viewport,
+            "ignore_https_errors": True,  # КРИТИЧНО: российские SSL
+            "locale": "ru-RU",
+            "timezone_id": "Europe/Moscow",
+        }
+        if zoom != 1.0:
+            context_opts["device_scale_factor"] = zoom
+        if USER_AGENT:
+            context_opts["user_agent"] = USER_AGENT
 
+        chromium = self._playwright.chromium
+        if USER_DATA_DIR:
+            # Постоянный профиль: куки и логин сохраняются между запусками
+            self._context = await chromium.launch_persistent_context(
+                USER_DATA_DIR, **launch_opts, **context_opts,
+            )
+            self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
+        else:
+            self._browser = await chromium.launch(**launch_opts)
+            if HEADLESS and not USER_AGENT:
+                # headless-UA содержит «HeadlessChrome»; берём реальную версию браузера
+                context_opts["user_agent"] = await self._headful_user_agent()
+            self._context = await self._browser.new_context(**context_opts)
+            self._page = await self._context.new_page()
+
+        if self._on_context is not None:
+            await self._on_context(self._context)
         logger.info("Переход на %s", TARGET_URL)
         await self._page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
-
-        logger.info("Ожидаем %.1f сек прогрузки фрейма…", FRAME_LOAD_WAIT)
-        await asyncio.sleep(FRAME_LOAD_WAIT)
-        await self._inject_zoom()
         logger.info("Браузер готов")
+
+    async def _headful_user_agent(self) -> Optional[str]:
+        assert self._browser is not None
+        probe = await self._browser.new_page()
+        try:
+            ua: str = await probe.evaluate("() => navigator.userAgent")
+        finally:
+            await probe.close()
+        return ua.replace("HeadlessChrome", "Chrome")
 
     async def stop(self) -> None:
         logger.info("Остановка браузера")
-        if self._context:
-            await self._context.close()
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        for closer in (
+            self._context.close if self._context else None,
+            self._browser.close if self._browser else None,
+            self._playwright.stop if self._playwright else None,
+        ):
+            if closer is None:
+                continue
+            try:
+                await closer()
+            except PlaywrightError as exc:
+                logger.debug("Ошибка при остановке: %s", _short(exc))
 
     async def __aenter__(self) -> "BrowserController":
         await self.start()
@@ -128,80 +258,179 @@ class BrowserController:
     async def __aexit__(self, *_: object) -> None:
         await self.stop()
 
+    def is_closed(self) -> bool:
+        return self._page is None or self._page.is_closed()
+
     # ------------------------------------------------------------------
     # Фреймы
     # ------------------------------------------------------------------
 
+    def _frame_score(self, url: str) -> int:
+        """Чем раньше ключевое слово в FRAME_KEYWORDS, тем выше приоритет фрейма."""
+        url = url.lower()
+        if not url or url.startswith("about:") or any(ign in url for ign in FRAME_IGNORE_KEYWORDS):
+            return 0
+        for i, keyword in enumerate(FRAME_KEYWORDS):
+            if keyword in url:
+                return len(FRAME_KEYWORDS) - i
+        return 0
+
+    async def find_target_frame(self) -> Optional[Frame]:
+        """Найти видимый целевой фрейм с заданием.
+
+        v2 возвращал ПЕРВЫЙ фрейм с 'task' в URL — в том числе отсоединённый
+        или нулевого размера. Здесь: приоритет ключевых слов, is_detached(),
+        реальный размер iframe на странице.
+        """
+        page = self.page
+        best: Optional[Frame] = None
+        best_score = 0
+        for frame in page.frames:
+            if frame is page.main_frame or frame.is_detached():
+                continue
+            score = self._frame_score(frame.url)
+            if score <= best_score:
+                continue
+            if not await self._frame_is_visible(frame):
+                continue
+            best, best_score = frame, score
+
+        if best is None and ALLOW_MAIN_FRAME:
+            return page.main_frame
+        if best is None and time.monotonic() - self._last_frame_warning > 30:
+            self._last_frame_warning = time.monotonic()
+            logger.warning("Целевой фрейм не найден. Доступные: %s", [f.url for f in page.frames])
+        return best
+
     def get_target_frame(self) -> Optional[Frame]:
-        """Найти целевой фрейм с заданием.
+        """Синхронный вариант (совместимость с v2): без проверки размера фрейма."""
+        page = self.page
+        candidates = [
+            (self._frame_score(f.url), f) for f in page.frames
+            if f is not page.main_frame and not f.is_detached()
+        ]
+        candidates = [c for c in candidates if c[0] > 0]
+        return max(candidates, key=lambda c: c[0])[1] if candidates else None
 
-        Правило: URL содержит klecks-operator или task,
-        не captcha / about:blank, не main_frame.
-        """
-        assert self._page is not None
-        main = self._page.main_frame
+    @staticmethod
+    async def _frame_is_visible(frame: Frame) -> bool:
+        try:
+            handle = await frame.frame_element()
+            box = await handle.bounding_box()
+        except PlaywrightError:
+            return False
+        return bool(box and box["width"] >= 50 and box["height"] >= 50)
 
-        for frame in self._page.frames:
-            if frame is main:
-                continue
+    async def page_has_captcha(self) -> bool:
+        """Капча — видимый iframe капчи на странице (а не слово «капча» в тексте, как в v2)."""
+        for frame in self.page.frames:
             url = frame.url.lower()
-            if any(ign in url for ign in FRAME_IGNORE_KEYWORDS):
+            if frame is self.page.main_frame or not any(k in url for k in CAPTCHA_URL_KEYWORDS):
                 continue
-            if url in ("about:blank", "", "about:srcdoc"):
+            try:
+                box = await (await frame.frame_element()).bounding_box()
+            except PlaywrightError:
                 continue
-            if any(kw in url for kw in FRAME_KEYWORDS):
-                logger.debug("Целевой фрейм: %s", frame.url)
-                return frame
-
-        logger.warning(
-            "Целевой фрейм не найден. Доступные: %s",
-            [f.url for f in self._page.frames],
-        )
-        return None
+            # невидимый бейдж reCAPTCHA (256×60) не считаем, чекбокс/челлендж — считаем
+            if box and box["width"] >= 100 and box["height"] >= 70:
+                return True
+        return False
 
     # ------------------------------------------------------------------
-    # Точный клик по индексу
+    # Действия по элементам снимка
     # ------------------------------------------------------------------
 
-    async def click_by_index(self, frame: Frame, index: int) -> None:
-        """Надёжная цепочка клика:
-        scroll → bounding_box → mouse.move → mousedown+mouseup → JS fallback.
+    async def click_element(
+        self, frame: Frame, el: ParsedElement, *, prefer_toggle: bool = False,
+    ) -> ActionOutcome:
+        """Кликнуть элемент снимка по его метке.
+
+        prefer_toggle — для «open»: кликаем отдельную стрелку-раскрывашку, если она есть
+        (клик по тексту строки во многих деревьях ВЫБИРАЕТ узел, а не раскрывает его).
+        Для выбираемой папки click идёт по её собственному radio/checkbox.
         """
-        logger.info("Клик по index=%d", index)
-        locator = frame.locator(_INTERACTIVE_SELECTOR).nth(index)
+        selectors: list[str] = []
+        if prefer_toggle and el.has_toggle:
+            selectors.append(f'[data-agent-toggle="{el.uid}"]')
+        if not prefer_toggle and el.has_select and el.kind == ElementKind.FOLDER:
+            selectors.append(f'[data-agent-select="{el.uid}"]')
+        selectors.append(f'[data-agent-id="{el.uid}"]')
 
-        # 1. Прокрутка к элементу
+        for selector in selectors:
+            locator = frame.locator(selector)
+            try:
+                count = await locator.count()
+            except PlaywrightError as exc:
+                return ActionOutcome(ok=False, stale=True, detail=f"фрейм недоступен: {_short(exc)}")
+            if count:
+                return await self._click_locator(locator.first, el.label())
+        return ActionOutcome(ok=False, stale=True, detail="элемент исчез из DOM (перерисовка)")
+
+    async def type_into(self, frame: Frame, el: ParsedElement, text: str) -> ActionOutcome:
+        """Ввести текст (или выбрать пункт нативного select) и проверить значение."""
+        locator = frame.locator(f'[data-agent-id="{el.uid}"]')
         try:
-            await locator.scroll_into_view_if_needed(timeout=5_000)
-        except Exception as exc:
-            logger.debug("Прокрутка не удалась: %s", exc)
+            if not await locator.count():
+                return ActionOutcome(ok=False, stale=True, detail="поле исчезло из DOM")
+            locator = locator.first
+            if el.input_type == "select":
+                try:
+                    await locator.select_option(label=text, timeout=3_000)
+                except PlaywrightError:
+                    await locator.select_option(value=text, timeout=3_000)
+                actual = await locator.evaluate(
+                    "e => ((e.selectedOptions[0] || {}).textContent || '').trim()"
+                )
+            else:
+                focus = await self._click_locator(locator, el.label())
+                if not focus.ok:
+                    return focus
+                await locator.fill("", timeout=3_000)
+                await locator.press_sequentially(
+                    text, delay=TYPE_DELAY_MS, timeout=max(5_000, len(text) * (TYPE_DELAY_MS + 50)),
+                )
+                actual = await locator.evaluate(_JS_READ_VALUE)
+                if _compact(actual) != _compact(text):
+                    # маска/автоформатирование съели символы — вводим значение целиком
+                    await locator.fill(text, timeout=3_000)
+                    actual = await locator.evaluate(_JS_READ_VALUE)
+        except PlaywrightError as exc:
+            return ActionOutcome(ok=False, detail=f"ошибка ввода: {_short(exc)}")
+        matches = _compact(actual) == _compact(text)
+        return ActionOutcome(
+            ok=matches or bool(actual.strip()), method="type",
+            detail=f"в поле: «{actual[:80]}»" + ("" if matches else " (отличается от введённого)"),
+        )
 
-        # 2. Получаем точные координаты
-        bbox = await locator.bounding_box()
-
-        if bbox and bbox["width"] > 0 and bbox["height"] > 0:
-            cx = bbox["x"] + bbox["width"]  / 2
-            cy = bbox["y"] + bbox["height"] / 2
-            await self._physical_click(cx, cy, locator)
+    async def scroll(
+        self, frame: Frame, el: Optional[ParsedElement], direction: str = "down",
+    ) -> ActionOutcome:
+        """Прокрутка колесом мыши над списком: срабатывают и виртуальный скролл
+        (cdk-virtual-scroll-viewport), и ленивые подгрузки по scroll-событию."""
+        page = self.page
+        box = None
+        try:
+            if el is not None:
+                locator = frame.locator(f'[data-agent-id="{el.uid}"]')
+                if await locator.count():
+                    box = await locator.first.bounding_box(timeout=1_000)
+            if box is None and frame is not page.main_frame:
+                box = await (await frame.frame_element()).bounding_box()
+        except PlaywrightError:
+            box = None
+        vp = page.viewport_size or {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+        if box:
+            x = min(max(box["x"] + box["width"] / 2, 5), vp["width"] - 5)
+            y = min(max(box["y"] + box["height"] / 2, 5), vp["height"] - 5)
         else:
-            # Элемент не виден — сразу JS
-            logger.warning("bounding_box пустой, прямой JS-клик")
-            await self._js_click(locator)
-
-        await asyncio.sleep(ACTION_WAIT)
-
-    async def type_by_index(self, frame: Frame, index: int, text: str) -> None:
-        """Ввести текст в элемент по индексу."""
-        logger.info("Текст index=%d: %r", index, text[:40])
-        locator = frame.locator(_INTERACTIVE_SELECTOR).nth(index)
+            x, y = vp["width"] / 2, vp["height"] / 2
+        delta = vp["height"] * 0.6 * (-1 if direction == "up" else 1)
         try:
-            await locator.scroll_into_view_if_needed(timeout=5_000)
-            await locator.click(timeout=5_000)
-            await locator.fill("")          # стереть старое значение
-            await locator.type(text, delay=40)
-        except Exception as exc:
-            logger.error("Ошибка type_by_index(%d): %s", index, exc)
-        await asyncio.sleep(ACTION_WAIT)
+            await page.mouse.move(x, y, steps=MOUSE_MOVE_STEPS)
+            await page.mouse.wheel(0, delta)
+        except PlaywrightError as exc:
+            return ActionOutcome(ok=False, detail=f"прокрутка не удалась: {_short(exc)}")
+        return ActionOutcome(ok=True, method="wheel", detail=f"прокрутка {direction}")
 
     async def click_by_text(
         self,
@@ -209,146 +438,175 @@ class BrowserController:
         texts: tuple[str, ...],
         *,
         skip_disabled: bool = True,
+        deny: tuple[str, ...] = (),
     ) -> bool:
-        """Найти кнопку по одному из texts и кликнуть. Возвращает True при успехе."""
+        """Фоллбэк: найти КНОПКУ по тексту и кликнуть. Возвращает True при успехе.
+
+        В v2 при len(text) > 3 сравнение было подстрокой по ЛЮБОМУ элементу
+        (get_by_text): «начать» совпадало с «Начать заново», «хорошо» — с
+        вариантом ответа «Хорошо», «завершить» — с «Завершить смену».
+        Теперь: только role=button, сначала точное совпадение, затем начало фразы,
+        плюс список запрещённых подстрок.
+        """
         for text in texts:
-            text_lower = text.lower()
-            try:
-                # Попытка 1: role=button
-                loc = frame.get_by_role("button", name=text, exact=False)
-                cnt = await loc.count()
-                if cnt == 0:
-                    # Попытка 2: любой элемент с таким текстом
-                    loc = frame.get_by_text(text, exact=False)
-                    cnt = await loc.count()
-                if cnt == 0:
+            patterns = (
+                re.compile(rf"^\s*{re.escape(text)}\s*$", re.IGNORECASE),
+                re.compile(rf"^\s*{re.escape(text)}(?:\s|$)", re.IGNORECASE),
+            )
+            for pattern in patterns:
+                buttons = frame.get_by_role("button", name=pattern)
+                try:
+                    count = await buttons.count()
+                except PlaywrightError:
                     continue
-
-                for i in range(cnt):
-                    candidate = loc.nth(i)
-
-                    if skip_disabled:
-                        disabled = await candidate.get_attribute("disabled")
-                        aria_dis = await candidate.get_attribute("aria-disabled")
-                        cls      = (await candidate.get_attribute("class")) or ""
-                        if (
-                            disabled is not None
-                            or aria_dis == "true"
-                            or "disabled" in cls.lower()
-                        ):
+                for i in range(count):
+                    candidate = buttons.nth(i)
+                    try:
+                        if not await candidate.is_visible():
+                            continue
+                        if skip_disabled and not await candidate.is_enabled(timeout=1_000):
                             logger.debug("Кнопка %r заблокирована", text)
                             continue
-
-                    # --- ИСПРАВЛЕННЫЙ БЛОК НАЧАЛО ---
-                    # Очищаем текст от лишних пробелов по краям
-                    el_text = (await candidate.inner_text() or "").strip().lower()
-                    
-                    # Если искомое слово короткое (например "ок", "ok"), требуем ТОЧНОГО совпадения,
-                    # чтобы не кликать по случайным словам вроде "пОКазать" или "стрОКа".
-                    if len(text_lower) <= 3:
-                        if text_lower != el_text:
-                            continue
-                    # Для длинных слов оставляем гибкое вхождение подстроки
-                    else:
-                        if text_lower not in el_text:
-                            continue
-                    # --- ИСПРАВЛЕННЫЙ БЛОК КОНЕЦ ---
-
-                    bbox = await candidate.bounding_box()
-                    if bbox and bbox["width"] > 0:
-                        cx = bbox["x"] + bbox["width"]  / 2
-                        cy = bbox["y"] + bbox["height"] / 2
-                        await self._physical_click(cx, cy, candidate)
-                    else:
-                        await self._js_click(candidate)
-
-                    logger.info("Клик по тексту %r", text)
-                    await asyncio.sleep(ACTION_WAIT)
-                    return True
-
-            except Exception as exc:
-                logger.debug("Не удалось нажать %r: %s", text, exc)
-
+                        name = normalize_text(await candidate.inner_text(timeout=1_000))
+                    except PlaywrightError:
+                        continue
+                    if any(d in name for d in deny):
+                        logger.info("Кнопка «%s» пропущена (запрещённая подстрока)", name)
+                        continue
+                    outcome = await self._click_locator(candidate, name)
+                    if outcome.ok:
+                        logger.info("Клик по тексту «%s»", name)
+                        return True
         return False
 
     # ------------------------------------------------------------------
-    # Физический клик (основной метод)
+    # Ожидания и скриншоты
     # ------------------------------------------------------------------
 
-    async def _physical_click(self, cx: float, cy: float, locator: Locator) -> None:
-        """Плавное движение мыши + mousedown/mouseup.
+    async def wait_settle(
+        self, frame: Frame, *, quiet_ms: int = SETTLE_QUIET_MS, timeout_ms: int = SETTLE_TIMEOUT_MS,
+    ) -> str:
+        """Дождаться, пока DOM фрейма перестанет меняться (анимации раскрытия,
+        change detection Angular, подгрузка детей). Возвращает причину выхода."""
+        try:
+            return await frame.evaluate(_JS_SETTLE, {"quietMs": quiet_ms, "timeoutMs": timeout_ms})
+        except PlaywrightError as exc:
+            # фрейм перезагрузился во время ожидания — это тоже «изменение»
+            logger.debug("wait_settle: %s", _short(exc))
+            await asyncio.sleep(quiet_ms / 1000)
+            return "navigated"
 
-        Если физический клик не сработал — JS фоллбэк.
-        """
-        assert self._page is not None
-        page = self._page
+    async def screenshot_b64(self, frame: Frame, mode: str) -> Optional[str]:
+        """Скриншот для vision-модели: главная картинка задания или весь фрейм (JPEG, base64)."""
+        try:
+            if mode == "image":
+                locator = frame.locator("[data-agent-img]")
+                if not await locator.count():
+                    return None
+                data = await locator.first.screenshot(
+                    type="jpeg", quality=80, timeout=5_000, animations="disabled",
+                )
+            elif mode == "frame" and frame is not self.page.main_frame:
+                handle = await frame.frame_element()
+                data = await handle.screenshot(type="jpeg", quality=70, timeout=5_000)
+            elif mode == "frame":
+                data = await self.page.screenshot(type="jpeg", quality=70, timeout=5_000)
+            else:
+                return None
+        except PlaywrightError as exc:
+            logger.debug("Скриншот не получен: %s", _short(exc))
+            return None
+        return base64.b64encode(data).decode("ascii")
+
+    # ------------------------------------------------------------------
+    # Клик: проверка кликабельности → мышь → JS-фоллбэк
+    # ------------------------------------------------------------------
+
+    async def _click_locator(self, locator: Locator, what: str) -> ActionOutcome:
+        try:
+            await locator.scroll_into_view_if_needed(timeout=3_000)
+        except PlaywrightError as exc:
+            logger.debug("Прокрутка не удалась: %s", _short(exc))
 
         try:
-            # Плавное перемещение мыши в центр элемента
-            await page.mouse.move(cx, cy, steps=MOUSE_MOVE_STEPS)
-            await asyncio.sleep(0.05)
+            # trial=True: все проверки Playwright (attached, visible, stable, enabled,
+            # «точку клика не перекрывает другой элемент») без самого клика
+            await locator.click(trial=True, timeout=CLICK_TIMEOUT_MS)
+        except PlaywrightError as exc:
+            blocker = await self._describe_blocker(locator)
+            logger.warning("«%s» не готов к клику (%s) — JS-фоллбэк", what, blocker or _short(exc))
+            if await self._js_click(locator):
+                detail = f"js-клик (перекрыт: {blocker})" if blocker else "js-клик"
+                return ActionOutcome(ok=True, method="js", detail=detail)
+            return ActionOutcome(ok=False, detail=f"не удалось кликнуть: {blocker or _short(exc)}")
 
-            # Физический mousedown → пауза → mouseup
-            await page.mouse.down()
-            await asyncio.sleep(0.08)
-            await page.mouse.up()
+        try:
+            box = await locator.bounding_box(timeout=1_000)
+        except PlaywrightError:
+            box = None
+        if not box or box["width"] < 1 or box["height"] < 1:
+            ok = await self._js_click(locator)
+            return ActionOutcome(ok=ok, method="js", detail="js-клик (нет bounding box)")
 
-            logger.debug("Физический клик: (%.1f, %.1f)", cx, cy)
-
-        except Exception as exc:
-            logger.warning("Физический клик слетел: %s. JS fallback.", exc)
-            await self._js_click(locator)
-
-    # ------------------------------------------------------------------
-    # JS фоллбэк (для перекрытых / нереагирующих)
-    # ------------------------------------------------------------------
+        x, y = self._aim(box)
+        try:
+            await self._human_click(x, y)
+        except PlaywrightError as exc:
+            logger.warning("Физический клик не удался: %s — JS-фоллбэк", _short(exc))
+            ok = await self._js_click(locator)
+            return ActionOutcome(ok=ok, method="js", detail="js-клик после ошибки мыши")
+        logger.debug("Физический клик «%s»: (%.1f, %.1f)", what, x, y)
+        return ActionOutcome(ok=True, method="mouse")
 
     @staticmethod
-    async def _js_click(locator: Locator) -> None:
-        """Безопасный JS-клик через dispatchEvent."""
+    def _aim(box: dict) -> tuple[float, float]:
+        """Центр элемента с небольшим разбросом (не выходит за внутренние 15%)."""
+        jx = min(box["width"] * 0.15, 4.0)
+        jy = min(box["height"] * 0.15, 3.0)
+        return (
+            box["x"] + box["width"] / 2 + random.uniform(-jx, jx),
+            box["y"] + box["height"] / 2 + random.uniform(-jy, jy),
+        )
+
+    async def _human_click(self, x: float, y: float) -> None:
+        """Плавное движение мыши + mousedown/mouseup с человеческими паузами."""
+        mouse = self.page.mouse
+        await mouse.move(x, y, steps=MOUSE_MOVE_STEPS)
+        await asyncio.sleep(random.uniform(0.04, 0.09))
+        await mouse.down()
+        await asyncio.sleep(random.uniform(0.05, 0.12))
+        await mouse.up()
+
+    @staticmethod
+    async def _js_click(locator: Locator) -> bool:
         try:
-            await locator.evaluate(
-                """
-                el => {
-                    ['pointerdown','mousedown','pointerup','mouseup','click']
-                        .forEach(type => {
-                            el.dispatchEvent(new MouseEvent(type, {
-                                bubbles: true, cancelable: true, view: window
-                            }));
-                        });
-                }
-                """
-            )
-            logger.debug("JS dispatchEvent клик выполнен")
-        except Exception as exc:
-            logger.error("JS клик тоже слетел: %s", exc)
+            await locator.evaluate(_JS_CLICK)
+            logger.debug("JS-клик выполнен")
+            return True
+        except PlaywrightError as exc:
+            logger.error("JS-клик тоже не удался: %s", _short(exc))
+            return False
+
+    @staticmethod
+    async def _describe_blocker(locator: Locator) -> str:
+        try:
+            return str(await locator.evaluate(_JS_BLOCKER))
+        except PlaywrightError:
+            return ""
 
     # ------------------------------------------------------------------
     # Вспомогательные методы
     # ------------------------------------------------------------------
 
-    async def _inject_zoom(self) -> None:
-        """Уменьшить масштаб страницы до PAGE_ZOOM."""
-        assert self._page is not None
-        try:
-            await self._page.evaluate(
-                f"() => {{ document.body.style.zoom = '{PAGE_ZOOM}'; }}"
-            )
-            logger.debug("Zoom установлен: %s", PAGE_ZOOM)
-        except Exception as exc:
-            logger.warning("Не удалось установить зум: %s", exc)
-
     async def reload_and_wait(self) -> None:
-        assert self._page is not None
-        await self._page.reload(wait_until="domcontentloaded", timeout=60_000)
+        await self.page.reload(wait_until="domcontentloaded", timeout=60_000)
         await asyncio.sleep(FRAME_LOAD_WAIT)
-        await self._inject_zoom()
 
     @property
     def page(self) -> Page:
-        assert self._page is not None
+        assert self._page is not None, "BrowserController не запущен"
         return self._page
 
     @property
     def interactive_selector(self) -> str:
-        return _INTERACTIVE_SELECTOR
+        return INTERACTIVE_SELECTOR

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Taiga-подобная разметка</title>
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 10px; }
+  tui-tree, tui-tree-item { display: block; }
+  tui-tree-item-content { display: flex; align-items: center; gap: 4px; height: 26px; }
+  .t-children { padding-left: 20px; }
+  .t-children._collapsed { display: none; }
+  .ghost { opacity: 0; }
+  tui-checkbox-labeled, tui-radio-labeled { display: flex; gap: 6px; align-items: center; height: 24px; cursor: pointer; position: relative; }
+  tui-checkbox-labeled input, tui-radio-labeled input { position: absolute; opacity: 0; }
+  tui-svg { display: inline-block; width: 12px; height: 12px; }
+  tui-select { display: inline-flex; align-items: center; border: 1px solid #999; width: 220px; height: 30px; }
+  tui-select input { border: 0; width: 180px; }
+  tui-input { display: block; margin: 6px 0; }
+  .spinner { width: 16px; height: 16px; background: #333; }
+  .list-item { display: flex; gap: 4px; align-items: center; height: 24px; }
+</style>
+</head>
+<body>
+<h2 class="task__title">Отметьте все подходящие характеристики и выберите цвет</h2>
+<div class="hint">Подсказка: можно выбрать несколько вариантов</div>
+
+<tui-tree role="tree">
+  <tui-tree-item role="treeitem">
+    <tui-tree-item-content>
+      <button type="button" class="t-chevron" aria-expanded="true" aria-label="Свернуть"><tui-svg src="tuiIconChevronDown"></tui-svg></button>
+      <span>Характеристики</span>
+    </tui-tree-item-content>
+    <div class="t-children">
+      <tui-checkbox-labeled><input type="checkbox" checked><tui-svg class="t-icon" src="tuiIconCheck"></tui-svg><span>Водонепроницаемый</span></tui-checkbox-labeled>
+      <tui-checkbox-labeled><input type="checkbox"><tui-svg class="t-icon" src="tuiIconCheck"></tui-svg><span>Беспроводной</span></tui-checkbox-labeled>
+      <div class="list-item inactive">Устаревший вариант <svg class="list-item__icon" width="10" height="10"><circle cx="5" cy="5" r="4"/></svg></div>
+    </div>
+  </tui-tree-item>
+  <tui-tree-item role="treeitem">
+    <tui-tree-item-content>
+      <button type="button" class="t-chevron" aria-expanded="false" aria-label="Развернуть"><tui-svg src="tuiIconChevronRight"></tui-svg></button>
+      <span>Материал</span>
+    </tui-tree-item-content>
+    <div class="t-children _collapsed">
+      <tui-radio-labeled><input type="radio" name="m"><span>Пластик</span></tui-radio-labeled>
+    </div>
+  </tui-tree-item>
+</tui-tree>
+
+<div class="ghost"><button type="button">Невидимая кнопка</button></div>
+
+<tui-input><label class="t-label">Комментарий</label><input type="text" value=""></tui-input>
+<label>Размер <select id="size"><option>S</option><option selected>M</option><option>L</option></select></label>
+<tui-select role="combobox" aria-expanded="false"><input readonly value="" placeholder="Цвет"><tui-svg src="tuiIconChevronDown"></tui-svg></tui-select>
+<shadow-card></shadow-card>
+<div role="alert">Выберите хотя бы один вариант</div>
+<div class="spinner loader" hidden></div>
+<button type="button" class="submit">Отправить</button>
+<script>
+  customElements.define('shadow-card', class extends HTMLElement {
+    constructor() {
+      super();
+      this.attachShadow({ mode: 'open' }).innerHTML =
+        '<div><button type="button" id="inner">Кнопка в тени</button></div>';
+    }
+  });
+</script>
+</body>
+</html>
