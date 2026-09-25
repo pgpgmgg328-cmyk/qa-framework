@@ -4,6 +4,9 @@
 # профиль браузера (USER_DATA_DIR) — содержит куки и сессию T-Work
 .browser-profile/
 
+# записи режима --record: скриншоты и HTML с вашими данными
+recordings/
+
 # Python
 __pycache__/
 *.pyc

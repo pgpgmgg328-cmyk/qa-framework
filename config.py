@@ -177,10 +177,12 @@ FINISH_DENY_SUBSTRINGS: tuple[str, ...] = _env_list(
 )
 
 
-def validate_config() -> None:
-    """Проверить критичные параметры до запуска браузера (fail fast)."""
+def validate_config(*, require_llm: bool = True) -> None:
+    """Проверить критичные параметры до запуска браузера (fail fast).
+
+    require_llm=False — для режима записи: там LLM не вызывается и ключ не нужен."""
     problems: list[str] = []
-    if not OPENAI_API_KEY:
+    if require_llm and not OPENAI_API_KEY:
         problems.append("OPENAI_API_KEY пуст — все запросы к LLM завершатся 401")
     if LLM_VISION not in ("off", "image", "frame"):
         problems.append(f"LLM_VISION={LLM_VISION!r}: допустимо off | image | frame")

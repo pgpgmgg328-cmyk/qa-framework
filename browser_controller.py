@@ -75,6 +75,14 @@ class ActionOutcome:
     detail: str = ""
 
 
+def is_connection_lost(exc: BaseException) -> bool:
+    """Связь с браузером потеряна (закрыт, упал или завершён драйвер) — шаги повторять бессмысленно."""
+    text = str(exc)
+    return any(marker in text for marker in (
+        "Connection closed", "has been closed", "Browser closed", "browser has disconnected",
+    ))
+
+
 def _short(exc: BaseException) -> str:
     return str(exc).strip().splitlines()[0][:160] if str(exc).strip() else exc.__class__.__name__
 
@@ -161,7 +169,10 @@ class BrowserController:
     """
 
     def __init__(
-        self, *, on_context: Optional[Callable[[BrowserContext], Awaitable[None]]] = None,
+        self,
+        *,
+        on_context: Optional[Callable[[BrowserContext], Awaitable[None]]] = None,
+        headless: Optional[bool] = None,
     ) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser:    Optional[Browser] = None
@@ -170,6 +181,8 @@ class BrowserController:
         self._last_frame_warning = 0.0
         # хук после создания контекста: маршруты (тесты, блокировка аналитики), куки и т.п.
         self._on_context = on_context
+        # None — как в .env (HEADLESS); режим записи принудительно открывает окно
+        self._headless = HEADLESS if headless is None else headless
 
     # ------------------------------------------------------------------
     # Жизненный цикл
@@ -181,11 +194,11 @@ class BrowserController:
         viewport = {"width": round(VIEWPORT_WIDTH / zoom), "height": round(VIEWPORT_HEIGHT / zoom)}
         logger.info(
             "Старт Playwright: headless=%s url=%s viewport=%s zoom=%.2f profile=%s",
-            HEADLESS, TARGET_URL, viewport, zoom, USER_DATA_DIR or "—",
+            self._headless, TARGET_URL, viewport, zoom, USER_DATA_DIR or "—",
         )
         self._playwright = await async_playwright().start()
         launch_opts: dict = {
-            "headless": HEADLESS,
+            "headless": self._headless,
             "slow_mo": SLOW_MO,
             "args": [
                 "--disable-blink-features=AutomationControlled",
@@ -216,7 +229,7 @@ class BrowserController:
             self._page = self._context.pages[0] if self._context.pages else await self._context.new_page()
         else:
             self._browser = await chromium.launch(**launch_opts)
-            if HEADLESS and not USER_AGENT:
+            if self._headless and not USER_AGENT:
                 # headless-UA содержит «HeadlessChrome»; берём реальную версию браузера
                 context_opts["user_agent"] = await self._headful_user_agent()
             self._context = await self._browser.new_context(**context_opts)
@@ -248,7 +261,9 @@ class BrowserController:
                 continue
             try:
                 await closer()
-            except PlaywrightError as exc:
+            except Exception as exc:  # noqa: BLE001 — закрытие best effort: по Ctrl+C драйвер
+                # Playwright получает сигнал вместе с Python и завершается первым, а его
+                # «Connection closed» — обычный Exception, не playwright.Error
                 logger.debug("Ошибка при остановке: %s", _short(exc))
 
     async def __aenter__(self) -> "BrowserController":
@@ -606,6 +621,11 @@ class BrowserController:
     def page(self) -> Page:
         assert self._page is not None, "BrowserController не запущен"
         return self._page
+
+    @property
+    def context(self) -> BrowserContext:
+        assert self._context is not None, "BrowserController не запущен"
+        return self._context
 
     @property
     def interactive_selector(self) -> str:

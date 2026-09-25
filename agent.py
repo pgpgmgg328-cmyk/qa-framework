@@ -24,7 +24,7 @@ from typing import Optional
 
 from playwright.async_api import Error as PlaywrightError, Frame
 
-from browser_controller import BrowserController
+from browser_controller import BrowserController, is_connection_lost
 from config import (
     ACTION_WAIT,
     CAPTCHA_TIMEOUT,
@@ -156,7 +156,7 @@ class Agent:
                 try:
                     result = await self._step()
                 except PlaywrightError as exc:
-                    if self._browser.is_closed():
+                    if self._browser.is_closed() or is_connection_lost(exc):
                         logger.warning("Браузер закрыт — остановка")
                         break
                     # «Execution context was destroyed» и т.п.: фрейм перезагрузился посреди шага
@@ -164,6 +164,9 @@ class Agent:
                     await asyncio.sleep(1.0)
                     continue
                 except Exception as exc:  # noqa: BLE001 — один сбойный шаг не должен ронять агента
+                    if is_connection_lost(exc):
+                        logger.warning("Связь с браузером потеряна — остановка")
+                        break
                     logger.exception("Непредвиденная ошибка в шаге: %s", exc)
                     await asyncio.sleep(2.0)
                     continue
