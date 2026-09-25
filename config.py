@@ -5,12 +5,31 @@
 
 import logging
 import os
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+PROJECT_DIR = Path(__file__).resolve().parent
+
 # Ищем .env рядом с этим файлом
-load_dotenv(Path(__file__).parent / ".env")
+load_dotenv(PROJECT_DIR / ".env")
+
+# Консоль Windows в cp1251/cp866 не умеет печатать ✓, ⛔, ═ — вместо ошибки логгера
+# («--- Logging error ---») такие символы заменяются на «?»
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors="replace")
+    except (AttributeError, ValueError):
+        pass
+
+
+def _project_path(raw: str) -> str:
+    """Относительный путь считается от папки проекта, а не от текущей папки терминала."""
+    if not raw:
+        return ""
+    path = Path(raw).expanduser()
+    return str(path if path.is_absolute() else (PROJECT_DIR / path).resolve())
 
 
 def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
@@ -82,8 +101,9 @@ HEADLESS: bool = _env_bool("HEADLESS", False)
 # «Человечность» кликов обеспечивают явные паузы в BrowserController, поэтому 0.
 SLOW_MO: int = int(os.getenv("SLOW_MO", "0"))
 BROWSER_CHANNEL: str = os.getenv("BROWSER_CHANNEL", "")   # "chrome" — установленный Google Chrome
-# Постоянный профиль: куки/логин сохраняются между запусками (пустая строка — выкл.)
-USER_DATA_DIR: str = os.getenv("USER_DATA_DIR", "")
+# Постоянный профиль: куки/логин сохраняются между запусками (пустая строка — выкл.).
+# Относительный путь («.browser-profile») — внутри папки проекта, откуда бы ни запускали.
+USER_DATA_DIR: str = _project_path(os.getenv("USER_DATA_DIR", "").strip())
 # Пусто — нативный UA установленного Chromium (жёстко зашитый Chrome/124 в v2
 # расходился с реальной версией браузера и заголовками Client Hints).
 USER_AGENT: str = os.getenv("USER_AGENT", "")
