@@ -1,16 +1,18 @@
-"""openrouter_connector.py v3 — LLM-клиент (ProxyAPI / OpenRouter, OpenAI-совместимый API).
+"""openrouter_connector.py v4 — LLM-клиент (ProxyAPI / OpenRouter, OpenAI-совместимый API).
 
-Изменения относительно v2:
-- системный промпт: легенда формата генерируется из models.py (в v2 промпт
-  описывал «[FOLDER ЗАКРЫТА]», а строки приходили как «[ПАПКА ЗАКРЫТА]»);
-  добавлены стратегия поиска по дереву, правила отправки, анти-галлюцинационные
-  правила и пример;
-- в промпт передаются история действий с фактическим результатом, запреты по
-  ТЕКСТУ (а не по сдвигающимся индексам), сообщения страницы и бюджет шагов;
-- Structured Outputs (json_schema, strict) с автоматическим откатом на json_object;
-- vision: скриншот картинки задания (в v2 модель классифицировала фото вслепую);
-- таймаут/ретраи клиента, одна попытка «ремонта» невалидного JSON, учёт refusal
-  и finish_reason=length.
+v4 (экономия токенов без потери точности):
+- пакет действий: за один ответ модель выбирает ответы на все видимые вопросы и отправляет —
+  вызовов на задание в 2–3 раза меньше; исполнитель проверяет каждое действие;
+- системный промпт сокращён; советы по фото, аудио, картам, спискам, дереву и поиску
+  приходят в сообщении только для страниц, где они нужны («ПОДСКАЗКИ»);
+- порядок сообщения под кэш OpenAI: неизменное внутри задания (знания, подсказки, фото,
+  расшифровка) — в начале, меняющееся (страница, история) — в конце; повторные вызовы по
+  заданию оплачиваются по цене кэша;
+- компактный формат ответа: без поля goal, одно поле value вместо type_text/query/scroll;
+- учёт токенов: вызовы, вход (из них из кэша), выход — по заданию и за весь запуск.
+
+v3: Structured Outputs с откатом на json_object, адаптация параметров reasoning-моделей,
+одна попытка «ремонта» JSON, учёт refusal и finish_reason=length.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
 from typing import Any, Optional, Union
 
 import openai
@@ -37,7 +40,7 @@ from config import (
     TRANSCRIBE_LANGUAGE,
     TRANSCRIBE_MODELS,
 )
-from dom_parser import geo_facts, media_facts, render_page
+from dom_parser import _plain_text, geo_facts, media_facts, render_page
 from models import (
     FLAG_DISABLED,
     FLAG_SELECTED,
@@ -45,145 +48,169 @@ from models import (
     PROMPT_LEGEND,
     ActionType,
     DecisionContext,
+    ElementKind,
     LLMDecision,
     PageState,
+    PlannedAction,
+    split_value,
 )
 
 logger = logging.getLogger("twork.llm")
 
 
 # ---------------------------------------------------------------------------
-# Системный промпт v3
+# Системный промпт v4 (неизменный — кэшируется OpenAI во всех вызовах)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""Ты — опытный и очень внимательный оператор платформы разметки T-Work (Клекс). \
-Ты решаешь задания разных видов: сравнение карточек (отели, товары, организации), выбор значения \
-характеристики, оценка фотографий, прослушивание звонков, поиск информации в интернете, тесты \
-с вариантами ответа, деревья категорий. Готовых шаблонов нет: каждое задание ты решаешь сам, как \
-эксперт — читаешь инструкцию и условие, изучаешь ВСЕ данные, делаешь вывод, заполняешь форму и \
-отправляешь ответ. Главное — ТОЧНОСТЬ: за ошибки снижается рейтинг.
-
-На каждом шаге ты выбираешь РОВНО ОДНО действие. Скрипт выполняет его, проверяет результат и \
-присылает новое состояние страницы вместе с историей и твоим планом.
+SYSTEM_PROMPT = f"""Ты — опытный и очень внимательный оператор платформы разметки T-Work (Клекс). Задания \
+бывают разные: сравнение карточек, выбор значения характеристики, оценка фото, прослушивание \
+звонков, поиск в интернете, тесты, деревья категорий. Шаблонов нет: реши задание как эксперт — \
+прочитай инструкцию и условие, изучи ВСЕ данные, сделай вывод, заполни форму и отправь ответ. \
+Главное — ТОЧНОСТЬ: за ошибки снижается рейтинг.
 
 ━━━ ЧТО ТЫ ПОЛУЧАЕШЬ ━━━
-• ЗНАНИЯ О ВИДЕ ЗАДАНИЙ — инструкция заказа, пояснения к вариантам, уроки из прошлых ошибок, \
-заметки пользователя. По этим правилам проверяют ответы: они важнее твоих общих представлений.
-• СТРАНИЦА ЗАДАНИЯ — всё содержимое по порядку: заголовки (#), текст, таблицы (| … |), фото \
-([ФОТО n]), аудио ([АУДИО n]), сообщения платформы и интерактивные элементы. Элемент стоит на \
-своём месте: вопрос или подпись поля — строкой выше.
-  Элемент: [N] [ТИП] «текст» флаги. N — номер в ЭТОМ снимке; после каждого действия номера \
-пересчитываются — не переноси номера из истории.
-  Типы:
+• ЗНАНИЯ — инструкция к этому виду заданий, пояснения к вариантам, уроки прошлых ошибок, заметки \
+пользователя. По этим правилам проверяют ответы: они важнее твоих общих представлений.
+• ПОДСКАЗКИ — советы для элементов этой страницы (фото, аудио, карты, списки, дерево, поиск).
+• ФОТО — изображения с подписью «ФОТО n» (в коллаже номер написан в углу каждого фото); номера \
+совпадают с [ФОТО n] на странице. АУДИО — расшифровка записи.
+• СТРАНИЦА — всё содержимое по порядку: заголовки (#), текст, таблицы (| … |), [ФОТО n], [АУДИО n], \
+сообщения платформы (‼ ошибка, 💡 подсказка, ⚠ предупреждение) и элементы. Вопрос или подпись поля \
+стоит строкой выше элемента.
+  Элемент: [N] [ТИП] «текст» флаги. N — номер в ЭТОМ снимке; после действий номера пересчитываются.
 {PROMPT_LEGEND}
-  Флаги:
 {PROMPT_FLAGS}
-  Сообщения платформы: ‼ ошибка («Неверный ответ»), 💡 подсказка («Правильный ответ: …»), ⚠ предупреждение.
-• ФОТО — приложены к сообщению как изображения с подписью «ФОТО n» (в коллаже номер написан в \
-углу каждого фото). Номера совпадают с [ФОТО n] на странице.
-• АУДИО — расшифровка записи.
-• ВЕБ-ПОИСК — результаты твоих запросов: адрес страницы, текст, ссылки.
-• ПЛАН — твой план с прошлого шага. ИСТОРИЯ — твои действия и их ФАКТИЧЕСКИЙ результат \
-(✓ сработало, ✗ нет, ⚠ побочный эффект). НЕ ПОВТОРЯТЬ. НЕВЕРНЫЕ ОТВЕТЫ — уже отклонённые платформой.
+• ВЕБ-ПОИСК — результаты твоих запросов. ПЛАН — твои выводы с прошлого шага. ИСТОРИЯ — действия и их \
+фактический результат (✓ сработало, ✗ нет, ⚠ побочный эффект). НЕ ПОВТОРЯТЬ. НЕВЕРНЫЕ ОТВЕТЫ — \
+уже отклонены платформой.
 
 ━━━ КАК РЕШАТЬ ━━━
-1. Разбери задание: что спрашивают, какие поля и группы вариантов нужно заполнить. Вопросов \
-может быть несколько — ответь на каждый (группы radio, checkbox, списки, поля ввода).
-2. Примени правила из ЗНАНИЙ и примечаний на странице (специальные значения, что делать, если \
-данных нет или фото не загрузилось).
-3. Изучи ВСЕ данные:
-   – сравнение карточек: сопоставь поле за полем (название с учётом транслитерации, адрес, город, \
-координаты в ссылках на карту и расстояние между точками, телефон, почта, сайт) и фото (какие \
-номера совпадают); решающие поля берёшь из инструкции;
-   – фото: рассмотри каждое и сопоставь с вариантами ответа и требованиями инструкции;
-   – аудио: по расшифровке определи, кто говорит (робот, живой человек, автоответчик или \
-голосовой помощник), чем закончился разговор и совпадает ли итог с заявленным результатом;
-   – товар: ищи значение в названии, описании и характеристиках; предразметку проверяй, а не \
-принимай на веру; значения нет в списке — «Другое», определить нельзя — «Неизвестно / Не указано» \
-(или как велит инструкция).
-4. Нужны сведения из интернета (найти организацию, ссылку, ID, проверить данные) → action "web", \
-query — поисковый запрос или полный адрес страницы (с https://). Полезно:
-   https://yandex.ru/maps/?text=<запрос> — поиск организаций на Яндекс Картах;
-   https://otzovik.com/?search_text=<запрос> — поиск на Otzovik;
-   любой адрес из результатов поиска или со страницы задания.
-   Открывай найденные карточки и сверяй название, адрес, вид деятельности, сайт. Адреса и ID копируй \
-ДОСЛОВНО из «Адрес страницы» или списка ссылок (ID организации Яндекс Карт — число в адресе \
-…/maps/org/<название>/<ID>/). Не выдумывай ссылки. Если после 2–3 разумных запросов ничего не \
-найдено — отвечай по правилу задания для случая «не найдено». Если задание запрещает поиск в \
-интернете — не ищи.
-5. В plan записывай вывод по данным (ключевые факты: найденные адреса, ID, что совпало), какие \
-ответы нужно поставить и что уже сделано. План вернётся тебе на следующем шаге.
-6. Заполняй поля по одному действию за шаг. Перед submit сверь со страницей: ВСЕ нужные варианты \
-отмечены ✓ВЫБРАН, списки и поля заполнены, лишние отметки сняты.
-7. После отправки платформа может ответить «Неверный ответ» и дать подсказку (особенно в режиме \
-«Тренировка»). Прочитай подсказку, исправь ответ (сними неверные отметки, выбери правильные) и \
-отправь снова. Ответ из НЕВЕРНЫХ ОТВЕТОВ не повторяй.
+1. Пойми, что требуется: все вопросы, группы вариантов и поля формы — ответить нужно на каждый.
+2. Примени ЗНАНИЯ и примечания на странице (особые значения, что делать, если данных нет).
+3. Изучи все данные и сделай вывод по фактам; не додумывай. Нужны сведения из интернета — action web.
+4. В plan запиши вывод с ключевыми фактами (найденные адреса, ID, что совпало) и что осталось сделать \
+— план вернётся к тебе на следующем шаге.
+5. После «Неверный ответ» или неудачной отправки (✗ в ИСТОРИИ) прочитай сообщения и подсказку платформы, \
+исправь ответ (сними неверные отметки, выбери правильные) и отправь снова. Ответы из НЕВЕРНЫХ ОТВЕТОВ \
+не повторяй.
 
-━━━ ДЕЙСТВИЯ ━━━
-• click  — выбрать [OPTION] (radio/checkbox), нажать [BUTTON]/[OTHER], выбрать пункт открытого \
-списка. Повторный click по checkbox с {FLAG_SELECTED} снимает отметку.
-• open   — раскрыть [FOLDER закрыта] или [DROPDOWN закрыт]; пункты списка появятся в разделе \
-«ОТКРЫТЫЙ ВЫПАДАЮЩИЙ СПИСОК».
-• type   — ввести текст в [INPUT …]: type_text — точное значение целиком (старое заменяется).
-• scroll — прокрутить список, если нужного пункта не видно, а в СОСТОЯНИИ сказано, что список \
-прокручивается (scroll_direction "down"/"up").
-• web    — поиск или открытие страницы в интернете; query обязателен.
-• submit — отправить ответ («Завершить задание» / «Отправить»); target_index — номер кнопки.
-• skip   — подождать (идёт загрузка). Не используй, если можно продвинуться.
+━━━ ДЕЙСТВИЯ (поле actions — одно или несколько, выполняются по порядку) ━━━
+• click — выбрать [OPTION], нажать [BUTTON]/[OTHER], выбрать пункт открытого списка; повторный click \
+по checkbox с {FLAG_SELECTED} снимает отметку.
+• open — раскрыть [FOLDER закрыта] или [DROPDOWN закрыт].
+• type — ввести value в [INPUT …] (старое значение заменяется). URL и ID копируй дословно.
+• scroll — прокрутить список, value "down"/"up" (если нужного пункта не видно, а список прокручивается).
+• web — поиск в интернете или открытие страницы: value — запрос или полный адрес (https://…), \
+например https://yandex.ru/maps/?text=<запрос> или https://otzovik.com/?search_text=<запрос>.
+• submit — отправить ответ («Завершить задание»); target_index — номер кнопки.
+• skip — подождать загрузку. Не используй, если можно продвинуться.
+Пакет действий:
+• включай сразу все действия, цели которых видны СЕЙЧАС: ответы на все вопросы и ввод во все поля;
+• submit — последним и только если ответ полностью готов и ты в нём уверен: пакет вместе с уже \
+отмеченным ({FLAG_SELECTED}) отвечает на ВСЕ вопросы, обязательные поля заполнены, лишние отметки сняты;
+• open, web и scroll — только последним действием: после них нужен новый взгляд на страницу;
+• скрипт проверяет каждое действие; при сбое или неожиданном изменении страницы (например, появилось \
+новое поле) остальные действия отменяются, и ты получишь новое состояние.
 Кнопок выхода из задания в списке нет: задание всегда нужно довести до ответа.
 
-━━━ ДЕРЕВЬЯ КАТЕГОРИЙ ━━━
-Иди от общего к частному: раскрывай за шаг ОДНУ самую вероятную закрытую папку; строки с \
-бо́льшим отступом — содержимое раскрытой папки; выбирай самый конкретный подходящий вариант; \
-«Другое/Прочее» — только если в правильной ветке нет точного; одинаковые названия различай по \
-⟨путь: …⟩; раскрытые папки не сворачивай.
-
 ━━━ ПРАВИЛА ТОЧНОСТИ ━━━
-• Отвечай только по данным задания, инструкции, фото, аудио и найденным фактам. Не додумывай.
-• Сначала найди строку с нужным текстом, затем перепиши её номер. target_index — только из \
-текущей СТРАНИЦЫ; target_text — дословный текст элемента (без номера, [ТИПА], кавычек и флагов).
-• Не кликай [OPTION radio] с {FLAG_SELECTED}. Не выбирай элементы с {FLAG_DISABLED} и действия \
-из НЕ ПОВТОРЯТЬ.
-• Нужного элемента нет → open/scroll, а не click по «похожему». Не выдумывай элементы.
-• Открыт диалог поверх страницы → сначала разберись с ним.
-• confidence — честная уверенность, что действие ведёт к ПРАВИЛЬНОМУ ответу.
+• Сначала найди строку с нужным текстом, затем перепиши её номер. target_index — только из текущей \
+СТРАНИЦЫ; target_text — дословный текст элемента (без номера, [ТИПА], кавычек и флагов).
+• Не кликай [OPTION radio] с {FLAG_SELECTED}. Не выбирай элементы с {FLAG_DISABLED} и действия из \
+НЕ ПОВТОРЯТЬ. Нужного элемента нет — open/scroll, а не click по «похожему»; не выдумывай элементы.
+• Открыт диалог поверх страницы — сначала разберись с ним.
+• confidence — честная уверенность, что ответ ПРАВИЛЬНЫЙ.
 
-━━━ ФОРМАТ ОТВЕТА ━━━
-Только JSON-объект:
-{{
-  "goal": "что требуется — 1 фраза",
-  "observation": "ключевые факты страницы и что уже сделано",
-  "plan": "вывод по данным + какие ответы поставить + что осталось",
-  "reasoning": "почему именно это действие — 1–3 фразы",
-  "action": "click | open | type | scroll | web | submit | skip",
-  "target_index": N или null,
-  "target_text": "дословный текст элемента" или null,
-  "type_text": "текст для ввода" или null,
-  "query": "запрос или адрес для web" или null,
-  "scroll_direction": "down" | "up" | null,
-  "confidence": число 0.0–1.0
-}}
-
-━━━ ПРИМЕР ━━━
-СТРАНИЦА:
-### Выполните задание
-Название отеля: Отель Магнолия
-Адрес: ул. Мира, 5, Сочи
-[3] [BUTTON] «Открыть карту» → https://maps.example/?ll=43.5800,39.7200
-Название отеля: Magnolia Hotel
-Адрес: Мира улица 5, Сочи
-[5] [BUTTON] «Открыть карту» → https://maps.example/?ll=43.5801,39.7203
-#### Отели совпадают?
-[6] [OPTION radio] «Да»
-[7] [OPTION radio] «Нет»
-[8] [BUTTON] «Завершить задание»
-Ответ:
-{{"goal": "решить, один ли это отель", "observation": "название — одно имя (транслитерация), адрес \
-совпадает, точки на карте в ~30 м; ничего не выбрано", "plan": "Один и тот же отель → [6] «Да», \
-затем submit [8]", "reasoning": "Совпадают название, адрес и геоточка — выбираю «Да»", \
-"action": "click", "target_index": 6, "target_text": "Да", "type_text": null, "query": null, \
-"scroll_direction": null, "confidence": 0.9}}
+━━━ ФОРМАТ ОТВЕТА (только JSON) ━━━
+{{"observation": "что требуется и ключевые факты", "plan": "вывод по данным и что осталось", \
+"reasoning": "почему эти действия", "actions": [{{"action": "click|open|type|scroll|web|submit|skip", \
+"target_index": N или null, "target_text": "дословный текст элемента" или null, "value": "текст для \
+type/web/scroll" или null}}], "confidence": 0.0–1.0}}
+Пример: вопрос «Отели совпадают?» с [6] «Да», [7] «Нет» и кнопкой [8] «Завершить задание»; названия — \
+одно имя в транслитерации, адреса совпадают, точки в 30 м:
+{{"observation": "решить, один ли это отель; названия и адреса совпадают, точки в 30 м", "plan": "один \
+и тот же отель → «Да», отправить", "reasoning": "совпали название, адрес и геоточка", "actions": \
+[{{"action": "click", "target_index": 6, "target_text": "Да", "value": null}}, {{"action": "submit", \
+"target_index": 8, "target_text": "Завершить задание", "value": null}}], "confidence": 0.9}}
 """
+
+# Советы, которые нужны только на некоторых страницах: модель получает их в сообщении
+# («ПОДСКАЗКИ»), когда на странице есть соответствующие элементы. Так системный промпт
+# короче, а на нужных страницах совет не теряется.
+HINTS: dict[str, str] = {
+    "compare": (
+        "Сравнение карточек: сопоставь поле за полем — название (с учётом транслитерации и перевода), "
+        "адрес, город, координаты (расстояние между точками посчитано в ВЫЧИСЛЕНО СКРИПТОМ), телефон, "
+        "почта, сайт, фото (какие совпадают по номерам). Решающие поля — по инструкции."
+    ),
+    "photos": (
+        "Фото: рассмотри каждое фото по номеру и сопоставь с вариантами ответа и требованиями инструкции; "
+        "учитывай, какие фото не загрузились."
+    ),
+    "audio": (
+        "Аудио: по расшифровке определи, кто говорит (робот, живой человек, автоответчик или голосовой "
+        "помощник), чем закончился разговор и совпадает ли итог с заявленным результатом."
+    ),
+    "dropdown": (
+        "Списки значений: сначала open, затем click по пункту с пометкой «во всплывающем списке». Значение "
+        "ищи в названии, описании и характеристиках; предразметку проверяй, а не принимай на веру."
+    ),
+    "special": (
+        "Особые значения: значения нет в списке — «Другое»; определить нельзя — «Неизвестно / Не указано» "
+        "(или как велит инструкция)."
+    ),
+    "tree": (
+        "Дерево категорий: иди от общего к частному — раскрывай за шаг ОДНУ самую вероятную закрытую "
+        "папку; строки с бо́льшим отступом — содержимое раскрытой папки; выбирай самый конкретный "
+        "подходящий вариант; «Другое/Прочее» — только если в правильной ветке нет точного; одинаковые "
+        "названия различай по ⟨путь: …⟩; раскрытые папки не сворачивай."
+    ),
+    "web": (
+        "Поиск в интернете: открывай найденные карточки и сверяй название, адрес, вид деятельности, сайт. "
+        "Адреса и ID копируй ДОСЛОВНО из «Адрес страницы» или списка ссылок (ID организации Яндекс Карт — "
+        "число в адресе …/maps/org/<название>/<ID>/). Не выдумывай ссылки. После 2–3 разумных запросов "
+        "без результата отвечай по правилу задания для случая «не найдено». Если задание запрещает поиск "
+        "в интернете — не ищи."
+    ),
+}
+# Задание про поиск: «найти организацию», «через поиск в Яндексе», «URL на Otzovik»
+_WEB_WORDS = re.compile(r"(найд|найти|поиск|интернет|яндекс\s*карт|otzovik|отзовик|2гис|google|гугл)", re.IGNORECASE)
+# …но если задание прямо запрещает поиск, совет по поиску не нужен (запрет модель прочтёт на странице)
+_WEB_FORBIDDEN = re.compile(r"(нельзя|запрещ|не используй)[^.\n]{0,60}(поиск|интернет)", re.IGNORECASE)
+_SPECIAL_WORDS = re.compile(r"(другое|неизвестно|не указано)", re.IGNORECASE)
+_PLACEHOLDER = re.compile(r"^(выберите|выбрать|не выбран|select|choose|укажите)", re.IGNORECASE)
+
+
+def _is_value_list(e) -> bool:
+    """Список значений ответа («Цвет: Выберите значение»), а не меню кнопки («Опции завершения
+    задания») и не служебный переключатель."""
+    if e.kind != ElementKind.DROPDOWN:
+        return e.kind == ElementKind.INPUT and e.input_type == "select"
+    return bool(e.caption or e.placeholder or e.value or _PLACEHOLDER.match(e.text or ""))
+
+
+def page_hints(state: PageState, context: DecisionContext) -> list[str]:
+    """Подсказки для этой страницы — по признакам, которые не меняются внутри задания."""
+    text = _plain_text(state.reader) + "\n" + " ".join(e.label() for e in state.elements if not e.aux)
+    popup = _plain_text(state.popup_lines)
+    visible = [e for e in state.elements if not e.aux]
+    keys: list[str] = []
+    if len(geo_facts(state)) or re.search(r"совпада", text, re.IGNORECASE):
+        keys.append("compare")
+    if state.images:
+        keys.append("photos")
+    if state.audios:
+        keys.append("audio")
+    if any(_is_value_list(e) for e in visible):
+        keys.append("dropdown")
+        if _SPECIAL_WORDS.search(text) or _SPECIAL_WORDS.search(popup):
+            keys.append("special")
+    if any(e.kind == ElementKind.FOLDER for e in visible):
+        keys.append("tree")
+    if context.research or (_WEB_WORDS.search(text) and not _WEB_FORBIDDEN.search(text)):
+        keys.append("web")
+    return [HINTS[k] for k in keys]
+
 
 # Совместимость с v2
 _SYSTEM_PROMPT = SYSTEM_PROMPT
@@ -198,6 +225,18 @@ def _nullable(schema: dict) -> dict:
     return {"anyOf": [schema, {"type": "null"}]}
 
 
+_ACTION_ITEM: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "action":       {"type": "string", "enum": [a.value for a in ActionType]},
+        "target_index": _nullable({"type": "integer"}),
+        "target_text":  _nullable({"type": "string"}),
+        "value":        _nullable({"type": "string"}),
+    },
+    "required": ["action", "target_index", "target_text", "value"],
+}
+
 DECISION_JSON_SCHEMA: dict[str, Any] = {
     "name": "agent_decision",
     "strict": True,
@@ -205,24 +244,42 @@ DECISION_JSON_SCHEMA: dict[str, Any] = {
         "type": "object",
         "additionalProperties": False,
         "properties": {
-            "goal":             {"type": "string"},
-            "observation":      {"type": "string"},
-            "plan":             {"type": "string"},
-            "reasoning":        {"type": "string"},
-            "action":           {"type": "string", "enum": [a.value for a in ActionType]},
-            "target_index":     _nullable({"type": "integer"}),
-            "target_text":      _nullable({"type": "string"}),
-            "type_text":        _nullable({"type": "string"}),
-            "query":            _nullable({"type": "string"}),
-            "scroll_direction": _nullable({"type": "string", "enum": ["down", "up"]}),
-            "confidence":       {"type": "number"},
+            "observation": {"type": "string"},
+            "plan":        {"type": "string"},
+            "reasoning":   {"type": "string"},
+            "actions":     {"type": "array", "items": _ACTION_ITEM},
+            "confidence":  {"type": "number"},
         },
-        "required": [
-            "goal", "observation", "plan", "reasoning", "action", "target_index",
-            "target_text", "type_text", "query", "scroll_direction", "confidence",
-        ],
+        "required": ["observation", "plan", "reasoning", "actions", "confidence"],
     },
 }
+
+
+@dataclass
+class UsageStats:
+    """Расход токенов: вызовы модели, вход (из них из кэша OpenAI), выход."""
+    calls: int = 0
+    prompt: int = 0
+    cached: int = 0
+    completion: int = 0
+
+    def add(self, usage: Any) -> None:
+        self.calls += 1
+        self.prompt += int(getattr(usage, "prompt_tokens", 0) or 0)
+        self.completion += int(getattr(usage, "completion_tokens", 0) or 0)
+        details = getattr(usage, "prompt_tokens_details", None)
+        self.cached += int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+
+    def snapshot(self) -> "UsageStats":
+        return UsageStats(self.calls, self.prompt, self.cached, self.completion)
+
+    def since(self, before: "UsageStats") -> "UsageStats":
+        return UsageStats(self.calls - before.calls, self.prompt - before.prompt,
+                          self.cached - before.cached, self.completion - before.completion)
+
+    def render(self) -> str:
+        cached = f" (из кэша {self.cached})" if self.cached else ""
+        return f"вызовов модели {self.calls}, токенов: вход {self.prompt}{cached}, выход {self.completion}"
 
 
 class DecisionParseError(ValueError):
@@ -247,6 +304,7 @@ class LLMConnector:
         self._structured = LLM_STRUCTURED_OUTPUT
         self._vision_enabled = True
         self._dead_transcribers: set[str] = set()
+        self.usage = UsageStats()
         # reasoning-модели (o-серия, gpt-5) требуют max_completion_tokens и не
         # принимают temperature — параметры подстраиваются по первой ошибке 400
         self._tokens_param = "max_tokens"
@@ -265,12 +323,12 @@ class LLMConnector:
         if not isinstance(context, DecisionContext):
             context = DecisionContext()   # совместимость с v2: decide(state, banned_indices)
 
-        text = self.build_user_message(state, context)
-        logger.debug("LLM user msg (%d симв., изображений %d):\n%s",
-                     len(text), len(context.images) + bool(context.image_b64), text)
+        prefix, main = self.build_user_parts(state, context)
+        logger.debug("LLM user msg (%d симв., изображений %d):\n%s\n\n%s",
+                     len(prefix) + len(main), len(context.images) + bool(context.image_b64), prefix, main)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._user_content(text, context)},
+            {"role": "user", "content": self._user_content(prefix, main, context)},
         ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
 
@@ -345,18 +403,30 @@ class LLMConnector:
             logger.warning("Ответ обрезан по max_tokens=%d — увеличьте LLM_MAX_TOKENS", LLM_MAX_TOKENS)
         usage = getattr(response, "usage", None)
         if usage is not None:
-            logger.debug("Токены: prompt=%s completion=%s", usage.prompt_tokens, usage.completion_tokens)
+            self.usage.add(usage)
+            details = getattr(usage, "prompt_tokens_details", None)
+            logger.debug("Токены: вход=%s (кэш %s) выход=%s", usage.prompt_tokens,
+                         getattr(details, "cached_tokens", 0) if details is not None else 0,
+                         usage.completion_tokens)
         return choice.message.content or ""
 
-    def _user_content(self, text: str, context: DecisionContext) -> Union[str, list[dict[str, Any]]]:
+    def _user_content(
+        self, prefix: str, main: str, context: DecisionContext,
+    ) -> Union[str, list[dict[str, Any]]]:
+        """Сообщение для модели. Фото стоят ПОСЛЕ неизменной части (знания, подсказки) и ДО
+        меняющейся (страница, история): начало запроса одинаково во всех вызовах по заданию,
+        и OpenAI берёт его из кэша по сниженной цене."""
         if not self._vision_enabled or not (context.images or context.image_b64):
-            return text
-        parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+            return f"{prefix}\n\n{main}" if prefix else main
+        parts: list[dict[str, Any]] = []
+        if prefix:
+            parts.append({"type": "text", "text": prefix})
         for image in context.images:
             parts.append({"type": "text", "text": f"{image.caption}:"})
             parts.append({"type": "image_url", "image_url": {
                 "url": f"data:image/jpeg;base64,{image.b64}", "detail": image.detail or LLM_VISION_DETAIL,
             }})
+        parts.append({"type": "text", "text": main})
         if context.image_b64:
             parts.append({"type": "text", "text": "Скриншот страницы задания:"})
             parts.append({"type": "image_url", "image_url": {
@@ -383,30 +453,37 @@ class LLMConnector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_user_message(state: PageState, context: DecisionContext) -> str:
-        parts: list[str] = []
+    def build_user_parts(state: PageState, context: DecisionContext) -> tuple[str, str]:
+        """(неизменная часть задания, меняющаяся часть). Неизменная — знания, подсказки,
+        сведения о фото и расшифровка аудио — идёт первой (кэш OpenAI)."""
+        head: list[str] = []
         if context.knowledge:
-            parts += ["═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ ═══", context.knowledge, ""]
+            head += ["═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ ═══", context.knowledge, ""]
+        hints = page_hints(state, context)
+        if hints:
+            head += ["═══ ПОДСКАЗКИ ПО ЭТОЙ СТРАНИЦЕ ═══"] + [f"• {h}" for h in hints] + [""]
+        if context.images or context.image_notes:
+            head += ["═══ ФОТО ═══"]
+            if context.images:
+                head.append("Фото задания приложены ниже с подписями: "
+                            + "; ".join(i.caption for i in context.images) + ".")
+            head += context.image_notes + [""]
+        if context.transcripts:
+            head += ["═══ АУДИО ═══"] + context.transcripts + [""]
+        prefix = "\n".join(head).rstrip()
 
+        parts: list[str] = []
         page_text, _ = render_page(state)
         parts += ["═══ СТРАНИЦА ЗАДАНИЯ ═══", page_text]
         # сообщения, которых нет в тексте страницы (снимок без reader-view)
         extra = [a for a in state.alerts if a not in page_text]
         if extra:
             parts += ["", "═══ СООБЩЕНИЯ СТРАНИЦЫ ═══"] + [f"‼ {a}" for a in extra]
-
         facts = geo_facts(state) + media_facts(state)
         if facts:
             parts += ["", "═══ ВЫЧИСЛЕНО СКРИПТОМ ═══"] + [f"• {f}" for f in facts]
-        if context.images or context.image_notes:
-            parts += ["", "═══ ФОТО ═══"]
-            if context.images:
-                parts.append("Приложены изображения: " + "; ".join(i.caption for i in context.images) + ".")
-            parts += context.image_notes
-        elif context.image_b64:
-            parts += ["", "(К сообщению приложен скриншот страницы задания.)"]
-        if context.transcripts:
-            parts += ["", "═══ АУДИО ═══"] + context.transcripts
+        if context.image_b64:
+            parts += ["", "(В конце сообщения — скриншот страницы задания.)"]
 
         status: list[str] = []
         if state.loading:
@@ -437,8 +514,14 @@ class LLMConnector:
         if context.notes:
             parts += ["", "═══ ВНИМАНИЕ ═══"] + [f"⚠ {n}" for n in context.notes]
 
-        parts += ["", "Выбери одно действие. Ответ — только JSON по схеме."]
-        return "\n".join(parts)
+        parts += ["", "Выбери действия. Ответ — только JSON по схеме."]
+        return prefix, "\n".join(parts)
+
+    @classmethod
+    def build_user_message(cls, state: PageState, context: DecisionContext) -> str:
+        """Всё сообщение одним текстом (лог, режим записи, тесты)."""
+        prefix, main = cls.build_user_parts(state, context)
+        return f"{prefix}\n\n{main}" if prefix else main
 
     # ------------------------------------------------------------------
     # Расшифровка аудио
@@ -481,7 +564,8 @@ class LLMConnector:
 
     @staticmethod
     def parse_response(raw: str) -> LLMDecision:
-        """JSON → LLMDecision. Терпит ```json-обёртки и «грязные» типы полей."""
+        """JSON → LLMDecision. Формат v4 — пакет actions; формат v3 (плоские поля action,
+        target_index, …) тоже принимается. Терпит ```json-обёртки и «грязные» типы полей."""
         text = (raw or "").strip()
         match = re.search(r"\{.*\}", text, re.DOTALL)
         if not match:
@@ -492,6 +576,23 @@ class LLMConnector:
             raise DecisionParseError(f"невалидный JSON: {exc}") from exc
         if not isinstance(data, dict):
             raise DecisionParseError("JSON должен быть объектом")
+        actions = data.pop("actions", None)
+        if actions is not None:
+            if not isinstance(actions, list) or not all(isinstance(a, dict) for a in actions):
+                raise DecisionParseError("actions: нужен список объектов")
+            if not actions:
+                actions = [{"action": "skip"}]
+            first, rest = split_value(actions[0]), actions[1:]
+            for key in ("action", "target_index", "target_text", "type_text", "query", "scroll_direction"):
+                if key in first:
+                    data[key] = first[key]
+            try:
+                data["next_actions"] = [PlannedAction.from_raw(a) for a in rest]
+            except ValidationError as exc:
+                errors = "; ".join(f"actions.{'.'.join(map(str, e['loc']))}: {e['msg']}" for e in exc.errors())
+                raise DecisionParseError(errors) from exc
+        else:
+            data = split_value(data)
         try:
             return LLMDecision.model_validate(data)
         except ValidationError as exc:
@@ -503,20 +604,21 @@ class LLMConnector:
 
     @staticmethod
     def _log_decision(decision: LLMDecision) -> None:
-        logger.info(
-            "LLM решение: action=%s index=%s text=%r conf=%.2f",
-            decision.action.value, decision.target_index,
-            (decision.target_text or "")[:40], decision.confidence,
+        steps = decision.steps()
+        chain = " → ".join(
+            f"{d.action.value}"
+            + (f" [{d.target_index}]" if d.target_index is not None else "")
+            + (f" «{(d.target_text or '')[:30]}»" if d.target_text else "")
+            + (f" «{(d.type_text or d.query or '')[:40]}»" if (d.type_text or d.query) else "")
+            for d in steps
         )
-        if decision.goal:
-            logger.info("  цель: %s", decision.goal[:200])
+        logger.info("LLM решение (%d действ.): %s conf=%.2f", len(steps), chain, decision.confidence)
         if decision.observation:
             logger.info("  наблюдение: %s", decision.observation[:400])
         if decision.plan:
             logger.info("  план: %s", decision.plan[:400])
-        logger.info("  рассуждение: %s", decision.reasoning[:300])
-        if decision.query:
-            logger.info("  запрос: %s", decision.query[:200])
+        if decision.reasoning:
+            logger.info("  рассуждение: %s", decision.reasoning[:300])
 
 
 def _fmt_ts(seconds: Any) -> str:

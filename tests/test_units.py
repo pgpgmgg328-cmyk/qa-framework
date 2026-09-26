@@ -69,10 +69,39 @@ def test_json_schema_is_strict_compatible():
     schema = oc.DECISION_JSON_SCHEMA["schema"]
     assert set(schema["required"]) == set(schema["properties"])
     assert schema["additionalProperties"] is False
-    assert schema["properties"]["action"]["enum"] == [a.value for a in ActionType]
-    # порядок полей: рассуждения генерируются ДО действия
+    item = schema["properties"]["actions"]["items"]
+    assert set(item["required"]) == set(item["properties"]) and item["additionalProperties"] is False
+    assert item["properties"]["action"]["enum"] == [a.value for a in ActionType]
+    # порядок полей: рассуждения генерируются ДО действий
     keys = list(schema["properties"])
-    assert keys.index("reasoning") < keys.index("action")
+    assert keys.index("observation") < keys.index("plan") < keys.index("reasoning") < keys.index("actions")
+
+
+def test_parse_batch_and_value_mapping():
+    raw = ('{"observation": "о", "plan": "п", "reasoning": "р", "confidence": 0.8, "actions": ['
+           '{"action": "type", "target_index": 2, "target_text": "URL", "value": "https://x.example/1"},'
+           '{"action": "web", "target_index": null, "target_text": null, "value": "кафе Сочи"},'
+           '{"action": "scroll", "target_index": null, "target_text": null, "value": "down"}]}')
+    d = oc.LLMConnector.parse_response(raw)
+    steps = d.steps()
+    assert [s.action for s in steps] == [ActionType.TYPE, ActionType.WEB, ActionType.SCROLL]
+    assert steps[0].type_text == "https://x.example/1" and steps[1].query == "кафе Сочи"
+    assert steps[2].scroll_direction == "down" and d.plan == "п"
+    assert oc.LLMConnector.parse_response('{"actions": []}').action == ActionType.SKIP
+    with pytest.raises(oc.DecisionParseError):
+        oc.LLMConnector.parse_response('{"actions": [{"action": "click"}, {"action": "dance"}]}')
+
+
+def test_batch_order_rules():
+    def step(action, text=""):
+        return LLMDecision(action=action, target_text=text or None)
+
+    submit, a, b = step("submit", "Завершить"), step("click", "Да"), step("click", "Нет")
+    assert Agent._order_batch([submit, a, b]) == [a, b, submit]            # submit — последним
+    opened = step("open", "Цвет")
+    assert Agent._order_batch([a, opened, b, submit]) == [a, opened]        # после open — новый взгляд
+    assert Agent._order_batch([step("skip")]) == [step("skip")]
+    assert Agent._order_batch([step("skip"), a]) == [a]
 
 
 # --------------------------------------------------------------------- промпт
@@ -209,7 +238,7 @@ def test_memory_reset_on_new_task():
 
 # --------------------------------------------------------------------- отпечаток задания
 
-def _fp(text: str, image: str = "img.png", notices: tuple[str, ...] = ()) -> tuple[str, str, str, str]:
+def _fp(text: str, image: str = "img.png", notices: tuple[str, ...] = ()) -> tuple[str, ...]:
     reader = [text] + [f"\x01N{i}\x01" for i in range(len(notices))]
     images = [MediaImage(n=1, src=image)] if image else []
     return DomParser._fingerprint("https://x/task", reader, [], images, [], [])
@@ -317,3 +346,33 @@ def test_execute_refuses_denied_button_even_if_resolved():
     run(agent._execute(None, decision, state.elements[0], state))
     assert agent._browser.clicks == []
     assert "стоп-списка" in agent._memory.history[-1].result
+
+
+def test_page_hints_follow_the_page():
+    """Советы, вынесенные из системного промпта, приходят на страницах, где они нужны."""
+    from models import MediaAudio
+
+    def hints(reader, *elements, context=None, **kw):
+        state = page(*elements)
+        state.reader = list(reader)
+        for name, value in kw.items():
+            setattr(state, name, value)
+        return {k for k, text in oc.HINTS.items() if text in oc.page_hints(state, context or DecisionContext())}
+
+    radio = dict(choice_type="radio")
+    hotels = hints(["Название отеля: Магнолия", "#### Отели совпадают?"],
+                   el(0, "Да", **radio), el(1, "Нет", **radio), el(2, "Завершить задание", ElementKind.BUTTON))
+    assert hotels == {"compare"}
+    assert hints(["Оцените фото"], el(0, "Хорошо", **radio), images=[MediaImage(n=1, src="a.jpg")]) == {"photos"}
+    assert hints(["Прослушайте звонок"], el(0, "Робот", **radio), audios=[MediaAudio(n=1, src="a.mp3")]) == {"audio"}
+    color = el(0, "Выберите значение", ElementKind.DROPDOWN, caption="Цвет")
+    assert hints(["Товар: футболка"], color) == {"dropdown"}
+    assert hints(["Товар: футболка"], color, popup_lines=["Белый", "Другое"]) == {"dropdown", "special"}
+    # меню кнопки — не список значений ответа
+    assert hints(["Товар"], el(0, "Опции завершения задания", ElementKind.DROPDOWN)) == set()
+    assert hints(["Выберите категорию"], el(0, "Одежда", ElementKind.FOLDER, state=FolderState.CLOSED)) == {"tree"}
+    assert "web" in hints(["Найдите организацию на Яндекс Картах"], el(0, "Ссылка", ElementKind.INPUT))
+    assert "web" not in hints(["Нельзя использовать поиск в интернете"], el(0, "Да", **radio))
+    assert "web" in hints(["Оцените фото"], el(0, "Да", **radio), context=DecisionContext(research=["…"]))
+    # текст страницы и подписи элементов не склеиваются в одну строку
+    assert "web" in hints(["Ответ изменить нельзя"], el(0, "Поиск по каталогу", ElementKind.BUTTON))

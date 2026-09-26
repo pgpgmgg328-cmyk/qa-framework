@@ -1306,10 +1306,11 @@ class DomParser:
         alerts = [n.text for n in notices if n.kind in ("error", "warning") or n.where == "toast"]
         image_src = str(raw.get("imageSrc") or "")
         url = str(raw.get("url") or "")
-        task_id, preview, content_hash, loose_hash = self._fingerprint(
+        task_id, preview, content_hash, loose_hash, form_hash = self._fingerprint(
             url, reader, elements, images, audios, headings,
         )
         pool_key, pool_title, pool_signature = self._pool(headings, elements, task_text)
+        preview = pool_title or preview
         headings = [h.lstrip("#").strip() for h in headings]
 
         state = PageState(
@@ -1346,6 +1347,7 @@ class DomParser:
             local_loading=int(raw.get("localLoading") or 0),
             content_hash=content_hash,
             loose_hash=loose_hash,
+            form_hash=form_hash,
             media_srcs=[i.src for i in images] + [a.src for a in audios],
         )
         folders = [e for e in elements if e.kind == ElementKind.FOLDER]
@@ -1440,30 +1442,27 @@ class DomParser:
         images: list[MediaImage],
         audios: list[MediaAudio],
         headings: list[str],
-    ) -> tuple[str, str, str, str]:
-        """Отпечаток задания: содержимое страницы БЕЗ сообщений платформы, таймеров,
-        подсказок при наведении, состояний и значений полей. «Неверный ответ» и подсказка
-        после отправки отпечаток не меняют (в v3 меняли — и память о неверном ответе стиралась).
+    ) -> tuple[str, str, str, str, str]:
+        """Отпечаток задания: ТЕКСТ страницы без сообщений платформы, таймеров, подсказок при
+        наведении, состояний и значений полей. «Неверный ответ» и подсказка после отправки
+        отпечаток не меняют (в v3 меняли — и память о неверном ответе стиралась).
 
-        Возвращает (task_id, превью, хэш текста, хэш текста без цифр). Хэши текста нужны
-        агенту, чтобы отличать новое задание от догрузившихся фото (TaskIdentity)."""
-        by_index = {e.index: e for e in elements}
-        parts: list[str] = []
-        for line in reader:
-            def repl(m: re.Match) -> str:
-                kind, num, notice = m.group(1), m.group(2), m.group(3)
-                if notice is not None or kind != "E":
-                    return " "
-                el = by_index.get(int(num))
-                # строки раскрытых веток (depth > 0) появляются и исчезают при раскрытии —
-                # в отпечаток не входят, иначе каждое «open» сбрасывало бы память задания
-                if el is None or el.aux or el.depth > 0 or el.container in ("dialog", "popup", "toast"):
-                    return " "
-                return f" {el.kind.value}:{el.text or el.placeholder or el.caption} "
-            parts.append(_PH_RE.sub(repl, line))
+        Состав формы (подписи вариантов и полей) считается отдельно: поле, которое появилось
+        после выбора ответа («Укажите причину»), — это то же задание, а не новое.
+
+        Возвращает (task_id, превью, хэш текста, хэш текста без цифр, хэш формы) — хэши нужны
+        агенту, чтобы отличать новое задание от догрузившихся фото и полей (TaskIdentity)."""
+        parts = [_PH_RE.sub(" ", line) for line in reader]
         text = f"{urlsplit(url).path}|{_clean_basis(chr(10).join(parts))[:6000]}"
         content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
         loose_hash = hashlib.sha1(re.sub(r"\d+", "", text).encode("utf-8")).hexdigest()[:16]
+        # строки раскрытых веток (depth > 0) появляются и исчезают при раскрытии — не в счёт
+        form = [
+            f"{e.kind.value}:{normalize_text(e.text or e.placeholder or e.caption)}"
+            for e in elements
+            if not e.aux and e.depth == 0 and e.container not in ("dialog", "popup", "toast")
+        ]
+        form_hash = hashlib.sha1("|".join(form).encode("utf-8")).hexdigest()[:16]
         # первое фото/аудио различает задания с одинаковым текстом («оцените фото»)
         media = (images[0].src if images else "") + "|" + (audios[0].src if audios else "")
         digest = hashlib.sha1(f"{text}|{media}".encode("utf-8")).hexdigest()[:16]
@@ -1471,7 +1470,7 @@ class DomParser:
                   if normalize_text(t) not in _GENERIC_HEADINGS]
         plain = _plain_text(reader)
         preview = (titled[0] if titled else (plain.strip().splitlines() or [""])[0])[:80]
-        return digest, preview, content_hash, loose_hash
+        return digest, preview, content_hash, loose_hash, form_hash
 
     @staticmethod
     def _pool(headings: list[str], elements: list[ParsedElement], task_text: str) -> tuple[str, str, list[str]]:

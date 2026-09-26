@@ -119,18 +119,39 @@ def test_invalid_json_gets_one_repair_round(monkeypatch):
     assert repair[-2]["role"] == "assistant" and "не прошёл проверку" in repair[-1]["content"]
 
 
-def test_images_are_sent_with_captions(monkeypatch):
+def test_images_are_sent_with_captions_before_the_page(monkeypatch):
+    """Неизменное внутри задания (знания, фото) — в начале сообщения, страница и история — в
+    конце: так повторные вызовы по заданию попадают в кэш OpenAI."""
     photos = [VisionImage(caption="ФОТО 1–4", b64="BBBB"), VisionImage(caption="ФОТО 5", b64="CCCC")]
+    ctx = DecisionContext(images=photos, image_b64="AAAA", knowledge="Правило: сравнивай адреса.",
+                          history=["1. click «Да» → ✓ выбран"])
     with fake_openai([completion(json.dumps(VALID))]) as (url, requests):
         connector = make_connector(monkeypatch, url)
-        run(connector.decide(state(), DecisionContext(images=photos, image_b64="AAAA")))
+        run(connector.decide(state(), ctx))
     content = requests[0]["messages"][1]["content"]
     kinds = [part["type"] for part in content]
-    assert kinds == ["text", "text", "image_url", "text", "image_url", "text", "image_url"]
+    assert kinds == ["text", "text", "image_url", "text", "image_url", "text", "text", "image_url"]
+    head, page = content[0]["text"], content[5]["text"]
+    assert head.startswith("═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ ═══") and "ФОТО 1–4; ФОТО 5" in head
+    assert "СТРАНИЦА ЗАДАНИЯ" not in head and "ИСТОРИЯ" not in head
+    assert page.startswith("═══ СТРАНИЦА ЗАДАНИЯ ═══") and "═══ ИСТОРИЯ" in page
     assert content[1]["text"] == "ФОТО 1–4:" and content[2]["image_url"]["url"].endswith("BBBB")
     assert content[4]["image_url"]["url"].endswith("CCCC")
-    assert content[6]["image_url"]["url"].startswith("data:image/jpeg;base64,AAAA")   # скриншот фрейма
-    assert "Приложены изображения: ФОТО 1–4; ФОТО 5." in content[0]["text"]
+    assert content[7]["image_url"]["url"].startswith("data:image/jpeg;base64,AAAA")   # скриншот фрейма
+
+
+def test_token_usage_is_counted(monkeypatch):
+    body = completion(json.dumps(VALID))
+    body[1]["usage"] = {"prompt_tokens": 4000, "completion_tokens": 150, "total_tokens": 4150,
+                        "prompt_tokens_details": {"cached_tokens": 2048}}
+    with fake_openai([body, body]) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        run(connector.decide(state(), DecisionContext()))
+        before = connector.usage.snapshot()
+        run(connector.decide(state(), DecisionContext()))
+    assert (connector.usage.calls, connector.usage.prompt, connector.usage.cached, connector.usage.completion) \
+        == (2, 8000, 4096, 300)
+    assert connector.usage.since(before).render() == "вызовов модели 1, токенов: вход 4000 (из кэша 2048), выход 150"
 
 
 def test_transcription_falls_back_to_next_model(monkeypatch):

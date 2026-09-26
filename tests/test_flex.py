@@ -15,7 +15,7 @@ from browser_controller import BrowserController
 from dom_parser import DomParser, geo_facts, render_page
 from knowledge import KnowledgeBase
 from media import MediaManager
-from models import ActionType, DecisionContext, ElementKind, LLMDecision, PageState, ParsedElement
+from models import ActionType, DecisionContext, ElementKind, LLMDecision, PageState, ParsedElement, PlannedAction
 from tests.helpers import install_routes, run, workspace_url
 
 # ---------------------------------------------------------------------------
@@ -63,6 +63,21 @@ def submit(state: PageState, **kw) -> LLMDecision:
     button = find(state, "Завершить задание", ElementKind.BUTTON)
     return LLMDecision(reasoning="сценарий", action=ActionType.SUBMIT,
                        target_index=button.index if button else None, **kw)
+
+
+def batch(*steps: LLMDecision, plan: str = "") -> LLMDecision:
+    """Пакет действий: как ответ модели v4 с несколькими actions."""
+    first, rest = steps[0], steps[1:]
+    return first.model_copy(update={
+        "plan": plan,
+        "next_actions": [PlannedAction(action=s.action, target_index=s.target_index, target_text=s.target_text,
+                                       type_text=s.type_text, query=s.query) for s in rest],
+    })
+
+
+def type_into(el: ParsedElement, text: str) -> LLMDecision:
+    return LLMDecision(reasoning="сценарий", action=ActionType.TYPE, target_index=el.index,
+                       target_text=el.placeholder or el.text, type_text=text)
 
 
 class ScriptedLLM:
@@ -356,3 +371,95 @@ def test_media_manager_fetches_authorized_attachments(tmp_path):
     assert len(state.images) == 3 and all(i.src.startswith("https://klecks-operator.test/") for i in state.images)
     assert [i.caption for i in images] == ["ФОТО 1", "ФОТО 2", "ФОТО 3"] and notes == []
     assert all(len(i.b64) > 500 for i in images)
+
+
+# ---------------------------------------------------------------------------
+# Пакет действий: меньше вызовов модели, та же точность
+# ---------------------------------------------------------------------------
+
+
+def groups(state: PageState, label: str) -> list[ParsedElement]:
+    return [e for e in state.visible_elements if e.text == label and e.kind == ElementKind.OPTION]
+
+
+def test_batch_answers_all_questions_and_submits_in_one_call(tmp_path, monkeypatch):
+    """Два вопроса с одинаковыми вариантами «Да/Нет»: одним ответом модели — оба ответа и отправка."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        yes_new, yes_warranty = groups(state, "Да")
+        return batch(click(yes_new), click(yes_warranty), submit(state), plan="новый, гарантия есть")
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, workspace_url("quiz"))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 1 and agent._wrong_total == 0
+    assert len(llm.calls) == 1                     # было бы 3 вызова: click, click, submit
+
+
+def test_batch_stops_when_the_form_changes(tmp_path, monkeypatch):
+    """«Нет» открывает новое поле — пакет останавливается ДО отправки, модель видит новое поле."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        yes_new, yes_warranty = groups(state, "Да")
+        no_new, no_warranty = groups(state, "Нет")
+        if len(llm.calls) == 1:                    # ошибается: «гарантии нет» и сразу отправить
+            return batch(click(yes_new), click(no_warranty), submit(state))
+        return batch(click(yes_warranty), submit(state))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, workspace_url("quiz"))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert len(llm.calls) == 2 and agent._tasks_done == 1
+    second_state, second_ctx = llm.calls[1]
+    assert any("Пакет действий остановлен" in n and "«Укажите причину»" in n and "submit" in n
+               for n in second_ctx.notes)
+    assert find(second_state, "Укажите причину") is not None      # модель видит новое поле
+    assert agent._memory.submits == 0 or agent._wrong_total == 0  # неполный ответ не отправлялся
+
+
+def test_batch_saves_calls_on_training_and_research(tmp_path, monkeypatch):
+    """Тренировка с ошибкой: 3 вызова вместо 5; поиск организации: 3 вызова вместо 8."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("hotels"))
+
+    def hotels(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        first_task = "Отель Магнолия" in state.task_text
+        answer = find(state, "Нет" if (first_task and not ctx.feedback) or not first_task else "Да")
+        return batch(click(answer), submit(state))
+
+    async def run_hotels():
+        agent, llm = make_agent(tmp_path, hotels, workspace_url("hotels"))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(run_hotels())
+    assert agent._tasks_done == 2 and agent._wrong_total == 1 and len(llm.calls) == 3
+
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("org"))
+
+    def org(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        if not ctx.research:
+            return LLMDecision(reasoning="ищу", action=ActionType.WEB, query="lesnoydom.example")
+        if len(ctx.research) == 1:
+            return LLMDecision(reasoning="карточка", action=ActionType.WEB,
+                               query="https://yandex.ru/maps/org/lesnoy-dom/1234567890/")
+        url = find(state, "Введите полный URL на Яндекс Картах")
+        ident = find(state, "Введите ID из URL Яндекс Карт")
+        boxes = [find(state, n) for n in ("Название организации", "URL", "Адрес организации")]
+        return batch(type_into(url, "https://yandex.ru/maps/org/lesnoy-dom/1234567890/"),
+                     type_into(ident, "1234567890"), *[click(b) for b in boxes], submit(state))
+
+    async def run_org():
+        agent, llm = make_agent(tmp_path / "org", org, workspace_url("org"))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(run_org())
+    assert agent._tasks_done == 1 and agent._wrong_total == 0 and len(llm.calls) == 3

@@ -82,6 +82,7 @@ class TaskMemory:
     submits: int = 0
     dialog_attempts: Counter = field(default_factory=Counter)    # текст диалога → попыток закрыть
     instruction_pages: int = 0                                   # прочитано страниц инструкции в этом задании
+    batch_notes: list[str] = field(default_factory=list)         # «пакет остановлен: …» — для следующего шага
 
     def reset(self, task_id: str) -> None:
         """Полный сброс при смене задания (раскрытие папок задание не меняет)."""

@@ -66,6 +66,13 @@ def test_task_identity_rules():
     assert loaded.same_task(counter, submitted=False)             # изменились только цифры (счётчик)
     assert not loaded.same_task(counter, submitted=True)          # «2 из 14» после отправки — новое
     assert not base.same_task(other, submitted=False)
+    # поле «Укажите причину» открылось после выбора ответа — то же задание; после отправки
+    # тот же текст с другими вариантами — новое задание
+    form_a = TaskIdentity("text-1", "loose-1", frozenset(), "form-a")
+    form_b = TaskIdentity("text-1", "loose-1", frozenset(), "form-b")
+    assert form_a.same_task(form_b, submitted=False)
+    assert not form_a.same_task(form_b, submitted=True)
+    assert form_a.same_task(form_a, submitted=True)            # «Неверный ответ» — то же задание
 
 
 def test_search_urls():

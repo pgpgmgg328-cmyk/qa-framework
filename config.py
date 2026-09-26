@@ -176,6 +176,10 @@ READER_MAX_CHARS: int = int(os.getenv("READER_MAX_CHARS", "16000"))   # текс
 MAX_IDLE_SECONDS: float = float(os.getenv("MAX_IDLE_SECONDS", "900"))  # сколько ждать фрейм/задание подряд
 CAPTCHA_TIMEOUT: float = float(os.getenv("CAPTCHA_TIMEOUT", "600"))  # макс. ожидание ручного решения капчи
 MAX_OPEN_RETRIES: int = int(os.getenv("MAX_OPEN_RETRIES", "3"))     # попыток раскрыть одну папку
+# Пакет действий: модель за один ответ выбирает ответы на все видимые вопросы и отправляет.
+# Каждое действие проверяется; при сбое/неожиданном изменении страницы пакет останавливается.
+BATCH_ACTIONS: bool = _env_bool("BATCH_ACTIONS", True)
+MAX_BATCH_ACTIONS: int = int(os.getenv("MAX_BATCH_ACTIONS", "12"))
 MAX_NO_EFFECT: int = int(os.getenv("MAX_NO_EFFECT", "2"))           # повторов действия без эффекта до запрета
 
 # Тексты стартовых кнопок (локальный флоу «Приступить»). Сравнение — точное

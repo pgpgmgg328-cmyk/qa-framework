@@ -94,26 +94,17 @@ FLAG_IN_DIALOG  = "(в диалоге)"
 FLAG_IN_POPUP   = "(во всплывающем списке)"
 
 PROMPT_LEGEND = f"""\
-  {TAG_FOLDER_CLOSED}  — ветка дерева свёрнута; action "open" раскроет её содержимое.
-  {TAG_FOLDER_OPEN} — ветка раскрыта; её содержимое — строки НИЖЕ с бо́льшим отступом.
-  {TAG_OPTION} / [OPTION radio] / [OPTION checkbox] — конечный вариант; action "click" выбирает его
-                     (radio — один вариант из группы, checkbox — можно отметить несколько).
-  {TAG_DROPDOWN_CLOSED} / {TAG_DROPDOWN_OPEN} — выпадающий список; "open" открывает его,
-                     затем "click" по варианту с пометкой {FLAG_IN_POPUP}.
-  [INPUT text] / [INPUT textarea] / [INPUT number] / [INPUT select] … — поле ввода; action "type"
-                     (для [INPUT select] type_text = точный текст одного из вариантов).
-  {TAG_BUTTON}          — кнопка или ссылка; "click". Кнопку отправки ответа нажимай через action "submit".
-  {TAG_OTHER}           — прочий кликабельный элемент."""
+  {TAG_FOLDER_CLOSED} / {TAG_FOLDER_OPEN} — ветка дерева: open раскрывает, содержимое — строки ниже с бо́льшим отступом.
+  {TAG_OPTION} / [OPTION radio] / [OPTION checkbox] — вариант ответа: click выбирает (radio — один в группе, checkbox — несколько).
+  {TAG_DROPDOWN_CLOSED} / {TAG_DROPDOWN_OPEN} — выпадающий список: open, затем click по пункту {FLAG_IN_POPUP}.
+  [INPUT text] / [INPUT textarea] / [INPUT select] … — поле: type (для select — точный текст варианта).
+  {TAG_BUTTON} — кнопка или ссылка; {TAG_OTHER} — прочий кликабельный элемент."""
 
 PROMPT_FLAGS = f"""\
-  {FLAG_SELECTED}      — элемент уже выбран/отмечен.
-  {FLAG_DISABLED}   — нажать нельзя (для кнопки отправки: ответ ещё не заполнен).
-  {FLAG_OCCLUDED}     — сейчас закрыт другим элементом (оверлей, спиннер, диалог).
-  {FLAG_SELECTABLE}  — у папки есть собственный переключатель: её саму можно выбрать как ответ.
-  {FLAG_IN_DIALOG} / {FLAG_IN_POPUP} — элемент модального окна / открытого выпадающего списка.
-  ⟨путь: A › B⟩     — родительские папки; показывается у элементов с одинаковым текстом.
-  ⟨поле: X⟩         — подпись поля/списка на странице (например, название характеристики).
-  → https://…       — адрес, на который ведёт ссылка (координаты карт, сайты)."""
+  {FLAG_SELECTED} — уже выбран; {FLAG_DISABLED} — нажать нельзя (у кнопки отправки: ответ не заполнен);
+  {FLAG_OCCLUDED} — закрыт оверлеем или диалогом; {FLAG_SELECTABLE} — папку можно выбрать как ответ;
+  {FLAG_IN_DIALOG} / {FLAG_IN_POPUP} — в диалоге / в открытом списке; ⟨путь: A › B⟩ — родительские папки
+  (у одинаковых названий); ⟨поле: X⟩ — подпись поля; → https://… — адрес ссылки."""
 
 
 def normalize_text(value: Any) -> str:
@@ -301,6 +292,7 @@ class PageState(BaseModel):
     page_url:        str                 = Field("", description="URL главной страницы (не фрейма)")
     content_hash:    str                 = Field("", description="Хэш текста задания (без медиа)")
     loose_hash:      str                 = Field("", description="Хэш текста задания без цифр")
+    form_hash:       str                 = Field("", description="Хэш состава формы (варианты, поля)")
     media_srcs:      list[str]           = Field(default_factory=list, description="Адреса фото и аудио")
 
     @property
@@ -335,12 +327,14 @@ class PageState(BaseModel):
 # Решение LLM
 # ---------------------------------------------------------------------------
 
-class LLMDecision(BaseModel):
-    """Решение, принятое LLM (устойчиво к «грязным» типам в JSON)."""
+# Действия, после которых страница меняется настолько, что нужен новый взгляд модели:
+# в пакете действий они могут стоять только последними
+PAGE_CHANGING_ACTIONS = frozenset({ActionType.OPEN, ActionType.WEB, ActionType.SCROLL})
 
-    goal:             str           = Field("", description="Что требуется в задании")
-    observation:      str           = Field("", description="Что уже сделано / релевантные элементы")
-    reasoning:        str           = Field("", description="Почему выбрано это действие")
+
+class _ActionFields(BaseModel):
+    """Поля одного действия (общие для решения LLM и шагов пакета)."""
+
     action:           ActionType    = Field(..., description="Действие")
     target_index:     Optional[int] = Field(None, description="Индекс целевого элемента")
     target_text:      Optional[str] = Field(
@@ -353,8 +347,6 @@ class LLMDecision(BaseModel):
     type_text:        Optional[str] = Field(None, description="Текст для ввода")
     query:            Optional[str] = Field(None, description="Поисковый запрос или URL для action=web")
     scroll_direction: Optional[str] = Field(None, description="down/up для action=scroll")
-    plan:             str           = Field("", description="План решения: что сделано, что осталось, найденные факты")
-    confidence:       float         = Field(1.0, ge=0.0, le=1.0)
 
     @field_validator("action", mode="before")
     @classmethod
@@ -393,6 +385,44 @@ class LLMDecision(BaseModel):
         text = str(value).strip()
         return text or None
 
+
+class PlannedAction(_ActionFields):
+    """Следующее действие пакета (после первого)."""
+
+    @classmethod
+    def from_raw(cls, raw: dict[str, Any]) -> "PlannedAction":
+        return cls.model_validate(split_value(raw))
+
+
+def split_value(raw: dict[str, Any]) -> dict[str, Any]:
+    """Поле value из ответа модели → type_text / query / scroll_direction по типу действия.
+    Старые поля (type_text, query, scroll_direction) тоже принимаются."""
+    data = dict(raw)
+    value = data.pop("value", None)
+    if value is not None:
+        action = str(data.get("action") or "").strip().lower()
+        action = _ACTION_SYNONYMS.get(action, action)
+        action = action.value if isinstance(action, ActionType) else action
+        key = {"web": "query", "scroll": "scroll_direction"}.get(action, "type_text")
+        data.setdefault(key, value)
+        if data.get(key) is None:
+            data[key] = value
+    return data
+
+
+class LLMDecision(_ActionFields):
+    """Решение, принятое LLM (устойчиво к «грязным» типам в JSON).
+
+    Поля действия — ПЕРВОЕ действие; next_actions — следующие действия пакета
+    (модель может за один ответ выбрать ответы на все вопросы и отправить)."""
+
+    goal:             str           = Field("", description="Что требуется в задании (v3; теперь в observation)")
+    observation:      str           = Field("", description="Что требуется, ключевые факты, что уже сделано")
+    reasoning:        str           = Field("", description="Почему выбраны эти действия")
+    plan:             str           = Field("", description="План решения: выводы, найденные факты, что осталось")
+    confidence:       float         = Field(1.0, ge=0.0, le=1.0)
+    next_actions:     list[PlannedAction] = Field(default_factory=list, description="Следующие действия пакета")
+
     @field_validator("goal", "observation", "reasoning", "plan", mode="before")
     @classmethod
     def _coerce_str(cls, value: Any) -> Any:
@@ -412,6 +442,19 @@ class LLMDecision(BaseModel):
     @classmethod
     def skip(cls, reason: str) -> "LLMDecision":
         return cls(reasoning=reason, action=ActionType.SKIP, confidence=0.0)
+
+    def steps(self) -> list["LLMDecision"]:
+        """Все действия пакета по порядку — каждое как отдельное решение (для исполнителя)."""
+        first = self.model_copy(update={"next_actions": []})
+        rest = [
+            LLMDecision(
+                action=a.action, target_index=a.target_index, target_text=a.target_text,
+                type_text=a.type_text, query=a.query, scroll_direction=a.scroll_direction,
+                reasoning=self.reasoning, confidence=self.confidence,
+            )
+            for a in self.next_actions
+        ]
+        return [first] + rest
 
 
 # ---------------------------------------------------------------------------

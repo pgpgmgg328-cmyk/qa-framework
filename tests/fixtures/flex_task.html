@@ -274,6 +274,27 @@ const SCENARIOS = {
       }),
     }],
   },
+  quiz: {
+    mode: 'Экзамен', title: 'Выполните задание',
+    tasks: [{
+      render: () => {
+        const q2 = radios([{ text: 'Да' }, { text: 'Нет' }]);
+        // «Нет» открывает обязательное поле причины — форма меняется после выбора
+        q2.addEventListener('change', () => {
+          const no = q2.querySelector('input[value="Нет"]').checked;
+          const reason = document.querySelector('#reason');
+          if (no && !reason) q2.after(Object.assign(textInput('Укажите причину'), { id: 'reason' }));
+          if (!no && reason) reason.remove();
+        });
+        return [
+          text('Товар: холодильник, новый, гарантия производителя 2 года.'),
+          header('Товар новый?'), radios([{ text: 'Да' }, { text: 'Нет' }]),
+          header('Есть гарантия?'), q2,
+        ];
+      },
+      check: (f) => ({ ok: f.radio.join('|') === 'Да|Да', hint: '' }),
+    }],
+  },
   atm: {
     mode: 'Тренировка', title: 'Проверка наличия фото поверхностей банкомата', instruction: true,
     tasks: [{

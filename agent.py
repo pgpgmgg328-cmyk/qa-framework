@@ -37,6 +37,7 @@ from browser_controller import BrowserController, is_connection_lost
 from config import (
     ACTION_WAIT,
     AUDIO_PLAY_TO_END,
+    BATCH_ACTIONS,
     CAPTCHA_TIMEOUT,
     DIALOG_CLOSE_TEXTS,
     EXIT_CANCEL_TEXTS,
@@ -47,6 +48,7 @@ from config import (
     LLM_HISTORY_SIZE,
     LLM_TEMPERATURE,
     LLM_VISION,
+    MAX_BATCH_ACTIONS,
     MAX_IDLE_SECONDS,
     MAX_STEPS,
     MAX_STEPS_PER_TASK,
@@ -70,6 +72,7 @@ from models import (
     FLAG_OCCLUDED,
     FLAG_SELECTABLE,
     FLAG_SELECTED,
+    PAGE_CHANGING_ACTIONS,
     ActionType,
     DecisionContext,
     ElementKind,
@@ -226,18 +229,20 @@ class TaskIdentity:
     content: str
     loose: str
     media: frozenset[str]
+    form: str = ""
 
     @classmethod
     def of(cls, state: PageState) -> "TaskIdentity":
-        return cls(state.content_hash, state.loose_hash, frozenset(state.media_srcs))
+        return cls(state.content_hash, state.loose_hash, frozenset(state.media_srcs), state.form_hash)
 
     def same_task(self, other: "TaskIdentity", *, submitted: bool) -> bool:
         media_related = (not self.media or not other.media or bool(self.media & other.media))
+        if not media_related:
+            return False
         if self.content == other.content:
-            return media_related
-        if self.loose == other.loose and not submitted:
-            return media_related          # отличаются только цифры: таймер, счётчик, «1 из 14»
-        return False
+            # форма изменилась без отправки — это наш же выбор открыл/скрыл поле
+            return self.form == other.form or not submitted
+        return self.loose == other.loose and not submitted   # только цифры: таймер, счётчик
 
 
 class Agent:
@@ -269,6 +274,9 @@ class Agent:
         self._pool: Optional[PoolKnowledge] = None
         self._frame_shot: Optional[str] = None
         self._frame_shot_task = ""
+        # учёт токенов: у LLMConnector есть usage (сценарные «LLM» тестов — без него)
+        usage = getattr(self._llm, "usage", None)
+        self._task_usage_start = usage.snapshot() if usage is not None else None
 
     # ------------------------------------------------------------------
     # Главная точка входа
@@ -321,12 +329,20 @@ class Agent:
                 logger.warning("ДОСТИГНУТ ЛИМИТ ШАГОВ (%d)", MAX_STEPS)
             await self._web.close()
             self._media.close()
+            self._log_task_usage()
             minutes = (time.monotonic() - started) / 60
             logger.info(
                 "ИТОГ: отправлено заданий=%d, из них платформа признала неверными=%d, "
                 "шагов с действием=%d, время %.1f мин",
                 self._tasks_done, self._wrong_total, acted, minutes,
             )
+            usage = getattr(self._llm, "usage", None)
+            if usage is not None and usage.calls:
+                per_task = ""
+                if self._tasks_done:
+                    per_task = (f"; в среднем на задание: вход {usage.prompt // self._tasks_done}, "
+                                f"выход {usage.completion // self._tasks_done}")
+                logger.info("ТОКЕНЫ за запуск: %s%s", usage.render(), per_task)
 
     # ------------------------------------------------------------------
     # Один шаг агента
@@ -415,9 +431,8 @@ class Agent:
         if decision.plan:
             self._memory.plan = decision.plan
 
-        # 13. Сверка цели и выполнение
-        target = self._resolve_target(decision, state)
-        await self._execute(frame, decision, target, state)
+        # 13. Сверка целей и выполнение пакета действий
+        await self._run_batch(frame, decision, state)
         await self._browser.wait_settle(frame)
         return StepResult.ACTED
 
@@ -495,6 +510,8 @@ class Agent:
         """Сбрасывать память ТОЛЬКО при смене задания (см. TaskIdentity)."""
         identity = TaskIdentity.of(state)
         if self._identity is None or not self._identity.same_task(identity, submitted=self._submitted):
+            if self._identity is not None:
+                self._log_task_usage()
             logger.info(
                 "СМЕНА ЗАДАНИЯ: %s → %s «%s»",
                 self._task_identifier[:8] or "—", state.task_identifier[:8], state.task_preview[:60],
@@ -510,6 +527,16 @@ class Agent:
         self._identity = identity
         self._task_identifier = state.task_identifier
         self._submitted = False
+
+    def _log_task_usage(self) -> None:
+        """Расход токенов на прошлое задание (по данным API: вход, из кэша, выход)."""
+        usage = getattr(self._llm, "usage", None)
+        if usage is None or self._task_usage_start is None:
+            return
+        spent = usage.since(self._task_usage_start)
+        self._task_usage_start = usage.snapshot()
+        if spent.calls:
+            logger.info("Токены на задание %s: %s", self._task_identifier[:8] or "—", spent.render())
 
     async def _build_context(self, frame: Frame, state: PageState) -> DecisionContext:
         mem = self._memory
@@ -527,6 +554,8 @@ class Agent:
                          "ТОЛЬКО из текущей страницы.")
         if mem.repeated_forbidden:
             notes.append("Ты повторил действие из НЕ ПОВТОРЯТЬ — выбери другой элемент или другое действие.")
+        notes += mem.batch_notes
+        mem.batch_notes = []
         if mem.web_queries and sum(mem.web_queries.values()) >= MAX_WEB_PER_TASK:
             notes.append("Лимит поисковых запросов на задание исчерпан — отвечай по уже найденным данным.")
 
@@ -864,6 +893,120 @@ class Agent:
         return None
 
     # ------------------------------------------------------------------
+    # Пакет действий
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _order_batch(steps: list[LLMDecision]) -> list[LLMDecision]:
+        """Порядок пакета: submit — только последним; после open/web/scroll действия
+        отбрасываются (страница меняется, нужен новый взгляд модели); лимит длины."""
+        if not BATCH_ACTIONS:
+            return steps[:1]
+        body = [s for s in steps if s.action not in (ActionType.SKIP, ActionType.SUBMIT)]
+        submit = next((s for s in steps if s.action == ActionType.SUBMIT), None)
+        if not body and submit is None:
+            return steps[:1]                              # только skip
+        ordered: list[LLMDecision] = []
+        for step in body:
+            ordered.append(step)
+            if step.action in PAGE_CHANGING_ACTIONS:
+                return ordered[:MAX_BATCH_ACTIONS]
+        if submit is not None and len(ordered) < MAX_BATCH_ACTIONS:
+            ordered.append(submit)                        # не влез в лимит — отправит следующим шагом
+        return ordered[:MAX_BATCH_ACTIONS]
+
+    @staticmethod
+    def _step_label(step: LLMDecision) -> str:
+        what = step.target_text or step.type_text or step.query or ""
+        return f"{step.action.value}" + (f" «{what[:40]}»" if what else "")
+
+    async def _run_batch(self, frame: Frame, decision: LLMDecision, state: PageState) -> None:
+        """Выполнить действия по очереди. Перед каждым следующим: новый снимок, проверка
+        эффекта предыдущего и «ничего неожиданного» (задание то же, не открылся диалог, нет
+        новых ошибок, не появились и не исчезли поля). Иначе пакет останавливается, и модель
+        на следующем шаге видит новое состояние и заметку, что осталось не выполненным."""
+        mem = self._memory
+        all_steps = decision.steps()
+        steps = self._order_batch(all_steps)
+        dropped = [s for s in all_steps if s.action != ActionType.SKIP and not any(s is t for t in steps)]
+        if dropped:
+            mem.batch_notes.append(
+                "Не выполнено (после open/web/scroll нужен новый взгляд на страницу, submit — только "
+                "последним): " + ", ".join(self._step_label(s) for s in dropped)
+            )
+
+        # цели — по тому снимку, который видела модель (номера из него)
+        planned: list[tuple[LLMDecision, Optional[ParsedElement]]] = []
+        for i, step in enumerate(steps):
+            target = self._resolve_target(step, state)
+            if i > 0 and target is None and step.action in (ActionType.CLICK, ActionType.OPEN, ActionType.TYPE):
+                note = f"Действие {self._step_label(step)} не выполнено: элемента [{step.target_index}] нет на странице."
+                rest = steps[i + 1:]
+                if rest:
+                    note += " Следующие действия пакета тоже не выполнены: " + ", ".join(self._step_label(s) for s in rest)
+                mem.batch_notes.append(note)
+                break
+            planned.append((step, target))
+        if len(planned) > 1:
+            logger.info("Пакет из %d действий: %s", len(planned), " → ".join(self._step_label(s) for s, _ in planned))
+
+        current = state
+        last_status, last_target = "", None
+        for i, (step, target) in enumerate(planned):
+            if i > 0:
+                await self._browser.wait_settle(frame)
+                fresh = await DomParser(frame).parse(quiet=True)
+                mem.verify(fresh)
+                reason = self._batch_break_reason(current, fresh, last_status, last_target)
+                if reason is None and target is not None:
+                    remapped = fresh.by_key(target.key)
+                    if remapped is None:
+                        reason = f"элемент «{target.label()}» исчез со страницы"
+                    target = remapped
+                if reason is not None:
+                    rest = ", ".join(self._step_label(s) for s, _ in planned[i:])
+                    logger.info("Пакет остановлен: %s. Не выполнено: %s", reason, rest)
+                    mem.batch_notes.append(f"Пакет действий остановлен: {reason}. Не выполнено: {rest}. "
+                                           "Посмотри на страницу заново.")
+                    return
+                current = fresh
+            last_status = await self._execute(frame, step, target, current)
+            last_target = target
+            if last_status in ("done", "fail"):
+                return
+
+    def _batch_break_reason(
+        self, before: PageState, after: PageState, status: str, target: Optional[ParsedElement],
+    ) -> Optional[str]:
+        """Почему нельзя продолжать пакет после очередного действия (None — можно)."""
+        if status == "continue":
+            result = self._memory.history[-1].result if self._memory.history else ""
+            toggled_off = (target is not None and target.is_selected and target.choice_type == "checkbox"
+                           and result.startswith("⚠ выбор снят"))
+            if not (result.startswith("✓") or toggled_off):
+                return f"«{target.label() if target else '?'}» → {result}"
+        if not TaskIdentity.of(before).same_task(TaskIdentity.of(after), submitted=False):
+            return "задание сменилось"
+        if after.dialog_open and not before.dialog_open:
+            return "открылся диалог"
+        fresh_errors = set(after.notice_texts("error", "warning")) - set(before.notice_texts("error", "warning"))
+        if fresh_errors:
+            return "сообщение платформы: " + " | ".join(sorted(fresh_errors))[:200]
+
+        def form_keys(state: PageState) -> dict[str, str]:
+            return {e.key: e.label() for e in state.elements
+                    if not e.aux and e.container not in ("popup", "dialog", "toast")}
+
+        # Новое поле/вариант может требовать ответа — модель должна его увидеть до отправки.
+        # Исчезнувшие элементы новых обязанностей не создают (если исчезла цель следующего
+        # действия — пакет остановится при поиске цели).
+        was, now = form_keys(before), form_keys(after)
+        added = [now[k] for k in now if k not in was]
+        if added:
+            return "на странице появились " + ", ".join(f"«{x}»" for x in added[:3])
+        return None
+
+    # ------------------------------------------------------------------
     # Выполнение действия
     # ------------------------------------------------------------------
 
@@ -873,7 +1016,11 @@ class Agent:
         decision: LLMDecision,
         target: Optional[ParsedElement],
         state: PageState,
-    ) -> None:
+    ) -> str:
+        """Выполнить одно действие. Возвращает исход для пакета действий:
+        continue — выполнено, эффект проверяется следующим снимком; noop — делать нечего
+        (вариант уже выбран); done — действие завершает пакет (submit, web, open, scroll,
+        skip); fail — не выполнено."""
         action = decision.action
         mem = self._memory
         logger.info(
@@ -887,16 +1034,16 @@ class Agent:
             mem.consecutive_skips += 1
             mem.add(action, None, result="ожидание")
             await asyncio.sleep(ACTION_WAIT * 2)
-            return
+            return "done"
         mem.consecutive_skips = 0
 
         if action == ActionType.WEB:
             await self._do_web(decision.query or decision.type_text or decision.target_text or "")
-            return
+            return "done"
 
         if action == ActionType.SUBMIT:
             await self._do_submit(frame, state, target)
-            return
+            return "done"
 
         if action == ActionType.SCROLL:
             direction = decision.scroll_direction or "down"
@@ -904,40 +1051,40 @@ class Agent:
             if mem.is_forbidden(action, key):
                 mem.repeated_forbidden += 1
                 mem.add(action, target, result="⛔ прокрутка уже ничего не меняла")
-                return
+                return "fail"
             outcome = await self._browser.scroll(frame, target, direction)
             if outcome.ok:
                 mem.expect(action, target, state, note=direction, key=key)
             else:
                 mem.add(action, target, result=f"✗ {outcome.detail}")
-            return
+            return "done"
 
         if target is None:
             mem.invalid_targets += 1
             mem.add(action, None, result=(
                 f"✗ элемент не найден (номер={decision.target_index}, текст=«{decision.target_text or ''}»)"
             ))
-            return
+            return "fail"
         mem.invalid_targets = 0
 
         if is_denied_button(target):
             mem.add(action, target, result="⛔ кнопка из стоп-списка — агент её не нажимает")
-            return
+            return "fail"
         if target.is_disabled:
             mem.add(action, target, result="✗ элемент неактивен — нажать нельзя")
             mem.mark_no_effect(action, target.key)
-            return
+            return "fail"
         if mem.is_forbidden(action, target.key):
             mem.repeated_forbidden += 1
             mem.add(action, target, result="⛔ уже пробовали без эффекта — выбери другое действие")
-            return
+            return "fail"
         mem.repeated_forbidden = 0
 
         # Ссылка на внешний сайт: переход увёл бы фрейм задания со страницы (задание
         # потерялось бы) — открываем её во вкладке поиска и показываем модели как web
         if action == ActionType.CLICK and target.href and self._is_external(target.href, frame):
             await self._do_web(target.href, label=target.label())
-            return
+            return "done"
 
         if action == ActionType.OPEN:
             if (target.kind in (ElementKind.FOLDER, ElementKind.DROPDOWN)
@@ -947,7 +1094,7 @@ class Agent:
                 # настаивает — эвристика состояния могла ошибиться, выполняем.
                 mem.insist[(action, target.key)] += 1
                 mem.add(action, target, result="уже раскрыта — её содержимое ниже, с бо́льшим отступом")
-                return
+                return "done"
             mem.open_attempts[target.key] += 1
             outcome = await self._browser.click_element(frame, target, prefer_toggle=True)
         elif action == ActionType.CLICK:
@@ -956,31 +1103,33 @@ class Agent:
                 # Checkbox можно снять сознательно, поэтому для него клик выполняется.
                 mem.insist[(action, target.key)] += 1
                 mem.add(action, target, result="уже ✓ВЫБРАН — повторный клик снял бы выбор; если всё готово — submit")
-                return
+                return "noop"
             if target.kind == ElementKind.BUTTON and self._is_finish_button(target):
                 await self._do_submit(frame, state, target)
-                return
+                return "done"
             outcome = await self._browser.click_element(frame, target)
         elif action == ActionType.TYPE:
             if decision.type_text is None:
                 mem.add(action, target, result="✗ пустой type_text")
-                return
+                return "fail"
             outcome = await self._browser.type_into(frame, target, decision.type_text)
         else:
             logger.error("Неизвестное действие: %s", action.value)
-            return
+            return "fail"
 
         if outcome.stale:
             mem.add(action, target, result="⚠ элемент перерисовался до клика — повтор на свежем снимке")
-            return
+            return "fail"
         if not outcome.ok:
             mem.add(action, target, result=f"✗ {outcome.detail}")
             mem.mark_no_effect(action, target.key)
-            return
+            return "fail"
         note = f"«{decision.type_text[:80]}»" if action == ActionType.TYPE and decision.type_text else ""
         if outcome.method == "js":
             note = (note + " (js-клик)").strip()
         mem.expect(action, target, state, typed=decision.type_text, note=note)
+        # open меняет страницу (раскрытый список/ветка) — после него нужен новый взгляд модели
+        return "done" if action == ActionType.OPEN else "continue"
 
     @staticmethod
     def _is_external(href: str, frame: Frame) -> bool:
