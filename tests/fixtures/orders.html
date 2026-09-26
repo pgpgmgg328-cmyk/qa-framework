@@ -11,14 +11,18 @@
 <h2>Клекс</h2>
 <div class="tabs"><button type="button">Задания 1</button> <button type="button" aria-selected="true">Обучение 3</button></div>
 <div class="card"><h4>Сравнение отелей</h4><p>Тренировка</p><p>Сравните две карточки отелей.</p>
-  <button type="button" class="start">Приступить</button></div>
+  <button type="button" class="start" data-scenario="hotels">Приступить</button></div>
 <div class="card"><h4>Выделение атрибутов товара</h4><p>Экзамен</p>
-  <button type="button" class="start">Приступить</button></div>
+  <button type="button" class="start" data-scenario="quiz">Приступить</button></div>
 <div class="card"><h4>Прослушка звонка</h4><p>Тренировка</p>
-  <button type="button" class="start">Приступить</button></div>
+  <button type="button" class="start" data-scenario="call">Приступить</button></div>
 <script>
   window.__log = [];
-  document.querySelectorAll('.start').forEach((b) => b.addEventListener('click', () => window.__log.push('ORDER-START')));
+  // «Приступить» открывает заказ: фрейм уходит на задание, сначала — заставка «Тренировка»
+  document.querySelectorAll('.start').forEach((b) => b.addEventListener('click', () => {
+    window.__log.push('ORDER-START');
+    location.href = '/klecks/task?scenario=' + b.dataset.scenario + '&start=1';
+  }));
 </script>
 </body>
 </html>

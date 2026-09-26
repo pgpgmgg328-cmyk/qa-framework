@@ -39,6 +39,7 @@ from config import (
     AUDIO_PLAY_TO_END,
     BATCH_ACTIONS,
     CAPTCHA_TIMEOUT,
+    CLOSE_BROWSER_WHEN_DONE,
     DIALOG_CLOSE_TEXTS,
     EXIT_CANCEL_TEXTS,
     FINISH_BUTTON_TEXTS,
@@ -89,9 +90,15 @@ from task_memory import TaskMemory
 logger = logging.getLogger("twork.agent")
 
 
+# Модель ответила «skip» (ждать): следующий вызов — после изменения страницы, но не позже чем через
+# столько секунд (первое ожидание подряд / следующие)
+SKIP_WAIT_FIRST, SKIP_WAIT_NEXT = 8.0, 20.0
+
+
 class StepResult(str, Enum):
-    ACTED = "acted"   # шаг с действием — расходует MAX_STEPS
-    IDLE = "idle"     # ожидание (нет фрейма, капча, загрузка) — не расходует
+    ACTED = "acted"     # шаг с действием — расходует MAX_STEPS
+    IDLE = "idle"       # ожидание (нет фрейма, капча, загрузка) — не расходует
+    WAITING = "waiting" # список заказов: ждём, пока человек откроет заказ (без лимита простоя)
     STOP = "stop"
 
 
@@ -264,7 +271,8 @@ class Agent:
         self._submitted = False             # после нажатия «Завершить» новое задание ожидаемо
         self._tasks_done = 0
         self._wrong_total = 0
-        self._seen_task = False             # агент уже был в задании (для остановки на списке заказов)
+        self._seen_task = False             # агент уже был в задании (для итога заказа на списке заказов)
+        self._order_mark: Optional[tuple] = None   # начало заказа: (заданий, ошибок, токены, время)
         self._captcha_suppressed_until = 0.0
         self._last_idle_log = 0.0
         self._popup_attempts: dict[str, int] = {}
@@ -285,13 +293,20 @@ class Agent:
     async def run(self) -> None:
         """Запустить агента: работает до возврата на список заказов (или лимитов)."""
         started = time.monotonic()
+        check = getattr(self._llm, "check_model", None)
+        if check is not None:
+            await check()          # модели нет у прокси — ModelUnavailable, браузер не открываем
+            self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4 ЗАПУЩЕН. Работаю, пока платформа не вернёт на список заказов.")
+            logger.info("АГЕНТ v4.2 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+                        "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
+                        "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
             logger.info("=" * 60)
             acted = 0
             idle_since: Optional[float] = None
+            stuck = ""          # агент остановился сам (простой, лимит шагов) — окно не закрываем
             while acted < MAX_STEPS:
                 if self._browser.is_closed():
                     logger.warning("Окно браузера закрыто — остановка")
@@ -316,17 +331,21 @@ class Agent:
 
                 if result == StepResult.STOP:
                     break
-                if result == StepResult.ACTED:
+                if result == StepResult.WAITING:
+                    idle_since = None       # ждать следующий заказ можно сколько угодно
+                elif result == StepResult.ACTED:
                     acted += 1
                     idle_since = None
                 else:
                     idle_since = idle_since or time.monotonic()
                     if time.monotonic() - idle_since > MAX_IDLE_SECONDS:
                         logger.error("Нет активности %.0f с — остановка", MAX_IDLE_SECONDS)
+                        stuck = "нет активности"
                         break
                 await asyncio.sleep(0.2)
             else:
                 logger.warning("ДОСТИГНУТ ЛИМИТ ШАГОВ (%d)", MAX_STEPS)
+                stuck = "лимит шагов"
             await self._web.close()
             self._media.close()
             self._log_task_usage()
@@ -343,6 +362,11 @@ class Agent:
                     per_task = (f"; в среднем на задание: вход {usage.prompt // self._tasks_done}, "
                                 f"выход {usage.completion // self._tasks_done}")
                 logger.info("ТОКЕНЫ за запуск: %s%s", usage.render(), per_task)
+            if stuck and not CLOSE_BROWSER_WHEN_DONE and not self._browser.is_closed():
+                logger.warning("Агент остановлен (%s). Окно браузера оставлено открытым, чтобы было видно, "
+                               "на чём он остановился. Закройте окно браузера (или нажмите Ctrl+C), когда "
+                               "закончите.", stuck)
+                await self._browser.wait_closed()
 
     # ------------------------------------------------------------------
     # Один шаг агента
@@ -356,10 +380,11 @@ class Agent:
         # 2. Фрейм задания
         frame = await self._browser.find_target_frame()
         if frame is None:
+            # вход в аккаунт, другая страница сайта — ждём без лимита простоя (модель не вызывается)
             self._log_idle("Фрейм задания не найден — жду (если нужен вход в аккаунт, войдите в окне "
                            "браузера и откройте заказ кнопкой «Приступить»)")
             await asyncio.sleep(FRAME_LOAD_WAIT)
-            return StepResult.IDLE
+            return StepResult.WAITING
 
         if time.monotonic() > self._captcha_suppressed_until and await self._browser.page_has_captcha():
             await self._wait_captcha_solved()
@@ -384,6 +409,12 @@ class Agent:
         if handled is not None:
             return handled
 
+        # 5а. Заставка «Тренировка … [Начать]» — сразу. Под ней часто ещё крутится загрузка
+        # задания (и не уходит, пока не нажата «Начать»): раньше агент сначала ждал её до ~25 с,
+        # и человек успевал нажать «Начать» сам
+        if state.dialog_open and await self._maybe_click_start(frame, state):
+            return StepResult.ACTED
+
         # 6. Загрузка на всю страницу: ждём, но не бесконечно
         if state.loading and self._memory.loading_waits < 5:
             self._memory.loading_waits += 1
@@ -403,7 +434,9 @@ class Agent:
             self._log_idle("Активных элементов нет — жду загрузки/следующего задания")
             await asyncio.sleep(max(ACTION_WAIT, 1.0))
             return StepResult.IDLE
-        self._seen_task = True
+        if not self._seen_task:
+            self._seen_task = True
+            self._mark_order_start()
 
         # 9. Знания о виде задания: инструкция и подсказки «?» (один раз за запуск)
         if await self._maybe_open_instruction(frame, state):
@@ -452,13 +485,43 @@ class Agent:
         )
 
     async def _on_orders_list(self) -> StepResult:
-        if self._seen_task and STOP_ON_ORDERS_LIST:
-            logger.info("✅ Платформа вернула на список заказов — заказ выполнен, агент завершает работу")
-            return StepResult.STOP
-        self._log_idle("Открыт список заказов. Выберите заказ и нажмите «Приступить» — агент начнёт решать "
-                       "задания и остановится, когда платформа вернёт сюда")
+        """Список заказов: сам заказ агент не выбирает. После выполненного заказа — итог и
+        ожидание следующего (браузер не закрывается), либо выход (CLOSE_BROWSER_WHEN_DONE)."""
+        if self._seen_task:
+            self._seen_task = False
+            self._log_task_usage()
+            self._log_order_summary()
+            if STOP_ON_ORDERS_LIST and CLOSE_BROWSER_WHEN_DONE:
+                logger.info("✅ Платформа вернула на список заказов — заказ выполнен, агент завершает работу")
+                return StepResult.STOP
+            logger.info("✅ Платформа вернула на список заказов — заказ выполнен. Браузер остаётся открытым: "
+                        "откройте следующий заказ («Приступить») — агент продолжит сам. Закончить работу — "
+                        "закройте окно браузера или нажмите Ctrl+C в этом окне.")
+            self._last_idle_log = time.monotonic()
+        else:
+            self._log_idle("Открыт список заказов. Выберите заказ и нажмите «Приступить» — агент начнёт решать "
+                           "задания (заказ выбираете вы)")
         await asyncio.sleep(FRAME_LOAD_WAIT)
-        return StepResult.IDLE
+        return StepResult.WAITING
+
+    def _mark_order_start(self) -> None:
+        usage = getattr(self._llm, "usage", None)
+        self._order_mark = (self._tasks_done, self._wrong_total,
+                            usage.snapshot() if usage is not None else None, time.monotonic())
+
+    def _log_order_summary(self) -> None:
+        if self._order_mark is None:
+            return
+        tasks0, wrong0, usage0, started = self._order_mark
+        self._order_mark = None
+        line = (f"ИТОГ ЗАКАЗА: отправлено заданий={self._tasks_done - tasks0}, из них неверных="
+                f"{self._wrong_total - wrong0}, время {(time.monotonic() - started) / 60:.1f} мин")
+        usage = getattr(self._llm, "usage", None)
+        if usage is not None and usage0 is not None:
+            spent = usage.since(usage0)
+            if spent.calls:
+                line += f"; {spent.render()}"
+        logger.info(line)
 
     async def _dismiss_page_popup(self) -> bool:
         """Новости/объявления сайта (например, «Одноразовые пароли для TWork») открываются
@@ -716,10 +779,7 @@ class Agent:
                     await page.close()
                 except PlaywrightError:
                     pass
-        try:
-            await self._browser.page.bring_to_front()
-        except PlaywrightError:
-            pass
+        await self._browser.ensure_front()
         return text.strip()
 
     async def _close_dialog(self, frame: Frame, state: PageState) -> None:
@@ -779,7 +839,7 @@ class Agent:
                     await page.close()
                 except PlaywrightError:
                     pass
-            await self._browser.page.bring_to_front()
+            await self._browser.ensure_front()
         return True
 
     async def _maybe_read_tooltips(self, frame: Frame, state: PageState) -> None:
@@ -1033,7 +1093,10 @@ class Agent:
         if action == ActionType.SKIP:
             mem.consecutive_skips += 1
             mem.add(action, None, result="ожидание")
-            await asyncio.sleep(ACTION_WAIT * 2)
+            # модель ждёт (загрузка, ответ платформы): следующий вызов — когда страница изменится,
+            # а не каждые пару секунд — ожидание не должно стоить токенов
+            await self._wait_page_change(frame, state,
+                                         timeout=SKIP_WAIT_FIRST if mem.consecutive_skips == 1 else SKIP_WAIT_NEXT)
             return "done"
         mem.consecutive_skips = 0
 
@@ -1130,6 +1193,24 @@ class Agent:
         mem.expect(action, target, state, typed=decision.type_text, note=note)
         # open меняет страницу (раскрытый список/ветка) — после него нужен новый взгляд модели
         return "done" if action == ActionType.OPEN else "continue"
+
+    async def _wait_page_change(self, frame: Frame, state: PageState, timeout: float) -> None:
+        """Ждать изменения страницы (текст без цифр, поля, выбор, загрузка, диалог, сообщения)
+        до timeout секунд — без вызовов модели. Таймеры и счётчики изменением не считаются."""
+        def signature(s: PageState) -> tuple:
+            return (s.loose_hash, s.form_hash, s.loading, s.dialog_open, tuple(sorted(s.notice_texts())),
+                    tuple((e.key, e.is_selected, e.is_disabled) for e in s.visible_elements))
+
+        before = signature(state)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            try:
+                fresh = await DomParser(frame).parse(quiet=True)
+            except PlaywrightError:
+                return                    # фрейм перезагружается — дальше решает основной цикл
+            if signature(fresh) != before:
+                return
 
     @staticmethod
     def _is_external(href: str, frame: Frame) -> bool:

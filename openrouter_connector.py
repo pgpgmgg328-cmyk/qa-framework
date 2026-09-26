@@ -17,22 +17,33 @@ v3: Structured Outputs с откатом на json_object, адаптация п
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import re
-from dataclasses import dataclass
+import struct
+import time
+import zlib
+from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 import openai
 from pydantic import ValidationError
 
 from config import (
+    LLM_CHECK_BELOW,
+    LLM_CHECK_MODEL,
+    LLM_CHECK_PRICE,
     LLM_MAX_RETRIES,
     LLM_MAX_TOKENS,
     LLM_MODEL,
+    LLM_PRICE,
+    LLM_PRICE_CURRENCY,
+    LLM_REASONING_EFFORT,
     LLM_STRUCTURED_OUTPUT,
     LLM_TEMPERATURE,
     LLM_TIMEOUT,
+    LLM_VISION,
     LLM_VISION_DETAIL,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
@@ -126,6 +137,8 @@ SYSTEM_PROMPT = f"""Ты — опытный и очень внимательны
 "reasoning": "почему эти действия", "actions": [{{"action": "click|open|type|scroll|web|submit|skip", \
 "target_index": N или null, "target_text": "дословный текст элемента" или null, "value": "текст для \
 type/web/scroll" или null}}], "confidence": 0.0–1.0}}
+Пиши коротко, без пересказа страницы: observation — 1–2 предложения, reasoning — одно; в plan — только \
+выводы и факты, которые понадобятся дальше (найденные адреса, ID, что уже сделано).
 Пример: вопрос «Отели совпадают?» с [6] «Да», [7] «Нет» и кнопкой [8] «Завершить задание»; названия — \
 одно имя в транслитерации, адреса совпадают, точки в 30 м:
 {{"observation": "решить, один ли это отель; названия и адреса совпадают, точки в 30 м", "plan": "один \
@@ -255,31 +268,142 @@ DECISION_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
+# Прайс OpenAI, $ за 1 млн токенов: вход, вход из кэша, выход. У прокси (ProxyAPI) цена своя: её
+# можно вписать в .env (LLM_PRICE) — тогда стоимость в логе будет по вашему тарифу, в рублях.
+OPENAI_PRICES: dict[str, tuple[float, float, float]] = {
+    "gpt-4o": (2.50, 1.25, 10.00),
+    "gpt-4o-mini": (0.15, 0.075, 0.60),
+    "gpt-4.1": (2.00, 0.50, 8.00),
+    "gpt-4.1-mini": (0.40, 0.10, 1.60),
+    "gpt-4.1-nano": (0.10, 0.025, 0.40),
+    "gpt-5": (1.25, 0.125, 10.00),
+    "gpt-5-mini": (0.25, 0.025, 2.00),
+    "gpt-5-nano": (0.05, 0.005, 0.40),
+    "gpt-5.1": (1.25, 0.125, 10.00),
+    "gpt-5.4": (2.50, 0.25, 15.00),
+    "gpt-5.4-mini": (0.75, 0.075, 4.50),
+    "gpt-5.4-nano": (0.20, 0.02, 1.25),
+    "gpt-5.5": (5.00, 0.50, 30.00),
+}
+
+
+def _model_name(model: str) -> str:
+    """«openai/gpt-4o-2024-08-06» → «gpt-4o»."""
+    return re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model.split("/")[-1].strip().lower())
+
+
+def parse_price(text: str) -> Optional[tuple[float, float, float]]:
+    """«вход,кэш,выход» за 1 млн токенов: «225,22.5,1350» или «0,75; 0,075; 4,5»."""
+    parts = text.split(";") if ";" in text else text.split(",")
+    try:
+        values = [float(x.strip().replace(" ", "").replace(",", ".")) for x in parts]
+    except ValueError:
+        return None
+    if len(values) == 2:                  # без цены кэша — как обычный вход
+        values = [values[0], values[0], values[1]]
+    return tuple(values) if len(values) == 3 else None  # type: ignore[return-value]
+
+
+def model_price(model: str) -> Optional[tuple[float, float, float]]:
+    """Цена модели для оценки стоимости. Свои цены (LLM_PRICE) — для основной модели и
+    модели перепроверки (LLM_CHECK_PRICE); иначе прайс OpenAI для известных моделей."""
+    if LLM_PRICE:
+        if model == LLM_MODEL:
+            return parse_price(LLM_PRICE)
+        return parse_price(LLM_CHECK_PRICE) if LLM_CHECK_PRICE and model == LLM_CHECK_MODEL else None
+    return OPENAI_PRICES.get(_model_name(model))
+
+
+def _money(value: float, currency: str) -> str:
+    if currency in ("$", "USD", "usd"):
+        return f"${value:.4f}" if value < 1 else f"${value:.2f}"
+    return f"{value:.2f} {currency}"
+
+
 @dataclass
 class UsageStats:
-    """Расход токенов: вызовы модели, вход (из них из кэша OpenAI), выход."""
+    """Расход: вызовы модели, токены (вход, из них из кэша OpenAI, выход) и стоимость."""
     calls: int = 0
     prompt: int = 0
     cached: int = 0
     completion: int = 0
+    cost: float = 0.0
+    unpriced: int = 0                     # вызовы моделей, цена которых неизвестна
+    currency: str = "$"
 
-    def add(self, usage: Any) -> None:
-        self.calls += 1
-        self.prompt += int(getattr(usage, "prompt_tokens", 0) or 0)
-        self.completion += int(getattr(usage, "completion_tokens", 0) or 0)
+    def add(self, usage: Any, price: Optional[tuple[float, float, float]] = None) -> None:
+        prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
+        completion = int(getattr(usage, "completion_tokens", 0) or 0)
         details = getattr(usage, "prompt_tokens_details", None)
-        self.cached += int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+        cached = int(getattr(details, "cached_tokens", 0) or 0) if details is not None else 0
+        self.calls += 1
+        self.prompt += prompt
+        self.completion += completion
+        self.cached += cached
+        if price is None:
+            self.unpriced += 1
+        else:
+            fresh = max(prompt - cached, 0)
+            self.cost += (fresh * price[0] + cached * price[1] + completion * price[2]) / 1_000_000
 
     def snapshot(self) -> "UsageStats":
-        return UsageStats(self.calls, self.prompt, self.cached, self.completion)
+        return UsageStats(self.calls, self.prompt, self.cached, self.completion, self.cost,
+                          self.unpriced, self.currency)
 
     def since(self, before: "UsageStats") -> "UsageStats":
         return UsageStats(self.calls - before.calls, self.prompt - before.prompt,
-                          self.cached - before.cached, self.completion - before.completion)
+                          self.cached - before.cached, self.completion - before.completion,
+                          self.cost - before.cost, self.unpriced - before.unpriced, self.currency)
 
     def render(self) -> str:
         cached = f" (из кэша {self.cached})" if self.cached else ""
-        return f"вызовов модели {self.calls}, токенов: вход {self.prompt}{cached}, выход {self.completion}"
+        text = f"вызовов модели {self.calls}, токенов: вход {self.prompt}{cached}, выход {self.completion}"
+        if self.calls > self.unpriced:
+            text += f", ≈ {_money(self.cost, self.currency)}"
+            if self.unpriced:
+                text += " (без вызовов моделей с неизвестной ценой)"
+        return text
+
+
+@dataclass
+class _ModelParams:
+    """Параметры запроса, которые принимает модель (подстраиваются по ошибкам 400)."""
+    tokens_param: str = "max_tokens"
+    temperature: bool = True
+    structured: bool = True
+    reasoning: list[str] = field(default_factory=list)   # очередь значений reasoning_effort
+
+
+def _initial_params(model: str) -> _ModelParams:
+    """reasoning-модели (gpt-5.x, o-серия): max_completion_tokens и минимальное «обдумывание»
+    — иначе лишний запрос с ошибкой на старте и медленные дорогие ответы."""
+    params = _ModelParams(structured=LLM_STRUCTURED_OUTPUT)
+    effort = LLM_REASONING_EFFORT
+    if _model_name(model).startswith(("gpt-5", "o1", "o3", "o4")):
+        params.tokens_param = "max_completion_tokens"
+        if effort in ("", "auto"):
+            params.reasoning = ["none", "minimal", "low"]
+        elif effort not in ("off", "default"):
+            params.reasoning = [effort]
+    elif effort not in ("", "auto", "off", "default"):
+        params.reasoning = [effort]
+    return params
+
+
+def _probe_png(size: int = 512) -> str:
+    """Серая картинка size×size (PNG, base64) — узнать, во сколько токенов модель ставит фото."""
+    raw = b"".join(b"\x00" + b"\x80\x80\x80" * size for _ in range(size))
+
+    def chunk(tag: bytes, data: bytes) -> bytes:
+        return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+
+    png = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0))
+           + chunk(b"IDAT", zlib.compress(raw, 9)) + chunk(b"IEND", b""))
+    return base64.b64encode(png).decode("ascii")
+
+
+class ModelUnavailable(RuntimeError):
+    """Модели нет у прокси (или ключ не даёт к ней доступа) — работать дальше бессмысленно."""
 
 
 class DecisionParseError(ValueError):
@@ -301,18 +425,76 @@ class LLMConnector:
             max_retries=LLM_MAX_RETRIES,  # 429/5xx/обрывы соединения — с экспоненциальной паузой
             default_headers=headers,
         )
-        self._structured = LLM_STRUCTURED_OUTPUT
         self._vision_enabled = True
         self._dead_transcribers: set[str] = set()
-        self.usage = UsageStats()
-        # reasoning-модели (o-серия, gpt-5) требуют max_completion_tokens и не
-        # принимают temperature — параметры подстраиваются по первой ошибке 400
-        self._tokens_param = "max_tokens"
-        self._send_temperature = True
+        self.usage = UsageStats(currency=LLM_PRICE_CURRENCY)
+        # параметры запроса по моделям: reasoning-модели (o-серия, gpt-5) требуют
+        # max_completion_tokens, не все принимают temperature — подстраиваются по ошибкам 400
+        self._params: dict[str, _ModelParams] = {}
+        self._last_error: Optional[Exception] = None
+        self._last_usage: Any = None
         logger.info(
-            "LLM инициализирован: model=%s base=%s structured=%s",
-            LLM_MODEL, OPENAI_BASE_URL, self._structured,
+            "LLM инициализирован: model=%s base=%s%s",
+            LLM_MODEL, OPENAI_BASE_URL, f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
         )
+
+    # ------------------------------------------------------------------
+    # Проверка модели перед работой
+    # ------------------------------------------------------------------
+
+    async def check_model(self) -> None:
+        """Модель доступна у прокси, и сколько токенов стоит фото. Модели нет — ModelUnavailable
+        (агент не открывает браузер зря); проверка не прошла по другой причине — предупреждение."""
+        for model in dict.fromkeys(m for m in (LLM_MODEL, LLM_CHECK_MODEL) if m):
+            await self._check_one(model, photo=model == LLM_MODEL and LLM_VISION != "off")
+
+    async def _check_one(self, model: str, *, photo: bool) -> None:
+        ask = ("Проверка связи перед работой. Верни JSON по схеме: observation, plan и reasoning — "
+               "пустые строки, actions — [{\"action\": \"skip\", \"target_index\": null, "
+               "\"target_text\": null, \"value\": null}], confidence — 1.")
+        started = time.monotonic()
+        if await self._complete([{"role": "user", "content": ask}], LLM_TEMPERATURE, model) is None:
+            self._raise_if_unavailable(model)
+            logger.warning("Проверка модели %s не прошла (%s) — продолжаю, но вызовы могут не работать",
+                           model, str(self._last_error)[:200])
+            return
+        base = int(getattr(self._last_usage, "prompt_tokens", 0) or 0)
+        line = f"Модель {model}: доступна, ответ за {time.monotonic() - started:.1f} с"
+        if photo and base:                   # прокси сообщает расход — можно узнать цену фото
+            image = [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,{_probe_png()}", "detail": LLM_VISION_DETAIL}}]
+            if await self._complete([{"role": "user", "content": image}], LLM_TEMPERATURE, model) is not None:
+                tokens = int(getattr(self._last_usage, "prompt_tokens", 0) or 0) - base
+                price = model_price(model)
+                cost = f" (≈ {_money(tokens * price[0] / 1_000_000, self.usage.currency)})" if price else ""
+                line += f"; фото 512×512 — {tokens} токенов на вход{cost}"
+                if tokens > 1500:        # у gpt-4o — 255, у новых моделей — 400–650
+                    logger.warning(
+                        "⚠ Модель %s считает фото очень дорого: %d токенов за картинку 512×512 (обычно "
+                        "250–650). Задания с фото обойдутся в разы дороже — выберите другую модель "
+                        "(LLM_MODEL в .env) или поставьте LLM_VISION_DETAIL=low", model, tokens)
+        logger.info(line)
+
+    def _raise_if_unavailable(self, model: str) -> None:
+        exc = self._last_error
+        message = str(exc).lower()
+        missing = isinstance(exc, (openai.NotFoundError, openai.PermissionDeniedError)) or (
+            isinstance(exc, openai.BadRequestError) and "model" in message
+            and any(w in message for w in ("not found", "does not exist", "unknown", "invalid", "not supported",
+                                            "не найден", "не поддерж", "недоступ")))
+        if isinstance(exc, openai.AuthenticationError):
+            raise ModelUnavailable(f"Ключ OPENAI_API_KEY не подходит к {OPENAI_BASE_URL}: {str(exc)[:200]}")
+        if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
+            raise ModelUnavailable(f"Прокси отказал в оплате запроса (недостаточно средств на балансе?): "
+                                   f"{str(exc)[:200]}")
+        if missing:
+            raise ModelUnavailable(
+                f"Модель {model} недоступна у {OPENAI_BASE_URL}: {str(exc)[:200]}. Впишите в .env другую "
+                "модель (LLM_MODEL=…) из списка моделей в личном кабинете прокси")
+
+    # ------------------------------------------------------------------
+    # Решение
+    # ------------------------------------------------------------------
 
     async def decide(
         self,
@@ -332,10 +514,29 @@ class LLMConnector:
         ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
 
+        decision = await self._ask(LLM_MODEL, messages, temperature)
+        if decision is None:
+            return LLMDecision.skip("ошибка API LLM или невалидный ответ")
+        if self._needs_check(decision):
+            logger.info("Модель не уверена в отправляемом ответе (%.2f < %.2f) — перепроверяю моделью %s",
+                        decision.confidence, LLM_CHECK_BELOW, LLM_CHECK_MODEL)
+            checked = await self._ask(LLM_CHECK_MODEL, messages, temperature)
+            if checked is not None:
+                decision = checked
+        return decision
+
+    @staticmethod
+    def _needs_check(decision: LLMDecision) -> bool:
+        return (bool(LLM_CHECK_MODEL) and LLM_CHECK_MODEL != LLM_MODEL
+                and decision.confidence < LLM_CHECK_BELOW
+                and any(step.action == ActionType.SUBMIT for step in decision.steps()))
+
+    async def _ask(self, model: str, messages: list[dict[str, Any]], temperature: float) -> Optional[LLMDecision]:
+        """Запрос к модели + одна попытка «ремонта» JSON. None — ошибка API или ответ не разобран."""
         for attempt in (1, 2):
-            raw = await self._complete(messages, temperature)
+            raw = await self._complete(messages, temperature, model)
             if raw is None:
-                return LLMDecision.skip("ошибка API LLM")
+                return None
             try:
                 decision = self.parse_response(raw)
             except DecisionParseError as exc:
@@ -348,50 +549,63 @@ class LLMConnector:
                     )},
                 ]
                 continue
-            self._log_decision(decision)
+            self._log_decision(decision, model)
             return decision
-        return LLMDecision.skip("невалидный ответ LLM дважды")
+        return None
 
     # ------------------------------------------------------------------
     # Запрос
     # ------------------------------------------------------------------
 
-    async def _complete(self, messages: list[dict[str, Any]], temperature: float) -> Optional[str]:
+    async def _complete(
+        self, messages: list[dict[str, Any]], temperature: float, model: str = LLM_MODEL,
+    ) -> Optional[str]:
+        params = self._params.setdefault(model, _initial_params(model))
         kwargs: dict[str, Any] = {
-            "model": LLM_MODEL,
-            self._tokens_param: LLM_MAX_TOKENS,
+            "model": model,
+            params.tokens_param: LLM_MAX_TOKENS,
             "messages": messages,
             "response_format": (
                 {"type": "json_schema", "json_schema": DECISION_JSON_SCHEMA}
-                if self._structured else {"type": "json_object"}
+                if params.structured else {"type": "json_object"}
             ),
         }
-        if self._send_temperature:
+        if params.temperature:
             kwargs["temperature"] = temperature
+        if params.reasoning:
+            kwargs["reasoning_effort"] = params.reasoning[0]
+        self._last_error = None
         try:
             response = await self._client.chat.completions.create(**kwargs)
         except openai.BadRequestError as exc:
             message = str(exc).lower()
-            if "max_tokens" in message and self._tokens_param == "max_tokens":
-                logger.warning("Модель требует max_completion_tokens — переключаюсь")
-                self._tokens_param = "max_completion_tokens"
-                return await self._complete(messages, temperature)
-            if "temperature" in message and self._send_temperature:
-                logger.warning("Модель не принимает temperature — отправляю без него")
-                self._send_temperature = False
-                return await self._complete(messages, temperature)
-            if self._structured and ("response_format" in message or "json_schema" in message or "schema" in message):
+            if params.reasoning and "reasoning" in message:
+                dropped = params.reasoning.pop(0)
+                logger.info("Модель %s не принимает reasoning_effort=%s%s", model, dropped,
+                            f" — пробую {params.reasoning[0]}" if params.reasoning else " — отправляю без него")
+                return await self._complete(messages, temperature, model)
+            if "max_tokens" in message and params.tokens_param == "max_tokens":
+                logger.warning("Модель %s требует max_completion_tokens — переключаюсь", model)
+                params.tokens_param = "max_completion_tokens"
+                return await self._complete(messages, temperature, model)
+            if "temperature" in message and params.temperature:
+                logger.warning("Модель %s не принимает temperature — отправляю без него", model)
+                params.temperature = False
+                return await self._complete(messages, temperature, model)
+            if params.structured and ("response_format" in message or "json_schema" in message or "schema" in message):
                 logger.warning("Structured Outputs не поддерживаются (%s) — переключаюсь на json_object", exc)
-                self._structured = False
-                return await self._complete(messages, temperature)
+                params.structured = False
+                return await self._complete(messages, temperature, model)
             if self._vision_enabled and "image" in message and self._has_image(messages):
                 logger.warning("Модель не принимает изображения (%s) — отправляю без картинки", exc)
                 self._vision_enabled = False
-                return await self._complete(self._strip_images(messages), temperature)
+                return await self._complete(self._strip_images(messages), temperature, model)
             logger.error("LLM API ошибка запроса: %s", exc)
+            self._last_error = exc
             return None
         except openai.OpenAIError as exc:
             logger.error("LLM API ошибка: %s", exc)
+            self._last_error = exc
             return None
 
         choice = response.choices[0]
@@ -402,10 +616,11 @@ class LLMConnector:
         if choice.finish_reason == "length":
             logger.warning("Ответ обрезан по max_tokens=%d — увеличьте LLM_MAX_TOKENS", LLM_MAX_TOKENS)
         usage = getattr(response, "usage", None)
+        self._last_usage = usage
         if usage is not None:
-            self.usage.add(usage)
+            self.usage.add(usage, model_price(model))
             details = getattr(usage, "prompt_tokens_details", None)
-            logger.debug("Токены: вход=%s (кэш %s) выход=%s", usage.prompt_tokens,
+            logger.debug("Токены %s: вход=%s (кэш %s) выход=%s", model, usage.prompt_tokens,
                          getattr(details, "cached_tokens", 0) if details is not None else 0,
                          usage.completion_tokens)
         return choice.message.content or ""
@@ -603,7 +818,7 @@ class LLMConnector:
     _parse_response = parse_response
 
     @staticmethod
-    def _log_decision(decision: LLMDecision) -> None:
+    def _log_decision(decision: LLMDecision, model: str = LLM_MODEL) -> None:
         steps = decision.steps()
         chain = " → ".join(
             f"{d.action.value}"
@@ -612,7 +827,8 @@ class LLMConnector:
             + (f" «{(d.type_text or d.query or '')[:40]}»" if (d.type_text or d.query) else "")
             for d in steps
         )
-        logger.info("LLM решение (%d действ.): %s conf=%.2f", len(steps), chain, decision.confidence)
+        logger.info("LLM решение%s (%d действ.): %s conf=%.2f", "" if model == LLM_MODEL else f" [{model}]",
+                    len(steps), chain, decision.confidence)
         if decision.observation:
             logger.info("  наблюдение: %s", decision.observation[:400])
         if decision.plan:

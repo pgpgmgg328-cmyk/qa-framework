@@ -51,6 +51,7 @@
   tui-dropdown button { display: block; width: 100%; text-align: left; height: 26px; border: 0; background: #fff; }
   global-loader { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(255,255,255,.6); z-index: 40; }
   global-loader[data-visible="true"] { display: flex; }
+  global-loader.behind { z-index: 5; }   /* загрузка задания ПОД окном «Тренировка» */
   .t-loader { width: 40px; height: 40px; border-radius: 50%; border: 4px solid #999; border-top-color: transparent; }
   tui-loader:not(._loading) .t-loader { display: none; }
   tui-hint { position: fixed; background: #333; color: #fff; padding: 6px; border-radius: 6px; z-index: 50; max-width: 260px; }
@@ -393,7 +394,27 @@ const openInstruction = () => {
 };
 $('#instr').addEventListener('click', openInstruction);
 
+// Заставка тренировки (как на T-Work): окно «Тренировка … [Начать]», а под ним ещё крутится
+// загрузка задания — она уходит, только когда нажата «Начать»
+const openStartDialog = () => {
+  const loader = $('#loader');
+  loader.classList.add('behind');
+  loader.setAttribute('aria-busy', 'true');         // загрузка на всю страницу
+  loader.dataset.visible = 'true';
+  const d = dialog(h('h2', {}, 'Тренировка'),
+    h('p', {}, 'Внимательно изучите инструкцию и потренируйтесь перед выполнением реальных заданий. ' +
+               'Во время тренировки ошибки не учитываются'),
+    h('button', { type: 'button', class: 'tui-space_top-6', onclick: () => {
+      window.__log.push('start:clicked');
+      d.remove();
+      loader.dataset.visible = 'false';
+      loader.classList.remove('behind');
+      loader.removeAttribute('aria-busy');
+    } }, 'Начать'));
+};
+
 renderTask();
+if (params.get('start') === '1') openStartDialog();
 if (sc.instruction && params.get('autoinstruction') === '1') openInstruction();
 </script>
 </body>

@@ -6,7 +6,9 @@
 import logging
 import os
 import sys
+import time
 from pathlib import Path
+from typing import Optional
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -67,13 +69,57 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger("twork.config")
+# клиент OpenAI пишет в INFO каждый HTTP-запрос — в логе агента это шум
+for _noisy in ("httpx", "httpx2", "httpcore", "httpcore2", "openai"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+# Папка логов: каждый запуск — свой файл (например, logs/agent-20260927-101500.log): по нему
+# можно разобрать, что делал агент и сколько потратил. Пусто — без файла
+LOG_DIR: str = os.getenv("LOG_DIR", "logs").strip()
+LOG_KEEP: int = int(os.getenv("LOG_KEEP", "30"))          # сколько последних файлов хранить
+
+
+def enable_file_log(kind: str) -> Optional[Path]:
+    """Дублировать лог в файл logs/<kind>-<дата-время>.log (старые файлы сверх LOG_KEEP удаляются)."""
+    if not LOG_DIR:
+        return None
+    folder = Path(LOG_DIR)
+    if not folder.is_absolute():
+        folder = Path(__file__).resolve().parent / folder
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        if LOG_KEEP > 0:
+            previous = sorted(folder.glob(f"{kind}-*.log"))        # имя с датой — старые первыми
+            for stale in previous[:max(len(previous) - (LOG_KEEP - 1), 0)]:
+                stale.unlink(missing_ok=True)
+        path = folder / f"{kind}-{time.strftime('%Y%m%d-%H%M%S')}.log"
+        handler = logging.FileHandler(path, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Файл лога не создан (%s)", exc)
+        return None
+    handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)-8s] %(name)s — %(message)s", "%H:%M:%S"))
+    logging.getLogger().addHandler(handler)
+    return path
 
 # ---------------------------------------------------------------------------
 # LLM / ProxyAPI / OpenRouter
 # ---------------------------------------------------------------------------
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4o")
+# gpt-5.4-mini: в ~3 раза дешевле gpt-4o на входе, повторяющаяся часть запроса — за 10% цены.
+# При запуске агент проверяет модель и пишет, сколько токенов стоит фото (см. README, «Выбор модели»)
+LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5.4-mini")
+# Reasoning-модели (gpt-5.x, o-серия): сколько «думать» перед ответом. auto — минимум, который
+# принимает модель (none → minimal → low): быстрее и дешевле; low / medium — точнее, но дороже
+LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "auto").strip().lower()
+# Перепроверка: основная модель не уверена (confidence ниже LLM_CHECK_BELOW) в ответе, который
+# отправляется, — решение перепроверяет более сильная модель LLM_CHECK_MODEL. Пусто — выключено
+LLM_CHECK_MODEL: str = os.getenv("LLM_CHECK_MODEL", "").strip()
+LLM_CHECK_BELOW: float = float(os.getenv("LLM_CHECK_BELOW", "0.7"))
+# Цена за 1 млн токенов «вход,вход из кэша,выход» — для стоимости в логе (например, цены ProxyAPI
+# в рублях из личного кабинета). Пусто — прайс OpenAI для известных моделей, в долларах
+LLM_PRICE: str = os.getenv("LLM_PRICE", "").strip()
+LLM_CHECK_PRICE: str = os.getenv("LLM_CHECK_PRICE", "").strip()
+LLM_PRICE_CURRENCY: str = os.getenv("LLM_PRICE_CURRENCY", "₽" if LLM_PRICE else "$").strip()
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 # план + рассуждения + ответ: 1024 токенов иногда не хватало на задания с несколькими полями
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2000"))
@@ -95,7 +141,10 @@ LLM_VISION_DETAIL: str = os.getenv("LLM_VISION_DETAIL", "high")   # low | high |
 VISION_MAX_IMAGES: int = int(os.getenv("VISION_MAX_IMAGES", "36"))   # больше — не отправляются
 VISION_SINGLE_MAX: int = int(os.getenv("VISION_SINGLE_MAX", "6"))    # до стольких фото — по одному
 VISION_IMAGE_SIDE: int = int(os.getenv("VISION_IMAGE_SIDE", "1024"))  # длинная сторона одиночного фото
-VISION_CELL: int = int(os.getenv("VISION_CELL", "512"))              # ячейка коллажа, px
+# ячейка коллажа, px: коллаж 2×2 — 774 px. gpt-4o всё равно уменьшает картинку до 768 px (и берёт
+# за неё столько же токенов), а новые модели считают токены по площади — коллаж в 1030 px был
+# для них на ~40% дороже без выигрыша в деталях
+VISION_CELL: int = int(os.getenv("VISION_CELL", "384"))
 LLM_HISTORY_SIZE: int = int(os.getenv("LLM_HISTORY_SIZE", "14"))  # строк истории в промпте
 
 # Аудио: расшифровка через audio.transcriptions того же API (ProxyAPI/OpenAI).
@@ -117,6 +166,9 @@ TARGET_URL: str = os.getenv("TARGET_URL", "https://twork.tbank.ru")
 VIEWPORT_WIDTH: int = int(os.getenv("VIEWPORT_WIDTH", "1280"))
 VIEWPORT_HEIGHT: int = int(os.getenv("VIEWPORT_HEIGHT", "720"))
 HEADLESS: bool = _env_bool("HEADLESS", False)
+# Windows: свёрнутое окно браузера агент убирает за край экрана (свёрнутый Chrome не рисует
+# страницу, и агент в нём работает в разы медленнее); вернуть окно — кнопка на панели задач
+WINDOW_GUARD: bool = _env_bool("WINDOW_GUARD", True)
 # slow_mo замедляет КАЖДЫЙ вызов Playwright (включая чтение DOM), а не только клики.
 # «Человечность» кликов обеспечивают явные паузы в BrowserController, поэтому 0.
 SLOW_MO: int = int(os.getenv("SLOW_MO", "0"))
@@ -217,6 +269,10 @@ DIALOG_CLOSE_TEXTS: tuple[str, ...] = _env_list(
 # Список заказов: сюда платформа возвращает после последнего задания заказа
 # ---------------------------------------------------------------------------
 STOP_ON_ORDERS_LIST: bool = _env_bool("STOP_ON_ORDERS_LIST", True)
+# Заказ выполнен (платформа вернула на список) — что дальше. false (по умолчанию): браузер
+# остаётся открытым, агент ждёт — откройте следующий заказ, и он продолжит; закрыли окно
+# браузера или нажали Ctrl+C — агент завершает работу. true: сразу завершить работу (как в v4).
+CLOSE_BROWSER_WHEN_DONE: bool = _env_bool("CLOSE_BROWSER_WHEN_DONE", False)
 # Признаки: в URL фрейма нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
 TASK_URL_KEYWORDS: tuple[str, ...] = _env_list("TASK_URL_KEYWORDS", ("/task",))
 ORDERS_BUTTON_TEXTS: tuple[str, ...] = _env_list("ORDERS_BUTTON_TEXTS", ("приступить",))

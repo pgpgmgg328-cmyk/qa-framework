@@ -52,8 +52,10 @@ def fixture_url(task: str) -> str:
     return f"https://klecks-operator.test/task/{task}.html"
 
 
-def workspace_url(scenario: str, *, popup: bool = False, autoinstruction: bool = False) -> str:
-    extra = ("&popup=1" if popup else "") + ("&autoinstruction=1" if autoinstruction else "")
+def workspace_url(scenario: str, *, popup: bool = False, autoinstruction: bool = False,
+                  start: bool = False) -> str:
+    """start=True — задание открывается заставкой «Тренировка … [Начать]» (под ней идёт загрузка)."""
+    extra = ("&popup=1" if popup else "") + ("&autoinstruction=1" if autoinstruction else "") + ("&start=1" if start else "")
     return f"https://t-work.test/workspace.html?scenario={scenario}{extra}"
 
 
@@ -104,6 +106,8 @@ async def install_routes(context: BrowserContext) -> None:
                 src = f"https://klecks-operator.test/klecks/task?scenario={scenario}"
                 if query.get("autoinstruction"):
                     src += "&autoinstruction=1"
+                if query.get("start"):
+                    src += "&start=1"
                 await html(route, WRAPPER.format(src=src, popup=NEWS_POPUP if query.get("popup") else ""))
             else:
                 task = query.get("task", ["task_tree"])[0]

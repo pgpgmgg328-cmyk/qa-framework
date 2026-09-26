@@ -95,6 +95,8 @@ def test_structured_outputs_fallback_to_json_object(monkeypatch):
 
 
 def test_reasoning_model_parameters_are_adapted(monkeypatch):
+    """Незнакомая модель: параметры подстраиваются по ошибкам 400."""
+    monkeypatch.setattr(oc, "LLM_MODEL", "some-new-model")
     responses = [
         bad_request("Unsupported parameter: 'max_tokens' is not supported with this model. "
                     "Use 'max_completion_tokens' instead."),
@@ -107,6 +109,25 @@ def test_reasoning_model_parameters_are_adapted(monkeypatch):
     assert decision.action == ActionType.OPEN
     assert "max_tokens" in requests[0] and "max_completion_tokens" in requests[1]
     assert "temperature" in requests[1] and "temperature" not in requests[2]
+    assert all("reasoning_effort" not in r for r in requests)
+
+
+def test_gpt5_models_get_their_parameters_at_once(monkeypatch):
+    """gpt-5.x: сразу max_completion_tokens и минимальное «обдумывание»; значение, которое модель
+    не принимает, заменяется следующим (none → minimal)."""
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-5-mini")
+    responses = [
+        bad_request("Unsupported value: 'reasoning_effort' does not support 'none' with this model. "
+                    "Supported values are: 'minimal', 'low', 'medium', and 'high'."),
+        completion(json.dumps(VALID)),
+        completion(json.dumps(VALID)),
+    ]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        run(connector.decide(state(), DecisionContext()))
+        run(connector.decide(state(), DecisionContext()))
+    assert "max_completion_tokens" in requests[0] and "max_tokens" not in requests[0]
+    assert [r["reasoning_effort"] for r in requests] == ["none", "minimal", "minimal"]
 
 
 def test_invalid_json_gets_one_repair_round(monkeypatch):
@@ -141,6 +162,7 @@ def test_images_are_sent_with_captions_before_the_page(monkeypatch):
 
 
 def test_token_usage_is_counted(monkeypatch):
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-4o")
     body = completion(json.dumps(VALID))
     body[1]["usage"] = {"prompt_tokens": 4000, "completion_tokens": 150, "total_tokens": 4150,
                         "prompt_tokens_details": {"cached_tokens": 2048}}
@@ -151,7 +173,90 @@ def test_token_usage_is_counted(monkeypatch):
         run(connector.decide(state(), DecisionContext()))
     assert (connector.usage.calls, connector.usage.prompt, connector.usage.cached, connector.usage.completion) \
         == (2, 8000, 4096, 300)
-    assert connector.usage.since(before).render() == "вызовов модели 1, токенов: вход 4000 (из кэша 2048), выход 150"
+    assert connector.usage.since(before).render() == \
+        "вызовов модели 1, токенов: вход 4000 (из кэша 2048), выход 150, ≈ $0.0089"
+
+
+def test_cost_in_your_currency(monkeypatch):
+    """Цены из личного кабинета прокси (LLM_PRICE) — стоимость в логе в рублях."""
+    monkeypatch.setattr(oc, "LLM_PRICE", "225, 22.5, 1350")
+    monkeypatch.setattr(oc, "LLM_PRICE_CURRENCY", "₽")
+    body = completion(json.dumps(VALID))
+    body[1]["usage"] = {"prompt_tokens": 4000, "completion_tokens": 150, "total_tokens": 4150,
+                        "prompt_tokens_details": {"cached_tokens": 2048}}
+    with fake_openai([body]) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        run(connector.decide(state(), DecisionContext()))
+    assert connector.usage.render().endswith(", ≈ 0.69 ₽")
+    assert oc.parse_price("0,75; 0,075; 4,5") == (0.75, 0.075, 4.5) and oc.parse_price("1,2") == (1.0, 1.0, 2.0)
+    assert oc.model_price("openai/gpt-4o-2024-08-06") is None               # свои цены — только для LLM_MODEL
+    monkeypatch.setattr(oc, "LLM_PRICE", "")
+    assert oc.model_price("openai/gpt-4o-2024-08-06") == (2.50, 1.25, 10.00)
+    assert oc.model_price("gpt-5.4-mini") == (0.75, 0.075, 4.50) and oc.model_price("gpt-9") is None
+
+
+def usage_body(prompt: int, completion_tokens: int = 20) -> tuple[int, dict]:
+    status, body = completion(json.dumps(VALID))
+    body["usage"] = {"prompt_tokens": prompt, "completion_tokens": completion_tokens,
+                     "total_tokens": prompt + completion_tokens}
+    return status, body
+
+
+def test_model_check_reports_photo_cost(monkeypatch, caplog):
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-4o")
+    monkeypatch.setattr(oc, "LLM_VISION", "auto")
+    with fake_openai([usage_body(120), usage_body(375)]) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        with caplog.at_level("INFO", logger="twork.llm"):
+            run(connector.check_model())
+    assert requests[1]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
+    assert "Модель gpt-4o: доступна" in caplog.text and "фото 512×512 — 255 токенов на вход" in caplog.text
+    assert "очень дорого" not in caplog.text
+
+
+def test_model_check_warns_about_expensive_photos(monkeypatch, caplog):
+    """Модель, которая берёт за картинку десятки тысяч токенов, видна до начала работы."""
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-5.4-mini")
+    monkeypatch.setattr(oc, "LLM_VISION", "auto")
+    with fake_openai([usage_body(120), usage_body(16_500)]) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        with caplog.at_level("INFO", logger="twork.llm"):
+            run(connector.check_model())
+    assert "очень дорого: 16380 токенов" in caplog.text
+
+
+def test_model_check_stops_on_unknown_model(monkeypatch):
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-9-turbo")
+    not_found = (404, {"error": {"message": "The model `gpt-9-turbo` does not exist or you do not have access "
+                                            "to it.", "type": "invalid_request_error", "code": "model_not_found"}})
+    with fake_openai([not_found]) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        try:
+            run(connector.check_model())
+        except oc.ModelUnavailable as exc:
+            assert "gpt-9-turbo" in str(exc) and "LLM_MODEL" in str(exc)
+        else:
+            raise AssertionError("недоступная модель не остановила запуск")
+
+
+def test_unsure_submit_is_rechecked_by_stronger_model(monkeypatch):
+    """Дешёвая модель не уверена в ответе, который отправляет, — решение за сильной моделью."""
+    monkeypatch.setattr(oc, "LLM_MODEL", "gpt-5.4-nano")
+    monkeypatch.setattr(oc, "LLM_CHECK_MODEL", "gpt-5.4")
+    unsure = {"observation": "", "plan": "", "reasoning": "не уверен", "confidence": 0.4, "actions": [
+        {"action": "click", "target_index": 0, "target_text": "Электроника", "value": None},
+        {"action": "submit", "target_index": None, "target_text": None, "value": None}]}
+    sure = {**unsure, "reasoning": "проверил", "confidence": 0.9, "actions": [
+        {"action": "open", "target_index": 0, "target_text": "Электроника", "value": None}]}
+    confident_submit = {**unsure, "confidence": 0.95}
+    responses = [completion(json.dumps(unsure)), completion(json.dumps(sure)), completion(json.dumps(confident_submit))]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        first = run(connector.decide(state(), DecisionContext()))
+        second = run(connector.decide(state(), DecisionContext()))
+    assert [r["model"] for r in requests] == ["gpt-5.4-nano", "gpt-5.4", "gpt-5.4-nano"]
+    assert first.action == ActionType.OPEN and first.reasoning == "проверил"
+    assert second.confidence == 0.95 and len(second.steps()) == 2      # уверенный ответ — без перепроверки
 
 
 def test_transcription_falls_back_to_next_model(monkeypatch):

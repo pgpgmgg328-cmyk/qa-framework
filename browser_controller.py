@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import os
 import random
 import re
 import time
@@ -60,9 +61,11 @@ from config import (
     USER_DATA_DIR,
     VIEWPORT_HEIGHT,
     VIEWPORT_WIDTH,
+    WINDOW_GUARD,
 )
 from dom_parser import INTERACTIVE_SELECTOR
 from models import ElementKind, ParsedElement, normalize_text
+from window_guard import WindowGuard, win_api
 
 logger = logging.getLogger("twork.browser")
 
@@ -157,6 +160,32 @@ el => {
 }
 """
 
+# Страница отрисовывается? В свёрнутом окне (или фоновой вкладке) кадров нет: requestAnimationFrame
+# не срабатывает, проверки Playwright перед кликом ждут кадра и падают по таймауту
+_JS_RENDERING = """
+(ms) => new Promise((resolve) => {
+    let done = false;
+    requestAnimationFrame(() => { done = true; resolve(true); });
+    setTimeout(() => { if (!done) resolve(false); }, ms);
+})
+"""
+_JS_RENDERING_EL = "(_, ms) => (" + _JS_RENDERING.strip() + ")(ms)"
+
+# Прокрутка ближайшего прокручиваемого предка (колесо мыши без отрисовки не прокручивает)
+_JS_SCROLL = """
+(el, dy) => {
+    for (let n = el; n && n !== document.body; n = n.parentElement) {
+        const s = getComputedStyle(n);
+        if (/(auto|scroll|overlay)/.test(s.overflowY) && n.scrollHeight > n.clientHeight + 2) {
+            n.scrollBy(0, dy);
+            return true;
+        }
+    }
+    window.scrollBy(0, dy);
+    return true;
+}
+"""
+
 # Кто перекрывает центр элемента (для логов и истории)
 _JS_BLOCKER = """
 el => {
@@ -201,6 +230,9 @@ class BrowserController:
         self._context:    Optional[BrowserContext] = None
         self._page:       Optional[Page] = None
         self._last_frame_warning = 0.0
+        self._window_task: Optional[asyncio.Task] = None
+        self._guard: Optional[WindowGuard] = None
+        self._cdp = None                    # CDP-сессия главной страницы (состояние окна)
         # хук после создания контекста: маршруты (тесты, блокировка аналитики), куки и т.п.
         self._on_context = on_context
         # None — как в .env (HEADLESS); режим записи принудительно открывает окно
@@ -285,6 +317,8 @@ class BrowserController:
                 "(скопируйте его из адресной строки своего браузера). Сейчас этот адрес "
                 "можно ввести вручную в открывшемся окне."
             )
+        if headed and WINDOW_GUARD:
+            self._window_task = asyncio.create_task(self._watch_window())
         logger.info("Браузер готов")
 
     async def _headful_user_agent(self) -> Optional[str]:
@@ -298,6 +332,9 @@ class BrowserController:
 
     async def stop(self) -> None:
         logger.info("Остановка браузера")
+        if self._window_task is not None:
+            self._window_task.cancel()
+            self._window_task = None
         for closer in (
             self._context.close if self._context else None,
             self._browser.close if self._browser else None,
@@ -327,6 +364,116 @@ class BrowserController:
 
     def is_closed(self) -> bool:
         return self._page is None or self._page.is_closed()
+
+    # ------------------------------------------------------------------
+    # Свёрнутое окно
+    # ------------------------------------------------------------------
+
+    async def _watch_window(self) -> None:
+        """Свёрнутое окно Chrome не отрисовывает страницу — агент в нём в разы медленнее.
+        Windows: сторож убирает свёрнутое окно за край экрана (см. window_guard.py).
+        Другие системы: предупреждение в логе."""
+        api = win_api()
+        warned = False
+        failures = 0
+        searches, next_search = 0, 0.0
+        while self._page is not None and not self._page.is_closed():
+            try:
+                if api is not None and self._guard is None and time.monotonic() >= next_search:
+                    # страница могла как раз перезагружаться — несколько попыток с паузой
+                    self._guard = await self._find_window_guard(api)
+                    searches += 1
+                    next_search = time.monotonic() + 10.0
+                    if self._guard is None and searches >= 5:
+                        logger.info("Окно браузера не найдено — если свернуть его, агент будет работать медленнее")
+                        api = None           # дальше только предупреждения
+                if self._guard is not None:
+                    event = self._guard.tick()
+                    if event == "hidden":
+                        logger.info("Окно браузера свёрнуто — убрал его за край экрана: свёрнутый Chrome не "
+                                    "отрисовывает страницу, и агент работал бы медленно. Вернуть окно — кнопка "
+                                    "браузера на панели задач")
+                    elif event == "restored":
+                        logger.info("Окно браузера возвращено на экран")
+                    elif event == "gone":
+                        return
+                    await asyncio.sleep(0.5)
+                    continue
+                minimized = await self.window_minimized()
+                if minimized and not warned:
+                    logger.warning("Окно браузера свёрнуто: свёрнутый Chrome не отрисовывает страницу, и агент "
+                                   "работает медленно (анимации сайта не завершаются). Не сворачивайте окно — "
+                                   "просто переключитесь на другие программы, окно может оставаться под ними")
+                warned = minimized
+                failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 — сторож окна не должен ронять агента
+                failures += 1
+                logger.debug("Проверка окна не удалась: %s", _short(exc))
+                if failures >= 5:
+                    logger.info("Слежение за окном браузера отключено (%s)", _short(exc))
+                    return
+            await asyncio.sleep(1.0)
+
+    async def _find_window_guard(self, api) -> Optional[WindowGuard]:
+        """Найти окно браузера по временной метке в заголовке страницы."""
+        marker = f"twork-agent-{os.getpid()}"
+        page = self.page
+        try:
+            await page.evaluate("m => { window.__agentTitle = document.title; document.title = m; }", marker)
+        except PlaywrightError:
+            return None
+        hwnd = None
+        try:
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                hwnd = api.find_window(marker)
+                if hwnd:
+                    break
+        finally:
+            try:
+                await page.evaluate("() => { if (window.__agentTitle !== undefined) document.title = window.__agentTitle; }")
+            except PlaywrightError:
+                pass
+        if not hwnd:
+            return None
+        logger.debug("Окно браузера: hwnd=%s", hwnd)
+        return WindowGuard(api, hwnd)
+
+    async def window_minimized(self) -> bool:
+        """Окно браузера свёрнуто (CDP Browser.getWindowBounds)."""
+        if self._context is None or self._page is None:
+            return False
+        if self._cdp is None:
+            self._cdp = await self._context.new_cdp_session(self._page)
+        info = await self._cdp.send("Browser.getWindowForTarget")
+        bounds = await self._cdp.send("Browser.getWindowBounds", {"windowId": info["windowId"]})
+        return bounds.get("bounds", {}).get("windowState") == "minimized"
+
+    async def is_rendering(self, frame: Frame, timeout_ms: int = 250) -> bool:
+        """Страница отрисовывается (не свёрнутое окно и не фоновая вкладка)."""
+        try:
+            return bool(await frame.evaluate(_JS_RENDERING, timeout_ms))
+        except PlaywrightError:
+            return True
+
+    async def ensure_front(self) -> None:
+        """Вкладка задания — активная. bring_to_front только если она правда в фоне: он
+        активирует окно браузера (выдёргивает его поверх программ человека и разворачивает)."""
+        try:
+            if await self.page.evaluate("() => document.visibilityState") == "visible":
+                return
+            if self._headless is False and await self.window_minimized():
+                return                  # свёрнутое окно не разворачиваем посреди работы человека
+            await self.page.bring_to_front()
+        except PlaywrightError:
+            pass
+
+    async def wait_closed(self, poll: float = 0.5) -> None:
+        """Ждать, пока человек закроет окно браузера (агент при этом ничего не делает)."""
+        while not self.is_closed():
+            await asyncio.sleep(poll)
 
     # ------------------------------------------------------------------
     # Фреймы
@@ -491,6 +638,17 @@ class BrowserController:
         except PlaywrightError:
             box = None
         vp = await self.viewport()
+        if not await self.is_rendering(frame):
+            # колесо мыши в неотрисовываемой странице не прокручивает — прокручиваем из JS
+            dy = vp["height"] * 0.6 * (-1 if direction == "up" else 1)
+            try:
+                if el is not None and await frame.locator(f'[data-agent-id="{el.uid}"]').count():
+                    await frame.locator(f'[data-agent-id="{el.uid}"]').first.evaluate(_JS_SCROLL, dy)
+                else:
+                    await frame.evaluate("dy => window.scrollBy(0, dy)", dy)
+            except PlaywrightError as exc:
+                return ActionOutcome(ok=False, detail=f"прокрутка не удалась: {_short(exc)}")
+            return ActionOutcome(ok=True, method="js", detail=f"прокрутка {direction} (js)")
         if box:
             x = min(max(box["x"] + box["width"] / 2, 5), vp["width"] - 5)
             y = min(max(box["y"] + box["height"] / 2, 5), vp["height"] - 5)
@@ -570,6 +728,9 @@ class BrowserController:
 
     async def screenshot_b64(self, frame: Frame, mode: str) -> Optional[str]:
         """Скриншот для vision-модели: главная картинка задания или весь фрейм (JPEG, base64)."""
+        if not await self.is_rendering(frame):
+            logger.debug("Скриншот пропущен: страница не отрисовывается")
+            return None
         try:
             if mode == "image":
                 locator = frame.locator("[data-agent-img]")
@@ -599,6 +760,11 @@ class BrowserController:
         return await self._click_locator(locator, what)
 
     async def _click_locator(self, locator: Locator, what: str) -> ActionOutcome:
+        if not await self._locator_rendering(locator):
+            # окно свёрнуто или вкладка в фоне: проверки Playwright ждут кадра отрисовки и падают
+            # по таймауту (~5 с на каждый клик) — сразу JS-клик
+            ok = await self._js_click(locator)
+            return ActionOutcome(ok=ok, method="js", detail="js-клик (страница не отрисовывается — окно свёрнуто?)")
         try:
             await locator.scroll_into_view_if_needed(timeout=3_000)
         except PlaywrightError as exc:
@@ -652,6 +818,13 @@ class BrowserController:
         await mouse.down()
         await asyncio.sleep(random.uniform(0.05, 0.12))
         await mouse.up()
+
+    @staticmethod
+    async def _locator_rendering(locator: Locator, timeout_ms: int = 250) -> bool:
+        try:
+            return bool(await locator.evaluate(_JS_RENDERING_EL, timeout_ms, timeout=2_000))
+        except PlaywrightError:
+            return True
 
     @staticmethod
     async def _js_click(locator: Locator) -> bool:

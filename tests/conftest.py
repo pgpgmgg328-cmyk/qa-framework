@@ -22,4 +22,6 @@ os.environ.update({
     "FRAME_LOAD_WAIT": "0.3",
     "ACTION_WAIT": "0.1",
     "MAX_IDLE_SECONDS": "15",
+    # тесты заказа заканчиваются вместе с заказом; ожидание следующего — отдельный тест
+    "CLOSE_BROWSER_WHEN_DONE": "true",
 })

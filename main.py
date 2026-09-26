@@ -10,7 +10,7 @@ import asyncio
 import logging
 import sys
 
-from config import validate_config
+from config import enable_file_log, validate_config
 
 logger = logging.getLogger("twork.main")
 
@@ -59,6 +59,9 @@ if __name__ == "__main__":
     except ValueError as exc:
         logger.error("Конфигурация некорректна: %s", exc)
         sys.exit(2)
+    log_path = enable_file_log("record" if args.record else "agent")
+    if log_path is not None:
+        logger.info("Лог работы пишется в файл %s", log_path)
     try:
         if args.record:
             from recorder import record
@@ -71,6 +74,9 @@ if __name__ == "__main__":
         # поэтому ловить его внутри main(), как в v2, бесполезно
         logger.info("Остановлен пользователем (Ctrl+C)")
     except Exception as exc:  # noqa: BLE001 — известные ошибки запуска объясняем по-человечески
+        if type(exc).__name__ == "ModelUnavailable":
+            logger.error("%s", exc)
+            sys.exit(2)
         hint = startup_hint(exc)
         if hint is None:
             raise

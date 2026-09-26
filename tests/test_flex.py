@@ -4,10 +4,12 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
-from playwright.async_api import async_playwright
+from playwright.async_api import Frame, async_playwright
 
 import agent as agent_module
 from agent import Agent, StepResult
@@ -351,7 +353,101 @@ def test_agent_waits_on_orders_list_before_any_task(tmp_path, monkeypatch):
         return results, llm, log
 
     results, llm, log = run(scenario())
-    assert results == [StepResult.IDLE] * 3 and llm.calls == [] and log == []
+    assert results == [StepResult.WAITING] * 3 and llm.calls == [] and log == []
+
+
+def test_start_dialog_is_pressed_at_once_even_while_task_loads(tmp_path, monkeypatch):
+    """Заставка «Тренировка … [Начать]», под ней крутится загрузка задания: агент нажимает
+    «Начать» первым же шагом, без модели (раньше сначала ждал загрузку — до ~25 с)."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz", start=True))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), "")
+        async with agent._browser:
+            frame = None
+            for _ in range(30):
+                frame = await agent._browser.find_target_frame()
+                if frame is not None:
+                    break
+                await agent._browser.page.wait_for_timeout(100)
+            await frame.wait_for_function("() => document.querySelector('tui-dialog') !== null")
+            before = await DomParser(frame).parse(quiet=True)
+            result = await agent._step()
+            log = await frame.evaluate("() => window.__log")
+        return before, result, llm, log
+
+    before, result, llm, log = run(scenario())
+    assert before.dialog_open and before.loading          # окно поверх, за ним — загрузка
+    assert result == StepResult.ACTED and log == ["start:clicked"] and llm.calls == []
+
+
+def test_after_order_browser_stays_open_and_next_order_is_solved(tmp_path, monkeypatch):
+    """Заказ выполнен → список заказов: агент не закрывает браузер и ждёт. Человек открыл
+    следующий заказ — агент нажал «Начать» и решил его. Человек закрыл окно — агент завершился."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz", start=True))
+    monkeypatch.setattr(agent_module, "CLOSE_BROWSER_WHEN_DONE", False)
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        yes_new, yes_warranty = groups(state, "Да")
+        return batch(click(yes_new), click(yes_warranty), submit(state))
+
+    async def on_orders_list(agent: Agent, done: int) -> Frame:
+        for _ in range(300):
+            if agent._browser._page is None:           # браузер ещё запускается
+                await asyncio.sleep(0.1)
+                continue
+            frame = await agent._browser.find_target_frame()
+            if frame is not None and "orders.html" in frame.url and agent._tasks_done == done:
+                return frame
+            await asyncio.sleep(0.1)
+        raise AssertionError(f"агент не вернулся на список заказов (заданий: {agent._tasks_done})")
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        task = asyncio.create_task(agent.run())
+        frame = await on_orders_list(agent, 1)
+        await asyncio.sleep(1.5)                       # ждёт, а не завершается
+        assert not task.done() and not agent._browser.is_closed()
+        await frame.click('button[data-scenario="quiz"]')          # человек открыл следующий заказ
+        await on_orders_list(agent, 2)
+        await agent._browser.page.close()                          # человек закрыл окно
+        await asyncio.wait_for(task, timeout=15)
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 2 and len(llm.calls) == 2
+    assert all(not state.dialog_open for state, _ in llm.calls)    # «Начать» нажимал агент, без модели
+
+
+def test_skip_waits_for_page_change_instead_of_calling_model_again(tmp_path, monkeypatch):
+    """Модель ответила «ждать»: агент не зовёт её снова каждые пару секунд, а ждёт изменения
+    страницы (здесь — сообщение платформы через ~1 с)."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz"))
+    monkeypatch.setattr(agent_module, "SKIP_WAIT_FIRST", 6.0)
+    times: list[float] = []
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        times.append(time.monotonic())
+        if len(llm.calls) == 1:
+            return LLMDecision.skip("жду загрузку")
+        yes_new, yes_warranty = groups(state, "Да")
+        return batch(click(yes_new), click(yes_warranty), submit(state))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, workspace_url("quiz"))
+        task = asyncio.create_task(agent.run())
+        while len(times) < 1:
+            await asyncio.sleep(0.05)
+        await asyncio.sleep(1.0)
+        frame = await agent._browser.find_target_frame()
+        await frame.evaluate("() => document.querySelector('#hint-slot').append(Object.assign("
+                             "document.createElement('tui-notification'), {textContent: 'Задание загружено'}))")
+        await asyncio.wait_for(task, timeout=30)
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert len(llm.calls) == 2 and agent._tasks_done == 1
+    assert 0.9 < times[1] - times[0] < 4.0          # дождался изменения, а не таймаута в 6 с
 
 
 def test_media_manager_fetches_authorized_attachments(tmp_path):

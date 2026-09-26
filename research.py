@@ -112,7 +112,11 @@ def to_url(query: str) -> str:
 
 
 class WebResearch:
-    """Вкладка поиска: одна на всё время работы, переиспользуется."""
+    """Поиск во вкладке того же окна: вкладка открывается на запрос и закрывается после чтения.
+
+    v4 держал одну вкладку и переключался между ней и заданием через bring_to_front — а это
+    выдёргивает окно браузера на передний план (и разворачивает свёрнутое) посреди работы
+    человека. Закрытая вкладка сама возвращает на вкладку задания, окно не активируется."""
 
     def __init__(self, browser) -> None:
         self._browser = browser
@@ -158,11 +162,6 @@ class WebResearch:
     async def _ensure_page(self) -> Page:
         if self._page is None or self._page.is_closed():
             self._page = await self._browser.context.new_page()
-        else:
-            try:
-                await self._page.bring_to_front()
-            except PlaywrightError:
-                pass
         return self._page
 
     @staticmethod
@@ -199,10 +198,9 @@ class WebResearch:
         return data
 
     async def _back_to_task(self) -> None:
-        try:
-            await self._browser.page.bring_to_front()
-        except PlaywrightError:
-            pass
+        """Закрыть вкладку поиска: браузер сам вернётся на вкладку задания."""
+        await self.close()
+        await self._browser.ensure_front()
 
 
 def _trim_text(text: str, limit: int) -> str:
