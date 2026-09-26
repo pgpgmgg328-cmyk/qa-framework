@@ -93,7 +93,7 @@ OPENROUTER_REFERER: str = os.getenv("OPENROUTER_REFERER", "https://localhost/two
 # ---------------------------------------------------------------------------
 # Browser
 # ---------------------------------------------------------------------------
-TARGET_URL: str = os.getenv("TARGET_URL", "https://t-work.ru")
+TARGET_URL: str = os.getenv("TARGET_URL", "https://twork.tbank.ru")
 VIEWPORT_WIDTH: int = int(os.getenv("VIEWPORT_WIDTH", "1280"))
 VIEWPORT_HEIGHT: int = int(os.getenv("VIEWPORT_HEIGHT", "720"))
 HEADLESS: bool = _env_bool("HEADLESS", False)
