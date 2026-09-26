@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import openrouter_connector as oc
-from models import ActionType, DecisionContext, ElementKind, PageState, ParsedElement
+from models import ActionType, DecisionContext, ElementKind, PageState, ParsedElement, VisionImage
 from tests.helpers import run
 
 os.environ.setdefault("NO_PROXY", "127.0.0.1,localhost")
@@ -41,7 +41,12 @@ def fake_openai(responses: list[tuple[int, dict]]):
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
-            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            if "json" in (self.headers.get("Content-Type") or ""):
+                body = json.loads(raw)
+            else:                                   # multipart: audio/transcriptions
+                body = {"_raw": raw}
+            body["_path"] = self.path
             requests.append(body)
             status, payload = responses.pop(0)
             data = json.dumps(payload).encode()
@@ -114,13 +119,35 @@ def test_invalid_json_gets_one_repair_round(monkeypatch):
     assert repair[-2]["role"] == "assistant" and "не прошёл проверку" in repair[-1]["content"]
 
 
-def test_image_is_sent_as_image_url_part(monkeypatch):
+def test_images_are_sent_with_captions(monkeypatch):
+    photos = [VisionImage(caption="ФОТО 1–4", b64="BBBB"), VisionImage(caption="ФОТО 5", b64="CCCC")]
     with fake_openai([completion(json.dumps(VALID))]) as (url, requests):
         connector = make_connector(monkeypatch, url)
-        run(connector.decide(state(), DecisionContext(image_b64="AAAA")))
+        run(connector.decide(state(), DecisionContext(images=photos, image_b64="AAAA")))
     content = requests[0]["messages"][1]["content"]
-    assert isinstance(content, list) and content[1]["type"] == "image_url"
-    assert content[1]["image_url"]["url"].startswith("data:image/jpeg;base64,AAAA")
+    kinds = [part["type"] for part in content]
+    assert kinds == ["text", "text", "image_url", "text", "image_url", "text", "image_url"]
+    assert content[1]["text"] == "ФОТО 1–4:" and content[2]["image_url"]["url"].endswith("BBBB")
+    assert content[4]["image_url"]["url"].endswith("CCCC")
+    assert content[6]["image_url"]["url"].startswith("data:image/jpeg;base64,AAAA")   # скриншот фрейма
+    assert "Приложены изображения: ФОТО 1–4; ФОТО 5." in content[0]["text"]
+
+
+def test_transcription_falls_back_to_next_model(monkeypatch):
+    monkeypatch.setattr(oc, "TRANSCRIBE_MODELS", ("gpt-4o-transcribe", "whisper-1"))
+    verbose = {"text": "Алло. Слушаю.", "language": "russian", "duration": 4.2, "segments": [
+        {"id": 0, "start": 0.0, "end": 1.4, "text": " Алло."},
+        {"id": 1, "start": 1.6, "end": 4.2, "text": " Слушаю."},
+    ]}
+    responses = [bad_request("Model gpt-4o-transcribe is not available"), (200, verbose)]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        text = run(connector.transcribe(b"ID3fake", "audio.mp3", "audio/mpeg"))
+    assert text == "[0:00–0:01] Алло.\n[0:01–0:04] Слушаю."
+    assert [r["_path"] for r in requests] == ["/v1/audio/transcriptions"] * 2
+    assert b'name="model"' in requests[0]["_raw"] and b"gpt-4o-transcribe" in requests[0]["_raw"]
+    assert b"verbose_json" in requests[1]["_raw"] and b'name="language"' in requests[1]["_raw"]
+    assert "gpt-4o-transcribe" in connector._dead_transcribers   # больше не запрашивается
 
 
 def test_api_error_becomes_skip(monkeypatch):

@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="ru">
+<head><meta charset="utf-8"><title>Klecks · заказы</title>
+<style>
+  body { font-family: sans-serif; margin: 16px; }
+  .card { border: 1px solid #ccc; border-radius: 12px; padding: 12px; margin: 10px 0; width: 420px; }
+  .card h4 { margin: 0 0 6px; }
+</style></head>
+<body>
+<nav><button type="button" aria-selected="true">Задания</button> <button type="button">Отчеты</button></nav>
+<h2>Клекс</h2>
+<div class="tabs"><button type="button">Задания 1</button> <button type="button" aria-selected="true">Обучение 3</button></div>
+<div class="card"><h4>Сравнение отелей</h4><p>Тренировка</p><p>Сравните две карточки отелей.</p>
+  <button type="button" class="start">Приступить</button></div>
+<div class="card"><h4>Выделение атрибутов товара</h4><p>Экзамен</p>
+  <button type="button" class="start">Приступить</button></div>
+<div class="card"><h4>Прослушка звонка</h4><p>Тренировка</p>
+  <button type="button" class="start">Приступить</button></div>
+<script>
+  window.__log = [];
+  document.querySelectorAll('.start').forEach((b) => b.addEventListener('click', () => window.__log.push('ORDER-START')));
+</script>
+</body>
+</html>

@@ -1,6 +1,10 @@
-"""models.py v3 — Pydantic v2 схемы данных агента.
+"""models.py v4 — Pydantic v2 схемы данных агента.
 
-Изменения относительно v2:
+v4: страница задания целиком (reader-view: текст, таблицы, ссылки, [ФОТО n], [АУДИО n]
+и элементы на своих местах), уведомления платформы, медиа, действие web (поиск в
+интернете), план решения в ответе модели.
+
+Изменения v3 относительно v2:
 - ParsedElement получил стабильные идентификаторы: `uid` (метка data-agent-id в DOM,
   по ней кликает BrowserController) и `key` (ключ «путь + текст» для памяти агента,
   переживает смену индексов при раскрытии папок).
@@ -33,6 +37,7 @@ class ActionType(str, Enum):
     SUBMIT = "submit"  # отправить ответ (нажать «Завершить/Отправить»)
     TYPE   = "type"    # ввести текст в поле / выбрать пункт нативного select
     SCROLL = "scroll"  # прокрутить список (виртуальный скролл / ленивая подгрузка)
+    WEB    = "web"     # поиск в интернете / открыть адрес во вкладке поиска (query)
     SKIP   = "skip"    # ничего не делать на этом шаге (идёт загрузка)
 
 
@@ -43,6 +48,8 @@ _ACTION_SYNONYMS: dict[str, ActionType] = {
     "input": ActionType.TYPE, "fill": ActionType.TYPE, "write": ActionType.TYPE,
     "finish": ActionType.SUBMIT, "send": ActionType.SUBMIT, "complete": ActionType.SUBMIT,
     "wait": ActionType.SKIP, "none": ActionType.SKIP, "noop": ActionType.SKIP,
+    "search": ActionType.WEB, "browse": ActionType.WEB, "visit": ActionType.WEB,
+    "open_url": ActionType.WEB, "research": ActionType.WEB, "google": ActionType.WEB,
 }
 
 
@@ -95,7 +102,7 @@ PROMPT_LEGEND = f"""\
                      затем "click" по варианту с пометкой {FLAG_IN_POPUP}.
   [INPUT text] / [INPUT textarea] / [INPUT number] / [INPUT select] … — поле ввода; action "type"
                      (для [INPUT select] type_text = точный текст одного из вариантов).
-  {TAG_BUTTON}          — кнопка; "click". Кнопку отправки ответа нажимай через action "submit".
+  {TAG_BUTTON}          — кнопка или ссылка; "click". Кнопку отправки ответа нажимай через action "submit".
   {TAG_OTHER}           — прочий кликабельный элемент."""
 
 PROMPT_FLAGS = f"""\
@@ -104,7 +111,9 @@ PROMPT_FLAGS = f"""\
   {FLAG_OCCLUDED}     — сейчас закрыт другим элементом (оверлей, спиннер, диалог).
   {FLAG_SELECTABLE}  — у папки есть собственный переключатель: её саму можно выбрать как ответ.
   {FLAG_IN_DIALOG} / {FLAG_IN_POPUP} — элемент модального окна / открытого выпадающего списка.
-  ⟨путь: A › B⟩     — родительские папки; показывается у элементов с одинаковым текстом."""
+  ⟨путь: A › B⟩     — родительские папки; показывается у элементов с одинаковым текстом.
+  ⟨поле: X⟩         — подпись поля/списка на странице (например, название характеристики).
+  → https://…       — адрес, на который ведёт ссылка (координаты карт, сайты)."""
 
 
 def normalize_text(value: Any) -> str:
@@ -145,6 +154,9 @@ class ParsedElement(BaseModel):
     has_select:   bool         = Field(False, description="Есть видимый radio/checkbox для выбора")
     in_viewport:  bool         = Field(True, description="Сейчас в видимой области фрейма")
     occluded:     bool         = Field(False, description="Центр элемента перекрыт другим элементом")
+    caption:      str          = Field("",   description="Подпись поля на странице («Цвет» у списка значений)")
+    href:         str          = Field("",   description="Адрес ссылки (a[href])")
+    aux:          bool         = Field(False, description="Служебный (плеер, переключатели карусели) — LLM не показывается")
 
     # --- представление для LLM -------------------------------------------
 
@@ -163,23 +175,32 @@ class ParsedElement(BaseModel):
 
     def label(self) -> str:
         """Человекочитаемая подпись для логов и истории."""
-        return self.text or self.placeholder or f"#{self.index}"
+        return self.text or self.placeholder or self.caption or f"#{self.index}"
 
-    def prompt_line(self, *, show_path: bool = False) -> str:
-        """Одна строка для LLM-промпта. Формат описан в PROMPT_LEGEND/PROMPT_FLAGS."""
+    def prompt_line(self, *, show_path: bool = False, show_caption: bool = True) -> str:
+        """Одна строка для LLM-промпта. Формат описан в PROMPT_LEGEND/PROMPT_FLAGS.
+
+        show_caption=False — подпись поля уже стоит строкой выше в тексте страницы."""
         indent = "  " * min(self.depth, 8)
         parts = [f"{indent}[{self.index}] {self.type_tag()}"]
 
         text = self.text or self.placeholder
         if text:
             parts.append(f"«{text}»")
+        if show_caption and self.caption and normalize_text(self.caption) != normalize_text(text):
+            parts.append(f"⟨поле: {self.caption}⟩")
 
         if self.kind == ElementKind.INPUT:
-            parts.append(f"значение=«{self.value[:80]}»" if self.value else "(пусто)")
+            parts.append(f"значение=«{self.value[:300]}»" if self.value else "(пусто)")
             if self.options:
-                parts.append("варианты: " + " | ".join(self.options[:20]))
-        elif self.kind == ElementKind.DROPDOWN and self.value:
-            parts.append(f"значение=«{self.value[:80]}»")
+                parts.append("варианты: " + " | ".join(self.options[:40]))
+        elif self.kind == ElementKind.DROPDOWN:
+            if self.value:
+                parts.append(f"значение=«{self.value[:120]}»")
+            elif self.caption or self.placeholder:
+                parts.append("(не выбрано)")
+        if self.href:
+            parts.append(f"→ {self.href[:300]}")
 
         if self.is_selected:
             parts.append(FLAG_SELECTED)
@@ -203,6 +224,43 @@ class ParsedElement(BaseModel):
 # Состояние страницы
 # ---------------------------------------------------------------------------
 
+class Notice(BaseModel):
+    """Сообщение платформы: ошибка («Неверный ответ»), подсказка («Правильный ответ: …»), инфо."""
+
+    kind:  str = Field("info", description="error | warning | hint | success | info")
+    text:  str = Field("")
+    where: str = Field("inline", description="inline | toast | dialog")
+
+    def render(self) -> str:
+        mark = {"error": "‼", "warning": "⚠", "hint": "💡", "success": "✓"}.get(self.kind, "ℹ")
+        return f"{mark} {self.text}"
+
+
+class MediaImage(BaseModel):
+    """Фото/картинка задания — [ФОТО n] в тексте страницы."""
+
+    n:       int  = Field(..., description="Номер для LLM (с 1)")
+    uid:     str  = Field("", description="Метка data-agent-media")
+    src:     str  = Field("", description="Абсолютный адрес")
+    alt:     str  = Field("")
+    loaded:  bool = Field(True, description="Загрузилось в странице (naturalWidth > 0)")
+    width:   int  = Field(0, description="Исходная ширина")
+    height:  int  = Field(0, description="Исходная высота")
+
+
+class MediaAudio(BaseModel):
+    """Аудиозапись задания — [АУДИО n] в тексте страницы."""
+
+    n:        int   = Field(...)
+    uid:      str   = Field("", description="Метка data-agent-media на <audio>/<video>")
+    play_uid: str   = Field("", description="Метка кнопки play/pause плеера, если есть")
+    src:      str   = Field("")
+    duration: float = Field(0.0)
+    current:  float = Field(0.0)
+    paused:   bool  = Field(True)
+    ended:    bool  = Field(False)
+
+
 class PageState(BaseModel):
     """Атомарный снимок фрейма (собран одним evaluate)."""
 
@@ -222,6 +280,35 @@ class PageState(BaseModel):
     frame_url:       str                 = Field("")
     total_elements:  int                 = Field(0)
     hidden_elements: int                 = Field(0, description="Совпавших по селектору, но невидимых")
+    # --- v4: страница целиком -------------------------------------------------
+    # Строки reader-view: текст/заголовки/таблицы как есть; элементы, фото и аудио —
+    # плейсхолдеры \x00E<index>\x00, \x00I<n>\x00, \x00A<n>\x00 (подставляются при рендере)
+    reader:          list[str]           = Field(default_factory=list, description="Основная страница")
+    dialog_lines:    list[str]           = Field(default_factory=list, description="Открытый диалог")
+    popup_lines:     list[str]           = Field(default_factory=list, description="Открытый выпадающий список")
+    toast_lines:     list[str]           = Field(default_factory=list, description="Всплывающие уведомления")
+    notices:         list[Notice]        = Field(default_factory=list)
+    images:          list[MediaImage]    = Field(default_factory=list)
+    audios:          list[MediaAudio]    = Field(default_factory=list)
+    headings:        list[str]           = Field(default_factory=list)
+    pool_key:        str                 = Field("", description="Вид задания (структура формы без данных)")
+    pool_title:      str                 = Field("", description="Название вида задания для файла знаний")
+    pool_signature:  list[str]           = Field(default_factory=list, description="Заголовки и поля формы")
+    dialog_open:     bool                = Field(False)
+    dialog_loading:  bool                = Field(False, description="В диалоге крутится загрузка")
+    dialog_frames:   int                 = Field(0, description="iframe внутри диалога (документ инструкции)")
+    local_loading:   int                 = Field(0, description="Мелкие лоадеры (галерея), не мешают работе")
+    page_url:        str                 = Field("", description="URL главной страницы (не фрейма)")
+    content_hash:    str                 = Field("", description="Хэш текста задания (без медиа)")
+    loose_hash:      str                 = Field("", description="Хэш текста задания без цифр")
+    media_srcs:      list[str]           = Field(default_factory=list, description="Адреса фото и аудио")
+
+    @property
+    def visible_elements(self) -> list["ParsedElement"]:
+        return [e for e in self.elements if not e.aux]
+
+    def notice_texts(self, *kinds: str) -> list[str]:
+        return [n.text for n in self.notices if not kinds or n.kind in kinds]
 
     def by_index(self, index: Optional[int]) -> Optional[ParsedElement]:
         if index is None:
@@ -264,7 +351,9 @@ class LLMDecision(BaseModel):
         ),
     )
     type_text:        Optional[str] = Field(None, description="Текст для ввода")
+    query:            Optional[str] = Field(None, description="Поисковый запрос или URL для action=web")
     scroll_direction: Optional[str] = Field(None, description="down/up для action=scroll")
+    plan:             str           = Field("", description="План решения: что сделано, что осталось, найденные факты")
     confidence:       float         = Field(1.0, ge=0.0, le=1.0)
 
     @field_validator("action", mode="before")
@@ -296,7 +385,7 @@ class LLMDecision(BaseModel):
             return None
         return index if index >= 0 else None
 
-    @field_validator("target_text", "type_text", "scroll_direction", mode="before")
+    @field_validator("target_text", "type_text", "query", "scroll_direction", mode="before")
     @classmethod
     def _coerce_optional_str(cls, value: Any) -> Any:
         if value is None:
@@ -304,7 +393,7 @@ class LLMDecision(BaseModel):
         text = str(value).strip()
         return text or None
 
-    @field_validator("goal", "observation", "reasoning", mode="before")
+    @field_validator("goal", "observation", "reasoning", "plan", mode="before")
     @classmethod
     def _coerce_str(cls, value: Any) -> Any:
         return "" if value is None else str(value)
@@ -338,5 +427,23 @@ class DecisionContext:
     notes:       list[str] = field(default_factory=list)   # предупреждения агента (бюджет, петли)
     step_in_task: int = 1
     steps_left:  int = 0
-    image_b64:   Optional[str] = None                      # скриншот картинки задания (vision)
+    image_b64:   Optional[str] = None                      # скриншот фрейма (LLM_VISION=frame / фоллбэк)
     temperature: Optional[float] = None                    # повышается при зацикливании
+    # --- v4 ---
+    images:      list["VisionImage"] = field(default_factory=list)   # фото задания (по одному / коллажи)
+    image_notes: list[str] = field(default_factory=list)   # «[ФОТО 3] не загрузилось» и т.п.
+    transcripts: list[str] = field(default_factory=list)   # расшифровки [АУДИО n]
+    knowledge:   str = ""                                  # инструкция вида заданий + уроки
+    research:    list[str] = field(default_factory=list)   # результаты action=web
+    plan:        str = ""                                  # план модели с прошлого шага
+    feedback:    list[str] = field(default_factory=list)   # «Неверный ответ» после отправки, подсказки
+    wrong_answers: list[str] = field(default_factory=list)  # ответы, признанные неверными
+
+
+@dataclass
+class VisionImage:
+    """Изображение для vision-модели: одиночное фото или коллаж с номерами."""
+
+    caption: str            # «ФОТО 1–4» — подпись перед картинкой в сообщении
+    b64: str                # JPEG, base64
+    detail: str = "high"

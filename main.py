@@ -1,4 +1,4 @@
-"""main.py — точка входа агента v3.
+"""main.py — точка входа агента v4.
 
   python main.py            — агент решает задания сам
   python main.py --record   — режим записи: вы решаете задания вручную, агент
@@ -44,7 +44,7 @@ def startup_hint(exc: BaseException) -> "str | None":
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Агент T-Work v3")
+    parser = argparse.ArgumentParser(description="Агент T-Work v4")
     parser.add_argument(
         "--record", action="store_true",
         help="режим записи: агент ничего не нажимает, сохраняет экраны и ваши действия",

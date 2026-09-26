@@ -1,0 +1,379 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Klecks · задание (тестовая копия структуры T-Work)</title>
+<!--
+  Синтетическая страница задания со структурой как у T-Work/Клекс (flex-компоненты,
+  Taiga UI): панель режима, «Подробная инструкция», карусели фото с пагинацией,
+  аудиоплеер, radio/checkbox, выпадающий список в портале, поля tui-textarea,
+  уведомления «Неверный ответ»/«Правильный ответ», диалоги, глобальный лоадер.
+  Данные вымышленные. Сценарий — параметр ?scenario=hotels|product|robot|org|atm.
+-->
+<style>
+  body { font-family: sans-serif; margin: 0; padding: 0; font-size: 14px; }
+  .panel { display: flex; gap: 24px; align-items: center; padding: 6px 16px; border-bottom: 1px solid #ddd; height: 36px; }
+  .panel .task-exit-button { margin-left: auto; }
+  main { padding: 16px 40px; max-width: 900px; }
+  h3 { margin: 8px 0; }
+  .flex-instruction__link { color: #2266cc; cursor: pointer; display: inline-block; margin-bottom: 10px; }
+  flex-element { display: block; margin: 8px 0; }
+  .flex-header__content { font-weight: bold; }
+  .compare__row { display: flex; gap: 20px; }
+  .compare__row > flex-element { flex: 1; }
+  .t-scroller { overflow: hidden; width: 300px; }
+  .t-items { display: flex; }
+  .t-items > fieldset { min-width: 300px; border: 0; margin: 0; padding: 0; }
+  tui-pagination button { width: 22px; }
+  .t-item { display: flex; align-items: center; gap: 6px; height: 26px; cursor: pointer; }
+  .t-item input, .flex-checkbox-label input { width: 14px; height: 14px; }
+  .flex-checkbox-label { display: flex; align-items: center; gap: 6px; height: 26px; cursor: pointer; }
+  .flex-gallery__container { display: flex; gap: 6px; }
+  .flex-gallery__container img { width: 200px; height: 150px; object-fit: cover; }
+  tui-select { display: inline-flex; align-items: center; border: 1px solid #999; width: 260px; height: 30px; cursor: pointer; position: relative; }
+  tui-select input { position: absolute; inset: 0; opacity: 0; cursor: pointer; }
+  tui-textarea { display: block; border: 1px solid #999; width: 520px; position: relative; }
+  tui-textarea .t-placeholder { font-size: 11px; color: #888; }
+  tui-textarea .t-pseudo-content { position: absolute; visibility: hidden; white-space: pre-wrap; }
+  tui-textarea textarea { width: 100%; border: 0; height: 36px; }
+  tui-tooltip { display: inline-block; width: 14px; height: 14px; border-radius: 50%; background: #ccc; }
+  flex-audio-player .flex-audio-player__container { display: flex; align-items: center; gap: 8px; height: 40px; }
+  flex-audio-player button { width: 28px; height: 28px; }
+  tui-notification { display: block; padding: 8px 12px; margin: 6px 0; border-radius: 8px; }
+  tui-notification[data-appearance="error"] { background: #fde2e2; }
+  tui-notification[data-appearance="info"] { background: #e2effd; }
+  .finish { display: flex; gap: 8px; margin: 16px 0 40px; }
+  tui-dialog { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0,0,0,.4); z-index: 10; }
+  tui-dialog section { background: #fff; width: 560px; max-height: 80vh; overflow: auto; padding: 20px; border-radius: 12px; }
+  tui-alerts { position: fixed; top: 10px; right: 10px; width: 320px; z-index: 20; }
+  tui-dropdown { position: absolute; background: #fff; border: 1px solid #999; overflow: hidden; z-index: 30; width: 260px; }
+  tui-dropdown .t-scroll { max-height: 180px; overflow: auto; }
+  tui-dropdown button { display: block; width: 100%; text-align: left; height: 26px; border: 0; background: #fff; }
+  global-loader { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; background: rgba(255,255,255,.6); z-index: 40; }
+  global-loader[data-visible="true"] { display: flex; }
+  .t-loader { width: 40px; height: 40px; border-radius: 50%; border: 4px solid #999; border-top-color: transparent; }
+  tui-loader:not(._loading) .t-loader { display: none; }
+  tui-hint { position: fixed; background: #333; color: #fff; padding: 6px; border-radius: 6px; z-index: 50; max-width: 260px; }
+</style>
+</head>
+<body>
+<div class="panel">
+  <div><div class="b-statistical-panel-block__title" id="mode">Тренировка</div><div id="progress">1 из 1 заданий</div></div>
+  <button type="button" class="task-exit-button" id="exit">Выйти из задания</button>
+</div>
+<main class="flex-common-view__main__container">
+  <flex-main-title><h3 class="main-title__text" id="title">Выполните задание</h3></flex-main-title>
+  <flex-instruction><a class="flex-instruction__link" id="instr">Подробная инструкция</a></flex-instruction>
+  <div id="hint-slot"></div>
+  <flex-container id="form"></flex-container>
+  <div class="finish">
+    <button type="button" id="finish">Завершить задание</button>
+    <button type="button" id="opts" aria-haspopup="listbox" aria-expanded="false">Опции завершения задания</button>
+  </div>
+</main>
+<tui-dialogs id="dialogs"></tui-dialogs>
+<tui-alerts id="alerts"></tui-alerts>
+<tui-dropdowns id="dropdowns"></tui-dropdowns>
+<global-loader id="loader" data-visible="false"><tui-loader class="_loading"><div class="t-loader"></div></tui-loader></global-loader>
+<script>
+window.__log = [];
+const params = new URLSearchParams(location.search);
+const SCENARIO = params.get('scenario') || 'hotels';
+const ATT = 'api/task/get-attachment/';
+const $ = (sel, root = document) => root.querySelector(sel);
+const h = (tag, attrs = {}, ...children) => {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'html') el.innerHTML = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v);
+  }
+  for (const c of children) if (c != null) el.append(c);
+  return el;
+};
+const element = (type, ...children) => h('flex-element', { 'data-component-type': type, class: 'flex-container__element' }, ...children);
+const header = (text) => element('header', h('flex-header', {}, h('div', { class: 'flex-header__content tui-text_h6' }, text)));
+const text = (html) => element('text', h('flex-text', {}, h('tui-editor-socket', { html })));
+let groupNo = 0;
+const radios = (options) => {
+  const name = 'g' + (++groupNo);
+  return element('radiobuttonGroup', h('tui-radio-list', {}, ...options.map((o) =>
+    h('label', { class: 't-item' }, h('input', { type: 'radio', name, value: o.value || o.text }),
+      h('div', {}, o.text), o.tip ? tooltip(o.tip) : null))));
+};
+const checkbox = (label, tip) => element('checkbox', h('flex-checkbox', {},
+  h('label', { class: 'flex-checkbox-label' }, h('input', { type: 'checkbox', value: label }), ' ' + label + ' ',
+    tip ? tooltip(tip) : null)));
+const tooltip = (tip) => h('tui-tooltip', {
+  class: 'flex-custom-tooltip__label',
+  onmouseenter: (e) => {
+    const r = e.target.getBoundingClientRect();
+    const hint = h('tui-hint', { role: 'tooltip' }, tip);
+    hint.style.left = (r.right + 6) + 'px'; hint.style.top = r.top + 'px';
+    document.body.append(hint);
+  },
+  onmouseleave: () => document.querySelectorAll('tui-hint').forEach((x) => x.remove()),
+});
+const gallery = (ids) => element('mediaGallery', h('flex-gallery', {}, h('div', { class: 'flex-gallery__container' },
+  ...ids.map((id) => h('div', { class: 'flex-gallery__column' }, h('img', { src: ATT + id, class: 'flex-gallery__media' }))))));
+const carousel = (srcs) => h('flex-gallery', {}, h('div', { class: 'carousel-container' },
+  h('tui-carousel', {}, h('div', { class: 't-scroller' }, h('div', { class: 't-items' },
+    ...srcs.map((src, i) => h('fieldset', i ? { class: 't-item', disabled: '' } : { class: 't-item' },
+      h('div', { class: 'carousel__item' }, h('img', { src, width: '300', height: '200', class: 'carousel__media' }))))))),
+  h('tui-pagination', { class: 'carousel__pagination' }, ...srcs.map((_, i) => h('button', { type: 'button' }, String(i + 1))))));
+const textInput = (placeholder) => {
+  const mirror = h('span');
+  const area = h('textarea', { oninput: () => { mirror.textContent = area.value; } });
+  return element('textInput', h('tui-textarea', {}, h('label', {},
+    h('div', { class: 't-placeholder' }, placeholder), h('div', { class: 't-pseudo-content', 'aria-hidden': 'true' }, mirror), area)));
+};
+const dropdown = (caption, options) => {
+  const valueBox = h('div', { class: 't-value' }, 'Выберите значение');
+  const input = h('input', { readonly: '', role: 'combobox', 'aria-haspopup': 'listbox', 'aria-expanded': 'false' });
+  const select = h('tui-select', { class: 'flex-dropdown-lists__select' }, input, valueBox);
+  select.addEventListener('click', () => {
+    const open = $('tui-dropdown');
+    if (open) { open.remove(); input.setAttribute('aria-expanded', 'false'); return; }
+    const r = select.getBoundingClientRect();
+    const list = h('div', { role: 'listbox' }, ...options.map((o) => h('button', { type: 'button', role: 'option', tuioption: '',
+      onclick: (e) => { e.stopPropagation(); valueBox.textContent = o; select.dataset.value = o;
+                         $('tui-dropdown').remove(); input.setAttribute('aria-expanded', 'false'); } }, o)));
+    const dd = h('tui-dropdown', {}, h('div', { class: 't-scroll' }, list));
+    dd.style.left = (r.left + scrollX) + 'px'; dd.style.top = (r.bottom + scrollY + 2) + 'px';
+    $('#dropdowns').append(dd);
+    input.setAttribute('aria-expanded', 'true');
+  });
+  return element('dropdownLists', h('flex-dropdown-lists', {}, h('div', { class: 'flex-dropdown-lists__element' },
+    h('span', { class: 'flex-dropdown-lists__element-name' }, caption), select)));
+};
+const audioPlayer = (id) => {
+  const audio = h('audio', {}, h('source', { type: 'audio/wav', src: ATT + id }));
+  const cur = h('span', { class: 'progress-bar__current-time' }, '--:--');
+  const dur = h('span', { class: 'progress-bar__duration' }, '--:--');
+  const fmt = (t) => '00:' + String(Math.floor(t)).padStart(2, '0');
+  const btn = h('button', { type: 'button', title: 'play', class: 'flex-audio-player__playback-btn',
+    onclick: () => { if (audio.paused) audio.play(); else audio.pause(); } });
+  audio.addEventListener('play', () => btn.title = 'pause');
+  audio.addEventListener('pause', () => btn.title = 'play');
+  audio.addEventListener('loadedmetadata', () => { dur.textContent = fmt(audio.duration); cur.textContent = fmt(0); });
+  audio.addEventListener('timeupdate', () => { cur.textContent = fmt(audio.currentTime); });
+  audio.addEventListener('ended', () => window.__log.push('audio:ended'));
+  return element('audio', h('flex-audio-player', {}, h('div', { class: 'flex-audio-player__container' },
+    btn, audio, h('button', { type: 'button', class: 'flex-audio-player__speed-option-btn', 'aria-haspopup': 'listbox' }, '1x'),
+    cur, h('input', { type: 'range', max: '100' }), dur, h('button', { type: 'button', title: 'mute' }))));
+};
+const indent = () => element('indent', h('flex-indent'));
+
+// ------------------------------------------------------------------ состояние формы
+const form = () => {
+  const radio = [...document.querySelectorAll('#form input[type=radio]:checked')].map((i) => i.value);
+  const checks = [...document.querySelectorAll('#form input[type=checkbox]:checked')].map((i) => i.value);
+  const texts = [...document.querySelectorAll('#form textarea')].map((t) => t.value.trim());
+  const selects = [...document.querySelectorAll('#form tui-select')].map((s) => s.dataset.value || '');
+  return { radio, checks, texts, selects };
+};
+
+// ------------------------------------------------------------------ сценарии
+const hotelCard = (name, address, city, phone, coords, photos) => h('div', {},
+  carousel(photos),
+  h('flex-text', {}, h('tui-editor-socket', { html:
+    `<b>Название отеля:</b> ${name}<br><br><b>Адрес:</b> ${address}<br><br><b>Город, страна:</b> ${city}<br><br>` +
+    `<b>Телефон:</b> ${phone}<br><br><b>Ссылка на карту: </b><a href="https://www.google.com/maps?ll=${coords}">Открыть карту</a>` })));
+
+const SCENARIOS = {
+  hotels: {
+    mode: 'Тренировка', title: 'Выполните задание',
+    tasks: [
+      {
+        render: () => [
+          element('horizontalComparator', h('div', { class: 'compare' }, h('div', { class: 'compare__row' },
+            element('text', hotelCard('Отель Магнолия', 'улица Мира, 5', 'Сочи, Россия', '+7 862 000-00-01', '43.58001,39.72002',
+              ['https://cdn.hotels.test/a1.jpg', 'https://cdn.hotels.test/a2.jpg', 'https://cdn.hotels.test/a3.jpg'])),
+            element('text', hotelCard('Magnolia Hotel', 'Mira street 5', 'Сочи, Россия', '−', '43.580012,39.720031',
+              ['https://cdn.hotels.test/b1.jpg', 'https://cdn.hotels.test/a2.jpg']))))),
+          header('Отели совпадают?'),
+          radios([{ text: 'Да' }, { text: 'Нет' }]),
+          text('Примечание:<ul><li>Основные поля — Название и Адрес.</li></ul>'),
+        ],
+        check: (f) => ({ ok: f.radio[0] === 'Да', hint: 'Правильный ответ: Да. Совпадают название (транслитерация), адрес и геолокация.' }),
+      },
+      {
+        render: () => [
+          element('horizontalComparator', h('div', { class: 'compare' }, h('div', { class: 'compare__row' },
+            element('text', hotelCard('Хостел Кедр', 'Сибирская, 12', 'Иркутск, Россия', '+7 395 000-00-02', '52.27001,104.30002',
+              ['https://cdn.hotels.test/c1.jpg'])),
+            element('text', hotelCard('Гостиница Байкал', 'Ленина, 3', 'Иркутск, Россия', '+7 395 000-00-03', '52.28510,104.28105',
+              ['https://cdn.hotels.test/d1.jpg']))))),
+          header('Отели совпадают?'),
+          radios([{ text: 'Да' }, { text: 'Нет' }]),
+        ],
+        check: (f) => ({ ok: f.radio[0] === 'Нет', hint: 'Правильный ответ: Нет. Разные названия и адреса.' }),
+      },
+    ],
+  },
+  product: {
+    mode: 'Экзамен', title: 'Выполните задание',
+    tasks: [{
+      render: () => [
+        text('В этом задании мы показываем характеристику товара и список возможных значений.<br>' +
+             '<b>Другое</b> — значение можно определить, но его нет в списке.'),
+        header('Название товара'), text('Смартфон Galaxy A05 4/128GB Black'),
+        header('Характеристики товара'),
+        text('<table border="1"><tbody><tr><th>Название характеристики</th><th>Значение</th></tr>' +
+             '<tr><td>Модель</td><td>A05</td></tr><tr><td>Экран</td><td>6.7"/2400x1080 Пикс</td></tr></tbody></table>'),
+        text('<h1>Выбор характеристики из списка</h1>'),
+        dropdown('Цвет', ['Неизвестно / Не указано', 'Другое', 'Некорректная категория', 'Бежевый', 'Белый', 'Бесцветный',
+                          'Бронзовый', 'Голубой', 'Желтый', 'Зеленый', 'Золотистый', 'Коричневый', 'Красный', 'Оранжевый',
+                          'Разноцветный', 'Розовый', 'Серебристый', 'Серый', 'Синий', 'Фиолетовый', 'Черный']),
+        textInput('Комментарий'),
+      ],
+      check: (f) => ({ ok: f.selects[0] === 'Черный', hint: '' }),
+    }],
+  },
+  robot: {
+    mode: 'Тренировка', title: 'Прослушайте звонок до конца',
+    tasks: [{
+      render: () => [
+        header('Цель робота:'),
+        text('Идентифицировать клиента и получить обещание о платеже.<br>Робот звонит клиенту и закрывает звонок с результатом.'),
+        audioPlayer('call1'),
+        header('Результат звонка'), text('Отказ от платежа'),
+        header('Результат звонка правильный?'),
+        radios([{ text: 'Результат правильный' }, { text: 'Результат неправильный. Был человек' },
+                { text: 'Результат неправильный. Был автоответчик' }]),
+      ],
+      check: (f) => ({ ok: f.radio[0] === 'Результат неправильный. Был автоответчик', hint: '' }),
+      guard: () => {
+        const a = $('audio');
+        return a && !a.ended ? 'Прослушайте звонок до конца' : '';
+      },
+    }],
+  },
+  org: {
+    mode: 'Тренировка', title: 'Выполните задание',
+    tasks: [{
+      render: () => [
+        text('<b>Предложенные данные организации</b><br><b>Название организации:</b> lesnoydom<br>' +
+             '<b>Адрес организации:</b> САНКТ-ПЕТЕРБУРГ, ЦВЕТОЧНАЯ УЛИЦА, 7<br><b>URL организации:</b> http://lesnoydom.example/'),
+        text('Ниже укажите полный адрес страницы на Яндекс Картах (если организация была найдена):'),
+        textInput('Введите полный URL на Яндекс Картах'),
+        text('Обязательно введите найденный ID из найденного URL Яндекс Карт (если организация была найдена):'),
+        textInput('Введите ID из URL Яндекс Карт'),
+        text('Ниже укажите полный адрес страницы на Otzovik.com (если организация была найдена):'),
+        textInput('Введите полный URL на Otzovik.com'),
+        text('Какие предложенные данные совпали?'),
+        checkbox('Название организации'), checkbox('URL'), checkbox('Адрес организации'),
+        text('Если организация не найдена, отметь галочку здесь:'),
+        checkbox('Организация не найдена'),
+      ],
+      check: (f) => ({
+        ok: f.texts[0].includes('/maps/org/lesnoy-dom/1234567890') && f.texts[1] === '1234567890' && f.texts[2] === ''
+            && ['Название организации', 'URL', 'Адрес организации'].every((c) => f.checks.includes(c))
+            && !f.checks.includes('Организация не найдена'),
+        hint: '',
+      }),
+    }],
+  },
+  atm: {
+    mode: 'Тренировка', title: 'Проверка наличия фото поверхностей банкомата', instruction: true,
+    tasks: [{
+      render: () => [
+        text('Проверь блоки фото и укажи верный вариант.'),
+        radios([{ text: 'Все фото в наличии', tip: 'Есть фото лицевой части, обеих боковых сторон и верхней панели.' },
+                { text: 'Фото присутствуют частично', tip: 'Нет хотя бы одной поверхности.' }]),
+        text('Если фото присутствуют частично, укажи по какой поверхности недостаточно фотографий ниже'),
+        checkbox('Лицевая часть - недостаточно фото'), gallery(['atm-front-1', 'atm-front-2']),
+        checkbox('Боковые поверхности - недостаточно фото'), gallery(['atm-side-1']),
+      ],
+      check: (f) => ({ ok: f.radio[0] === 'Фото присутствуют частично' && f.checks.join('|') === 'Боковые поверхности - недостаточно фото',
+                       hint: 'Отсутствует фото правой боковой панели банкомата.' }),
+    }],
+  },
+};
+
+// ------------------------------------------------------------------ движок
+const sc = SCENARIOS[SCENARIO];
+let taskNo = 0;
+const clearFeedback = () => {
+  $('#hint-slot').innerHTML = '';
+  document.querySelectorAll('.training__error-hint').forEach((x) => x.remove());
+  $('#alerts').innerHTML = '';
+};
+const renderTask = () => {
+  clearFeedback();
+  $('#dropdowns').innerHTML = '';
+  groupNo = 0;
+  const task = sc.tasks[taskNo];
+  $('#mode').textContent = sc.mode;
+  $('#progress').textContent = `${taskNo + 1} из ${sc.tasks.length} заданий`;
+  $('#title').textContent = sc.title;
+  const f = $('#form');
+  f.innerHTML = '';
+  for (const c of task.render()) f.append(c);
+  window.__task = taskNo;
+};
+const toast = (msg) => {
+  $('#alerts').append(h('tui-alert', { role: 'alert' }, h('tui-notification', { 'data-appearance': 'error' },
+    h('span', {}, msg), h('button', { type: 'button', onclick: (e) => e.target.closest('tui-alert').remove() }, 'Закрыть'))));
+};
+$('#finish').addEventListener('click', () => {
+  const task = sc.tasks[taskNo];
+  const f = form();
+  const guard = task.guard ? task.guard() : '';
+  const verdict = guard ? { ok: false, hint: '' } : task.check(f);
+  window.__log.push(`submit:${SCENARIO}:${taskNo}:${JSON.stringify(f)}:${guard ? 'guard' : verdict.ok}`);
+  const loader = $('#loader');
+  loader.dataset.visible = 'true';
+  setTimeout(() => {
+    loader.dataset.visible = 'false';
+    clearFeedback();
+    if (guard) { toast(guard); return; }
+    if (!verdict.ok) {
+      if (verdict.hint) $('#hint-slot').append(h('tui-notification', { 'data-appearance': 'info', class: 'flex-common-view__hint' },
+        h('span', {}, verdict.hint)));
+      const lastGroup = [...document.querySelectorAll('#form flex-element[data-component-type="radiobuttonGroup"]')].pop();
+      if (lastGroup) lastGroup.append(h('tui-notification', { 'data-appearance': 'error', class: 'training__error-hint' }, 'Неверный ответ'));
+      toast('Ответ неверный, обратите внимание на подсказку и внимательно прочитайте инструкцию');
+      return;
+    }
+    taskNo += 1;
+    if (taskNo >= sc.tasks.length) { location.href = '/klecks/orders.html'; return; }
+    renderTask();
+  }, 350);
+});
+
+// ------------------------------------------------------------------ диалоги
+const dialog = (...content) => {
+  const d = h('tui-dialog', { role: 'dialog', 'aria-modal': 'true' }, h('section', { class: 't-dialog' }, ...content));
+  $('#dialogs').append(d);
+  return d;
+};
+window.openExitDialog = () => {
+  const d = dialog(h('h2', {}, 'Выйти из задания?'),
+    h('button', { type: 'button', onclick: () => { window.__log.push('exit:stay'); d.remove(); } }, 'Нет, остаться'),
+    h('button', { type: 'button', onclick: () => { window.__log.push('exit:LEFT'); d.remove(); } }, 'Да, выйти'));
+};
+$('#exit').addEventListener('click', () => window.openExitDialog());
+const openInstruction = () => {
+  const body = h('div', { class: 'custom-instruction-viewer__instruction-block' });
+  const loader = h('tui-loader', { class: 'custom-instruction-viewer__loader _loading' }, h('div', { class: 't-loader' }));
+  const d = dialog(h('div', { class: 'custom-instruction-viewer__container' }, h('span', {}, 'Инструкция к заданию'),
+      h('button', { type: 'button', class: 'custom-instruction-viewer__button-link', 'aria-label': 'Открыть в новой вкладке' }),
+      h('button', { type: 'button', onclick: () => { window.__log.push('instruction:closed'); d.remove(); } }, 'Закрыть')),
+    loader, body);
+  window.__log.push('instruction:opened');
+  setTimeout(() => {
+    loader.classList.remove('_loading');
+    body.innerHTML = '<h2>Проверка наличия фото</h2><p>Для каждой поверхности банкомата должны быть фото: лицевая часть, ' +
+      'обе боковые стороны, верхняя панель.</p><p>Если хотя бы одной стороны нет — выбирайте «Фото присутствуют частично» ' +
+      'и отмечайте поверхность, по которой недостаточно фото.</p><ul><li>Чёрные фото считаются отсутствующими.</li>' +
+      '<li>Размытое фото, на котором нельзя различить поверхность, считается отсутствующим.</li></ul>';
+  }, 1200);
+};
+$('#instr').addEventListener('click', openInstruction);
+
+renderTask();
+if (sc.instruction && params.get('autoinstruction') === '1') openInstruction();
+</script>
+</body>
+</html>

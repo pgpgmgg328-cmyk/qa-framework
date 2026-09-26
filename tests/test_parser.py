@@ -58,8 +58,12 @@ def test_tree_initial_snapshot():
             finish = one(state, "Завершить")
             assert finish.kind == ElementKind.BUTTON and finish.is_disabled
             assert state.task_text.startswith("Выберите категорию для товара: смартфон")
-            assert "00:59" not in state.task_text
             assert state.image_src and state.hidden_elements > 0
+            # таймер виден модели в тексте страницы, но отпечаток задания от него не зависит
+            await frame.evaluate("() => { document.querySelector('.timer').textContent = '00:41'; }")
+            ticked = await DomParser(frame).parse()
+            assert "00:41" in ticked.task_text
+            assert ticked.task_identifier == state.task_identifier
     run(scenario())
 
 
@@ -144,8 +148,14 @@ def test_taiga_like_semantics():
             assert "Отметьте все подходящие" in state.task_text
             assert state.hint_text.startswith("Подсказка")
             assert state.alerts == ["Выберите хотя бы один вариант"]
-            assert not state.loading
+            assert not state.loading and state.local_loading == 0
+            # маленький спиннер рядом с полем — «местная» загрузка, работу не блокирует
             await frame.evaluate("() => { document.querySelector('.spinner').hidden = false; }")
+            small = await DomParser(frame).parse()
+            assert not small.loading and small.local_loading == 1
+            # оверлей на весь экран — блокирующая загрузка
+            await frame.evaluate("() => { document.querySelector('.spinner').style.cssText = "
+                                 "'position:fixed;inset:0;width:auto;height:auto'; }")
             assert (await DomParser(frame).parse()).loading
     run(scenario())
 

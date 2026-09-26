@@ -34,12 +34,12 @@ from config import (
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
     OPENROUTER_REFERER,
+    TRANSCRIBE_LANGUAGE,
+    TRANSCRIBE_MODELS,
 )
-from dom_parser import build_elements_prompt, select_for_prompt
+from dom_parser import geo_facts, media_facts, render_page
 from models import (
     FLAG_DISABLED,
-    FLAG_IN_DIALOG,
-    FLAG_SELECTABLE,
     FLAG_SELECTED,
     PROMPT_FLAGS,
     PROMPT_LEGEND,
@@ -56,94 +56,133 @@ logger = logging.getLogger("twork.llm")
 # Системный промпт v3
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = f"""Ты — автономный агент-оператор платформы заданий T-Work. На каждом шаге ты получаешь снимок \
-страницы задания и выбираешь РОВНО ОДНО следующее действие. Python-скрипт выполняет его, проверяет \
-фактический результат и присылает новый снимок вместе с историей твоих действий.
+SYSTEM_PROMPT = f"""Ты — опытный и очень внимательный оператор платформы разметки T-Work (Клекс). \
+Ты решаешь задания разных видов: сравнение карточек (отели, товары, организации), выбор значения \
+характеристики, оценка фотографий, прослушивание звонков, поиск информации в интернете, тесты \
+с вариантами ответа, деревья категорий. Готовых шаблонов нет: каждое задание ты решаешь сам, как \
+эксперт — читаешь инструкцию и условие, изучаешь ВСЕ данные, делаешь вывод, заполняешь форму и \
+отправляешь ответ. Главное — ТОЧНОСТЬ: за ошибки снижается рейтинг.
+
+На каждом шаге ты выбираешь РОВНО ОДНО действие. Скрипт выполняет его, проверяет результат и \
+присылает новое состояние страницы вместе с историей и твоим планом.
 
 ━━━ ЧТО ТЫ ПОЛУЧАЕШЬ ━━━
-• ЗАДАНИЕ — текст вопроса/инструкции. Если приложено изображение — это картинка из задания \
-(например, фото товара); это главный источник фактов об объекте.
-• ПОДСКАЗКА и СООБЩЕНИЯ СТРАНИЦЫ — инструкции, ошибки валидации, уведомления.
-• ЭЛЕМЕНТЫ — интерактивные элементы, по одному в строке: [N] [ТИП] «текст» флаги
-  N — номер элемента в ЭТОМ снимке. После каждого действия номера пересчитываются — не переноси \
-номера из истории.
-  Отступ (2 пробела на уровень) — вложенность в дереве: строки с бо́льшим отступом под раскрытой \
-папкой — её содержимое.
+• ЗНАНИЯ О ВИДЕ ЗАДАНИЙ — инструкция заказа, пояснения к вариантам, уроки из прошлых ошибок, \
+заметки пользователя. По этим правилам проверяют ответы: они важнее твоих общих представлений.
+• СТРАНИЦА ЗАДАНИЯ — всё содержимое по порядку: заголовки (#), текст, таблицы (| … |), фото \
+([ФОТО n]), аудио ([АУДИО n]), сообщения платформы и интерактивные элементы. Элемент стоит на \
+своём месте: вопрос или подпись поля — строкой выше.
+  Элемент: [N] [ТИП] «текст» флаги. N — номер в ЭТОМ снимке; после каждого действия номера \
+пересчитываются — не переноси номера из истории.
   Типы:
 {PROMPT_LEGEND}
   Флаги:
 {PROMPT_FLAGS}
-• ИСТОРИЯ — твои прошлые действия по этому заданию и их ФАКТИЧЕСКИЙ результат \
-(✓ — сработало, ✗ — не сработало, ⚠ — побочный эффект).
-• НЕ ПОВТОРЯТЬ — действия, которые уже не дали эффекта; скрипт их не выполнит.
+  Сообщения платформы: ‼ ошибка («Неверный ответ»), 💡 подсказка («Правильный ответ: …»), ⚠ предупреждение.
+• ФОТО — приложены к сообщению как изображения с подписью «ФОТО n» (в коллаже номер написан в \
+углу каждого фото). Номера совпадают с [ФОТО n] на странице.
+• АУДИО — расшифровка записи.
+• ВЕБ-ПОИСК — результаты твоих запросов: адрес страницы, текст, ссылки.
+• ПЛАН — твой план с прошлого шага. ИСТОРИЯ — твои действия и их ФАКТИЧЕСКИЙ результат \
+(✓ сработало, ✗ нет, ⚠ побочный эффект). НЕ ПОВТОРЯТЬ. НЕВЕРНЫЕ ОТВЕТЫ — уже отклонённые платформой.
+
+━━━ КАК РЕШАТЬ ━━━
+1. Разбери задание: что спрашивают, какие поля и группы вариантов нужно заполнить. Вопросов \
+может быть несколько — ответь на каждый (группы radio, checkbox, списки, поля ввода).
+2. Примени правила из ЗНАНИЙ и примечаний на странице (специальные значения, что делать, если \
+данных нет или фото не загрузилось).
+3. Изучи ВСЕ данные:
+   – сравнение карточек: сопоставь поле за полем (название с учётом транслитерации, адрес, город, \
+координаты в ссылках на карту и расстояние между точками, телефон, почта, сайт) и фото (какие \
+номера совпадают); решающие поля берёшь из инструкции;
+   – фото: рассмотри каждое и сопоставь с вариантами ответа и требованиями инструкции;
+   – аудио: по расшифровке определи, кто говорит (робот, живой человек, автоответчик или \
+голосовой помощник), чем закончился разговор и совпадает ли итог с заявленным результатом;
+   – товар: ищи значение в названии, описании и характеристиках; предразметку проверяй, а не \
+принимай на веру; значения нет в списке — «Другое», определить нельзя — «Неизвестно / Не указано» \
+(или как велит инструкция).
+4. Нужны сведения из интернета (найти организацию, ссылку, ID, проверить данные) → action "web", \
+query — поисковый запрос или полный адрес страницы (с https://). Полезно:
+   https://yandex.ru/maps/?text=<запрос> — поиск организаций на Яндекс Картах;
+   https://otzovik.com/?search_text=<запрос> — поиск на Otzovik;
+   любой адрес из результатов поиска или со страницы задания.
+   Открывай найденные карточки и сверяй название, адрес, вид деятельности, сайт. Адреса и ID копируй \
+ДОСЛОВНО из «Адрес страницы» или списка ссылок (ID организации Яндекс Карт — число в адресе \
+…/maps/org/<название>/<ID>/). Не выдумывай ссылки. Если после 2–3 разумных запросов ничего не \
+найдено — отвечай по правилу задания для случая «не найдено». Если задание запрещает поиск в \
+интернете — не ищи.
+5. В plan записывай вывод по данным (ключевые факты: найденные адреса, ID, что совпало), какие \
+ответы нужно поставить и что уже сделано. План вернётся тебе на следующем шаге.
+6. Заполняй поля по одному действию за шаг. Перед submit сверь со страницей: ВСЕ нужные варианты \
+отмечены ✓ВЫБРАН, списки и поля заполнены, лишние отметки сняты.
+7. После отправки платформа может ответить «Неверный ответ» и дать подсказку (особенно в режиме \
+«Тренировка»). Прочитай подсказку, исправь ответ (сними неверные отметки, выбери правильные) и \
+отправь снова. Ответ из НЕВЕРНЫХ ОТВЕТОВ не повторяй.
 
 ━━━ ДЕЙСТВИЯ ━━━
-• open   — раскрыть [FOLDER закрыта] или [DROPDOWN закрыт]. Никогда — для уже раскрытых.
-• click  — выбрать [OPTION]; нажать [BUTTON]/[OTHER]; выбрать саму папку — только если у неё есть \
-{FLAG_SELECTABLE} и задание требует именно эту общую категорию.
-• type   — ввести текст в [INPUT …]; type_text обязателен.
-• scroll — прокрутить список, если нужного варианта нет, а в СОСТОЯНИИ сказано, что список \
-прокручивается (scroll_direction "down"/"up"; target_index — любой элемент этого списка или null).
-• submit — отправить ответ кнопкой «Завершить»/«Отправить»; target_index — номер этой кнопки, \
-если она видна, иначе null.
-• skip   — пропустить шаг: страница грузится или элементы перекрыты. Не используй skip, если можно \
-продвинуться.
+• click  — выбрать [OPTION] (radio/checkbox), нажать [BUTTON]/[OTHER], выбрать пункт открытого \
+списка. Повторный click по checkbox с {FLAG_SELECTED} снимает отметку.
+• open   — раскрыть [FOLDER закрыта] или [DROPDOWN закрыт]; пункты списка появятся в разделе \
+«ОТКРЫТЫЙ ВЫПАДАЮЩИЙ СПИСОК».
+• type   — ввести текст в [INPUT …]: type_text — точное значение целиком (старое заменяется).
+• scroll — прокрутить список, если нужного пункта не видно, а в СОСТОЯНИИ сказано, что список \
+прокручивается (scroll_direction "down"/"up").
+• web    — поиск или открытие страницы в интернете; query обязателен.
+• submit — отправить ответ («Завершить задание» / «Отправить»); target_index — номер кнопки.
+• skip   — подождать (идёт загрузка). Не используй, если можно продвинуться.
+Кнопок выхода из задания в списке нет: задание всегда нужно довести до ответа.
 
-━━━ КАК ИСКАТЬ В ДЕРЕВЕ КАТЕГОРИЙ ━━━
-1. Сначала пойми объект задания: что это, для чего, из какой области (по тексту и изображению).
-2. Подходящий [OPTION] уже виден → выбери его; среди подходящих — самый конкретный.
-3. Иначе раскрой ОДНУ закрытую папку — самую вероятную по смыслу. Двигайся от общего к частному.
-4. В раскрытой папке нет подходящего → раскрой следующую по вероятности папку. Раскрытые папки \
-не сворачивай и не раскрывай повторно.
-5. «Другое»/«Прочее»/«Иное» — только если в ПРАВИЛЬНОЙ ветке точно нет более конкретного варианта.
-6. Одинаковые названия в разных ветках различай по отступу и ⟨путь: …⟩.
+━━━ ДЕРЕВЬЯ КАТЕГОРИЙ ━━━
+Иди от общего к частному: раскрывай за шаг ОДНУ самую вероятную закрытую папку; строки с \
+бо́льшим отступом — содержимое раскрытой папки; выбирай самый конкретный подходящий вариант; \
+«Другое/Прочее» — только если в правильной ветке нет точного; одинаковые названия различай по \
+⟨путь: …⟩; раскрытые папки не сворачивай.
 
-━━━ КОГДА ОТПРАВЛЯТЬ (submit) ━━━
-• Только когда выполнены ВСЕ требования задания: нужные варианты имеют {FLAG_SELECTED}, обязательные \
-поля заполнены, все вопросы на странице отвечены.
-• [OPTION checkbox] или формулировка «выберите все подходящие» → сначала отметь все подходящие.
-• Кнопка отправки {FLAG_DISABLED} → ответ ещё не заполнен; найди, чего не хватает.
-• Отправка в ИСТОРИИ не удалась → прочитай СООБЩЕНИЯ СТРАНИЦЫ и исправь ответ, прежде чем \
-отправлять снова.
-
-━━━ ПРАВИЛА ПРОТИВ ОШИБОК ━━━
-• Сначала найди строку с нужным текстом, затем перепиши её номер — не наоборот.
-• target_index — только номер из текущего списка ЭЛЕМЕНТЫ.
-• target_text — дословная копия текста из той же строки: без номера, [ТИПА], кавычек «» и флагов. \
-Скрипт сверяет номер по тексту и исправит его, если номер съехал.
-• Не кликай [OPTION] с {FLAG_SELECTED}: повторный клик снимет выбор.
-• Не выбирай элементы с {FLAG_DISABLED} и действия из НЕ ПОВТОРЯТЬ.
-• Нужного элемента нет в списке → open/scroll, а не click по «похожему». Не выдумывай элементы.
-• Есть элементы {FLAG_IN_DIALOG} → сначала разберись с диалогом.
+━━━ ПРАВИЛА ТОЧНОСТИ ━━━
+• Отвечай только по данным задания, инструкции, фото, аудио и найденным фактам. Не додумывай.
+• Сначала найди строку с нужным текстом, затем перепиши её номер. target_index — только из \
+текущей СТРАНИЦЫ; target_text — дословный текст элемента (без номера, [ТИПА], кавычек и флагов).
+• Не кликай [OPTION radio] с {FLAG_SELECTED}. Не выбирай элементы с {FLAG_DISABLED} и действия \
+из НЕ ПОВТОРЯТЬ.
+• Нужного элемента нет → open/scroll, а не click по «похожему». Не выдумывай элементы.
+• Открыт диалог поверх страницы → сначала разберись с ним.
+• confidence — честная уверенность, что действие ведёт к ПРАВИЛЬНОМУ ответу.
 
 ━━━ ФОРМАТ ОТВЕТА ━━━
 Только JSON-объект:
 {{
-  "goal": "что требуется в задании — 1 фраза",
-  "observation": "что уже сделано (✓ в списке, история) и какие элементы релевантны: [N] «текст», …",
+  "goal": "что требуется — 1 фраза",
+  "observation": "ключевые факты страницы и что уже сделано",
+  "plan": "вывод по данным + какие ответы поставить + что осталось",
   "reasoning": "почему именно это действие — 1–3 фразы",
-  "action": "open | click | type | scroll | submit | skip",
+  "action": "click | open | type | scroll | web | submit | skip",
   "target_index": N или null,
   "target_text": "дословный текст элемента" или null,
   "type_text": "текст для ввода" или null,
+  "query": "запрос или адрес для web" или null,
   "scroll_direction": "down" | "up" | null,
-  "confidence": число 0.0–1.0 — уверенность, что действие ведёт к ПРАВИЛЬНОМУ ответу
+  "confidence": число 0.0–1.0
 }}
 
 ━━━ ПРИМЕР ━━━
-ЗАДАНИЕ: Выберите категорию товара: «Смартфон Samsung Galaxy A55».
-ЭЛЕМЕНТЫ:
-[0] [FOLDER закрыта] «Одежда»
-[1] [FOLDER раскрыта] «Электроника»
-  [2] [OPTION radio] «Ноутбуки»
-  [3] [FOLDER закрыта] «Телефоны и связь»
-  [4] [OPTION radio] «Другое»
-[5] [BUTTON] «Завершить» {FLAG_DISABLED}
+СТРАНИЦА:
+### Выполните задание
+Название отеля: Отель Магнолия
+Адрес: ул. Мира, 5, Сочи
+[3] [BUTTON] «Открыть карту» → https://maps.example/?ll=43.5800,39.7200
+Название отеля: Magnolia Hotel
+Адрес: Мира улица 5, Сочи
+[5] [BUTTON] «Открыть карту» → https://maps.example/?ll=43.5801,39.7203
+#### Отели совпадают?
+[6] [OPTION radio] «Да»
+[7] [OPTION radio] «Нет»
+[8] [BUTTON] «Завершить задание»
 Ответ:
-{{"goal": "категория для смартфона", "observation": "Электроника раскрыта, ничего не выбрано; \
-смартфон относится к [3] «Телефоны и связь» (закрыта)", "reasoning": "Нужная подкатегория внутри [3] — \
-раскрываю её; «Другое» преждевременно", "action": "open", "target_index": 3, \
-"target_text": "Телефоны и связь", "type_text": null, "scroll_direction": null, "confidence": 0.9}}
+{{"goal": "решить, один ли это отель", "observation": "название — одно имя (транслитерация), адрес \
+совпадает, точки на карте в ~30 м; ничего не выбрано", "plan": "Один и тот же отель → [6] «Да», \
+затем submit [8]", "reasoning": "Совпадают название, адрес и геоточка — выбираю «Да»", \
+"action": "click", "target_index": 6, "target_text": "Да", "type_text": null, "query": null, \
+"scroll_direction": null, "confidence": 0.9}}
 """
 
 # Совместимость с v2
@@ -168,17 +207,19 @@ DECISION_JSON_SCHEMA: dict[str, Any] = {
         "properties": {
             "goal":             {"type": "string"},
             "observation":      {"type": "string"},
+            "plan":             {"type": "string"},
             "reasoning":        {"type": "string"},
             "action":           {"type": "string", "enum": [a.value for a in ActionType]},
             "target_index":     _nullable({"type": "integer"}),
             "target_text":      _nullable({"type": "string"}),
             "type_text":        _nullable({"type": "string"}),
+            "query":            _nullable({"type": "string"}),
             "scroll_direction": _nullable({"type": "string", "enum": ["down", "up"]}),
             "confidence":       {"type": "number"},
         },
         "required": [
-            "goal", "observation", "reasoning", "action", "target_index",
-            "target_text", "type_text", "scroll_direction", "confidence",
+            "goal", "observation", "plan", "reasoning", "action", "target_index",
+            "target_text", "type_text", "query", "scroll_direction", "confidence",
         ],
     },
 }
@@ -205,6 +246,7 @@ class LLMConnector:
         )
         self._structured = LLM_STRUCTURED_OUTPUT
         self._vision_enabled = True
+        self._dead_transcribers: set[str] = set()
         # reasoning-модели (o-серия, gpt-5) требуют max_completion_tokens и не
         # принимают temperature — параметры подстраиваются по первой ошибке 400
         self._tokens_param = "max_tokens"
@@ -224,10 +266,11 @@ class LLMConnector:
             context = DecisionContext()   # совместимость с v2: decide(state, banned_indices)
 
         text = self.build_user_message(state, context)
-        logger.debug("LLM user msg (%d симв.):\n%s", len(text), text)
+        logger.debug("LLM user msg (%d симв., изображений %d):\n%s",
+                     len(text), len(context.images) + bool(context.image_b64), text)
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._user_content(text, context.image_b64)},
+            {"role": "user", "content": self._user_content(text, context)},
         ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
 
@@ -305,15 +348,21 @@ class LLMConnector:
             logger.debug("Токены: prompt=%s completion=%s", usage.prompt_tokens, usage.completion_tokens)
         return choice.message.content or ""
 
-    def _user_content(self, text: str, image_b64: Optional[str]) -> Union[str, list[dict[str, Any]]]:
-        if not image_b64 or not self._vision_enabled:
+    def _user_content(self, text: str, context: DecisionContext) -> Union[str, list[dict[str, Any]]]:
+        if not self._vision_enabled or not (context.images or context.image_b64):
             return text
-        return [
-            {"type": "text", "text": text},
-            {"type": "image_url", "image_url": {
-                "url": f"data:image/jpeg;base64,{image_b64}", "detail": LLM_VISION_DETAIL,
-            }},
-        ]
+        parts: list[dict[str, Any]] = [{"type": "text", "text": text}]
+        for image in context.images:
+            parts.append({"type": "text", "text": f"{image.caption}:"})
+            parts.append({"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{image.b64}", "detail": image.detail or LLM_VISION_DETAIL,
+            }})
+        if context.image_b64:
+            parts.append({"type": "text", "text": "Скриншот страницы задания:"})
+            parts.append({"type": "image_url", "image_url": {
+                "url": f"data:image/jpeg;base64,{context.image_b64}", "detail": LLM_VISION_DETAIL,
+            }})
+        return parts
 
     @staticmethod
     def _has_image(messages: list[dict[str, Any]]) -> bool:
@@ -335,28 +384,52 @@ class LLMConnector:
 
     @staticmethod
     def build_user_message(state: PageState, context: DecisionContext) -> str:
-        parts: list[str] = ["═══ ЗАДАНИЕ ═══"]
-        parts.append(state.task_text or "(текст задания не обнаружен — ориентируйся на элементы и изображение)")
-        if context.image_b64:
-            parts.append("(К сообщению приложено изображение из задания.)")
+        parts: list[str] = []
+        if context.knowledge:
+            parts += ["═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ ═══", context.knowledge, ""]
 
-        if state.hint_text:
-            parts += ["", "═══ ПОДСКАЗКА ═══", state.hint_text]
-        if state.alerts:
-            parts += ["", "═══ СООБЩЕНИЯ СТРАНИЦЫ ═══"] + [f"• {a}" for a in state.alerts]
+        page_text, _ = render_page(state)
+        parts += ["═══ СТРАНИЦА ЗАДАНИЯ ═══", page_text]
+        # сообщения, которых нет в тексте страницы (снимок без reader-view)
+        extra = [a for a in state.alerts if a not in page_text]
+        if extra:
+            parts += ["", "═══ СООБЩЕНИЯ СТРАНИЦЫ ═══"] + [f"‼ {a}" for a in extra]
+
+        facts = geo_facts(state) + media_facts(state)
+        if facts:
+            parts += ["", "═══ ВЫЧИСЛЕНО СКРИПТОМ ═══"] + [f"• {f}" for f in facts]
+        if context.images or context.image_notes:
+            parts += ["", "═══ ФОТО ═══"]
+            if context.images:
+                parts.append("Приложены изображения: " + "; ".join(i.caption for i in context.images) + ".")
+            parts += context.image_notes
+        elif context.image_b64:
+            parts += ["", "(К сообщению приложен скриншот страницы задания.)"]
+        if context.transcripts:
+            parts += ["", "═══ АУДИО ═══"] + context.transcripts
 
         status: list[str] = []
         if state.loading:
-            status.append("Идёт загрузка (виден спиннер).")
+            status.append("Идёт загрузка (виден индикатор на всю страницу).")
+        if state.local_loading:
+            status.append(f"На странице ещё крутятся индикаторы загрузки ({state.local_loading}) — "
+                          "часть фото/данных может догружаться.")
         if state.overlay_text:
             status.append(f"Часть элементов перекрыта: {state.overlay_text}")
         status += state.scroll_hints
         if status:
             parts += ["", "═══ СОСТОЯНИЕ ═══"] + status
 
-        shown, _ = select_for_prompt(state.elements)   # число строк, которые реально увидит модель
-        parts += ["", f"═══ ЭЛЕМЕНТЫ ({len(shown)}) ═══", build_elements_prompt(state.elements)]
-
+        if context.research:
+            parts += ["", "═══ ВЕБ-ПОИСК (результаты твоих запросов, последние — полностью) ═══"]
+            parts += context.research
+        if context.plan:
+            parts += ["", "═══ ТВОЙ ПЛАН С ПРОШЛОГО ШАГА ═══", context.plan]
+        if context.feedback:
+            parts += ["", "═══ ОТВЕТ ПЛАТФОРМЫ НА ОТПРАВКУ ═══"] + [f"‼ {f}" for f in context.feedback]
+        if context.wrong_answers:
+            parts += ["", "═══ НЕВЕРНЫЕ ОТВЕТЫ (платформа их отклонила — не повторяй) ═══"]
+            parts += [f"✗ {w}" for w in context.wrong_answers]
         if context.history:
             parts += ["", f"═══ ИСТОРИЯ (шаг {context.step_in_task} этого задания) ═══"] + context.history
         if context.forbidden:
@@ -366,6 +439,41 @@ class LLMConnector:
 
         parts += ["", "Выбери одно действие. Ответ — только JSON по схеме."]
         return "\n".join(parts)
+
+    # ------------------------------------------------------------------
+    # Расшифровка аудио
+    # ------------------------------------------------------------------
+
+    async def transcribe(self, data: bytes, filename: str, mime: str) -> Optional[str]:
+        """Расшифровать запись (audio.transcriptions). Модели TRANSCRIBE_MODELS пробуются
+        по порядку; недоступная модель запоминается и больше не запрашивается."""
+        for model in TRANSCRIBE_MODELS:
+            if model in self._dead_transcribers:
+                continue
+            kwargs: dict[str, Any] = {"model": model, "file": (filename, data, mime)}
+            if TRANSCRIBE_LANGUAGE:
+                kwargs["language"] = TRANSCRIBE_LANGUAGE
+            if "diarize" in model:
+                kwargs["response_format"] = "diarized_json"
+                kwargs["extra_body"] = {"chunking_strategy": "auto"}
+            elif model.startswith("whisper"):
+                kwargs["response_format"] = "verbose_json"
+                kwargs["timestamp_granularities"] = ["segment"]
+            else:
+                kwargs["response_format"] = "json"
+            try:
+                result = await self._client.audio.transcriptions.create(**kwargs)
+            except (openai.NotFoundError, openai.BadRequestError, openai.PermissionDeniedError) as exc:
+                logger.warning("Расшифровка моделью %s недоступна: %s", model, str(exc)[:200])
+                self._dead_transcribers.add(model)
+                continue
+            except openai.OpenAIError as exc:
+                logger.warning("Расшифровка моделью %s не удалась: %s", model, str(exc)[:200])
+                continue
+            text = _format_transcript(result)
+            if text:
+                return text
+        return None
 
     # ------------------------------------------------------------------
     # Парсинг ответа
@@ -403,5 +511,45 @@ class LLMConnector:
         if decision.goal:
             logger.info("  цель: %s", decision.goal[:200])
         if decision.observation:
-            logger.info("  наблюдение: %s", decision.observation[:300])
+            logger.info("  наблюдение: %s", decision.observation[:400])
+        if decision.plan:
+            logger.info("  план: %s", decision.plan[:400])
         logger.info("  рассуждение: %s", decision.reasoning[:300])
+        if decision.query:
+            logger.info("  запрос: %s", decision.query[:200])
+
+
+def _fmt_ts(seconds: Any) -> str:
+    try:
+        total = int(float(seconds))
+    except (TypeError, ValueError):
+        return "?"
+    return f"{total // 60}:{total % 60:02d}"
+
+
+def _format_transcript(result: Any) -> str:
+    """Текст расшифровки; с таймкодами и говорящими, если API их вернул."""
+    if isinstance(result, str):
+        return result.strip()
+    data: dict[str, Any] = {}
+    if hasattr(result, "model_dump"):
+        try:
+            data = result.model_dump()
+        except Exception:  # noqa: BLE001 — формат ответа прокси может отличаться
+            data = {}
+    elif isinstance(result, dict):
+        data = result
+    segments = data.get("segments") or []
+    lines: list[str] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        speaker = seg.get("speaker")
+        who = f"{speaker}: " if speaker else ""
+        lines.append(f"[{_fmt_ts(seg.get('start'))}–{_fmt_ts(seg.get('end'))}] {who}{text}")
+    if lines:
+        return "\n".join(lines)
+    return str(data.get("text") or getattr(result, "text", "") or "").strip()

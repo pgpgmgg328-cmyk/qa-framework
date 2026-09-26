@@ -1,6 +1,14 @@
-"""dom_parser.py v3 — атомарный снимок DOM целевого фрейма.
+"""dom_parser.py v4 — атомарный снимок DOM целевого фрейма.
 
-Что изменилось относительно v2 и почему:
+v4: снимок содержит страницу задания ЦЕЛИКОМ (reader-view): заголовки, текст с
+переносами, таблицы, ссылки с адресами, фото [ФОТО n], аудио [АУДИО n], сообщения
+платформы и интерактивные элементы на своих местах. Модель видит вопрос рядом с
+вариантами, подпись «Цвет» рядом со списком значений и координаты в ссылках на карту.
+Исправлено по записи реальных заданий: ложная «загрузка» (скрытый global-loader),
+Angular-класс ng-invalid как «ошибка», обрезка текста задания на 1500 символах,
+пункты длинных выпадающих списков, «обрезанные» внешней обёрткой.
+
+Что изменилось в v3 относительно v2 и почему:
 
 1. Стабильные метки вместо «индекса в querySelectorAll».
    В v2 парсер нумеровал только ВИДИМЫЕ элементы, а BrowserController кликал
@@ -36,14 +44,25 @@ import hashlib
 import itertools
 import json
 import logging
+import math
 import re
 from collections import Counter
-from urllib.parse import urlsplit
+from typing import Optional
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import Frame
 
-from config import FINISH_DENY_SUBSTRINGS, MAX_ELEMENTS
-from models import ElementKind, FolderState, PageState, ParsedElement, normalize_text
+from config import FINISH_DENY_SUBSTRINGS, MAX_ELEMENTS, READER_MAX_CHARS
+from models import (
+    ElementKind,
+    FolderState,
+    MediaAudio,
+    MediaImage,
+    Notice,
+    PageState,
+    ParsedElement,
+    normalize_text,
+)
 
 logger = logging.getLogger("twork.dom_parser")
 
@@ -112,7 +131,7 @@ _JS_SNAPSHOT = r"""
     const GEN = String(args.gen);
     const MAX = args.max || 1500;
     const A_ID = 'data-agent-id', A_TOGGLE = 'data-agent-toggle',
-          A_SELECT = 'data-agent-select', A_IMG = 'data-agent-img';
+          A_SELECT = 'data-agent-select', A_IMG = 'data-agent-img', A_MEDIA = 'data-agent-media';
 
     // ------------------------------------------------------------ утилиты
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
@@ -153,6 +172,7 @@ _JS_SNAPSHOT = r"""
         if (el.hasAttribute(A_TOGGLE)) el.removeAttribute(A_TOGGLE);
         if (el.hasAttribute(A_SELECT)) el.removeAttribute(A_SELECT);
         if (el.hasAttribute(A_IMG)) el.removeAttribute(A_IMG);
+        if (el.hasAttribute(A_MEDIA)) el.removeAttribute(A_MEDIA);
     }
 
     // ------------------------------------------------------------ видимость
@@ -167,6 +187,11 @@ _JS_SNAPSHOT = r"""
         const r = el.getBoundingClientRect();
         if (r.width < 1 || r.height < 1) return null;       // v2: '&&' пропускал схлопнутые по высоте
         if (!rendered(el)) return null;                     // opacity/visibility с учётом предков
+        // probe — что должно пересекаться с областью очередного предка. Выше прокручиваемого
+        // контейнера важна видимость самого контейнера: пункт длинного списка ниже края
+        // доступен прокруткой, хотя внешняя обёртка с overflow:hidden его «обрезает»
+        // (в записи из 20 значений списка «Цвет» терялись 5 нижних).
+        let probe = r;
         let fixed = styleOf(el).position === 'fixed';
         for (let a = flatParent(el); a && !fixed; a = flatParent(a)) {
             if (a === document.body || a === document.documentElement) break;
@@ -181,9 +206,9 @@ _JS_SNAPSHOT = r"""
                 clipCache.set(a, c);
             }
             if (c.rect.width < 1 || c.rect.height < 1) return null;   // схлопнутая ветка / аккордеон
-            if (c.scrollable) continue;                               // до элемента можно доскроллить
-            const ix = Math.min(r.right, c.rect.right) - Math.max(r.left, c.rect.left);
-            const iy = Math.min(r.bottom, c.rect.bottom) - Math.max(r.top, c.rect.top);
+            if (c.scrollable) { probe = c.rect; continue; }            // до элемента можно доскроллить
+            const ix = Math.min(probe.right, c.rect.right) - Math.max(probe.left, c.rect.left);
+            const iy = Math.min(probe.bottom, c.rect.bottom) - Math.max(probe.top, c.rect.top);
             if (ix < 1 || iy < 1) return null;                        // обрезан overflow:hidden
         }
         return r;
@@ -263,6 +288,9 @@ _JS_SNAPSHOT = r"""
             const tag = tagOf(n);
             if (tag === 'br') { out += ' '; continue; }
             if (SKIP_TEXT.has(tag)) continue;
+            // мелкие aria-hidden-узлы — декор: «зеркало» значения в tui-textarea, иконки-лигатуры.
+            // Крупные не пропускаем: при открытом диалоге aria-hidden вешают на всё приложение.
+            if (attr(n, 'aria-hidden') === 'true' && n.childElementCount <= 3) continue;
             const s = styleOf(n);
             if (s.display === 'none' || s.visibility === 'hidden' || s.visibility === 'collapse') continue;
             push(n, !(s.display.startsWith('inline') || s.display === 'contents'));
@@ -283,7 +311,7 @@ _JS_SNAPSHOT = r"""
         return meaningful(al) ? norm(al) : '';
     };
     const rowLabel = (el) => {
-        let t = textOf(el, candSet, 200);
+        let t = textOf(el, candSet, 400);
         if (meaningful(t)) return t;
         t = ariaText(el) || norm(attr(el, 'title'));
         if (meaningful(t)) return t.slice(0, 200);
@@ -300,9 +328,18 @@ _JS_SNAPSHOT = r"""
         if (!meaningful(t)) t = norm(attr(el, 'placeholder'));
         if (!meaningful(t)) t = norm(attr(el, 'title'));
         if (!meaningful(t) && el.closest) {
-            // Taiga: подпись поля живёт в обёртке tui-input/tui-textfield
+            // Taiga: подпись поля живёт в обёртке tui-input/tui-textfield. В обёртке
+            // tui-textarea есть и «зеркало» введённого текста — его из подписи вырезаем,
+            // иначе подпись (и ключ памяти) менялась бы с каждым введённым символом.
             const wrap = el.closest(FIELD_WRAP);
-            if (wrap) { const w = textOf(wrap, candSet, 120); if (meaningful(w)) t = w; }
+            if (wrap) {
+                const ph = wrap.querySelector('[automation-id*="placeholder" i], .t-placeholder, [class*="placeholder" i]');
+                let w = ph ? textOf(ph, candSet, 200) : '';
+                if (!meaningful(w)) w = textOf(wrap, candSet, 200);
+                const v = norm(el.value || '');
+                if (v) { const i = w.indexOf(v.slice(0, 24)); if (i >= 0) w = norm(w.slice(0, i)); }
+                if (meaningful(w)) t = w;
+            }
         }
         return meaningful(t) ? t.slice(0, 200) : '';
     };
@@ -395,7 +432,7 @@ _JS_SNAPSHOT = r"""
         rec.textInput = isTextInput(el);
         rec.choice = isChoiceControl(el);
         rec.dropdown = !rec.textInput && isDropdownTrigger(el);
-        rec.visibleText = rec.textInput ? '' : textOf(el, candSet, 200);
+        rec.visibleText = rec.textInput ? '' : textOf(el, candSet, 400);
         rec.label = rec.textInput ? inputLabel(el)
                   : rec.dropdown ? dropdownLabel(el)
                   : (meaningful(rec.visibleText) ? rec.visibleText : rowLabel(el));
@@ -676,6 +713,7 @@ _JS_SNAPSHOT = r"""
     const POPUP_SEL = 'tui-dropdown, tui-data-list, [role="listbox"], [role="menu"], .cdk-overlay-pane';
     const containerOf = (el) => {
         if (!el.closest) return '';
+        if (el.closest('tui-alerts, tui-alert, [class*="toast" i]')) return 'toast';
         if (el.closest(DIALOG_SEL)) return 'dialog';
         const p = el.closest(POPUP_SEL);
         if (p) {
@@ -707,7 +745,61 @@ _JS_SNAPSHOT = r"""
         return tagOf(x) + (c ? '.' + c : '') + (t ? ' «' + t + '»' : '');
     };
 
-    // --------------------------------------------- 7. разметка и результат
+    // --------------------------------------------- 7. служебные элементы и подписи
+    // Плееры аудио/видео: свои кнопки и ползунки агенту не нужны (запись он расшифровывает
+    // и доигрывает сам) — в тексте страницы плеер заменяется строкой [АУДИО n].
+    const mediaEls = ALL.filter((n) => { const t = tagOf(n); return t === 'audio' || t === 'video'; });
+    const widgetRootOf = (m) => {
+        let root = m;
+        for (let a = flatParent(m), n = 0; a && n < 6; a = flatParent(a), n++) {
+            if (a === document.body || a === document.documentElement) break;
+            const r = a.getBoundingClientRect();
+            if (r.height > 160) break;
+            if (mediaEls.some((o) => o !== m && contains(a, o))) break;
+            root = a;
+        }
+        return root;
+    };
+    const mediaRootOf = new Map();                  // корень виджета → <audio>/<video>
+    for (const m of mediaEls) mediaRootOf.set(widgetRootOf(m), m);
+    const inMediaWidget = (el) => {
+        for (const root of mediaRootOf.keys()) if (root !== el && contains(root, el)) return true;
+        return false;
+    };
+    // Переключатели карусели фото («1» … «20», стрелки): фото агент скачивает сам
+    const PAGER_RE = /(^|[_-])(pagination|pager|carousel|slider|swiper|gallery|dots|bullets)([_-]|$)/i;
+    const isPagerControl = (el, label) => {
+        if (!(label === '' || /^\d{1,3}$/.test(label) || /^[‹›<>←→«»]$/.test(label))) return false;
+        for (let a = el, n = 0; a && n < 6; a = flatParent(a), n++) {
+            const t = tagOf(a);
+            if (t === 'tui-pagination' || t === 'tui-carousel' || hasToken(a, PAGER_RE)) return true;
+        }
+        return false;
+    };
+    // Подпись поля — ближайший текст перед ним («Цвет» перед списком «Выберите значение»,
+    // «Ниже укажите полный адрес…» перед полем ввода)
+    const FIELD_HOST = 'tui-input, tui-textfield, tui-input-number, tui-textarea, tui-input-date, '
+                     + 'tui-input-tag, tui-select, tui-combo-box, tui-multi-select';
+    const captionOf = (el) => {
+        // поиск начинается снаружи обёртки поля: внутри неё — декор и «зеркало» значения
+        const start = (el.closest && el.closest(FIELD_HOST)) || el;
+        for (let a = start, n = 0; a && n < 4; a = flatParent(a), n++) {
+            if (a === document.body || a === document.documentElement) break;
+            let sib = a.previousElementSibling;
+            for (let k = 0; sib && k < 3; sib = sib.previousElementSibling, k++) {
+                if (keptSet.has(sib) || (keptCount.get(sib) || 0) > 0) return '';
+                if (attr(sib, 'aria-hidden') === 'true') continue;
+                const st = styleOf(sib);
+                if (st.display === 'none' || st.visibility === 'hidden') continue;
+                const t = textOf(sib, keptSet, 200);
+                if (meaningful(t)) return t.length <= 160 ? t : '';
+            }
+        }
+        return '';
+    };
+    const PLACEHOLDER_RE = /^(выберите|выбрать|не выбран|select|choose|укажите|—|-)/i;
+
+    // --------------------------------------------- 8. разметка и результат
     const elements = [];
     const occluders = new Map();
     kept.forEach((el, i) => {
@@ -727,12 +819,14 @@ _JS_SNAPSHOT = r"""
         if (occ) occluders.set(occ, (occluders.get(occ) || 0) + 1);
         const tag = tagOf(el);
         const kind = rec.kind;
-        let inputType = '', value = '', options = [];
+        let text = rec.textInput ? '' : rec.label;
+        let placeholder = rec.textInput ? rec.label : '';
+        let inputType = '', value = '', options = [], caption = '';
         if (kind === 'INPUT') {
             inputType = tag === 'textarea' ? 'textarea' : tag === 'select' ? 'select'
                 : tag === 'input' ? inputTypeOf(el) : (el.isContentEditable ? 'contenteditable' : (roleOf(el) || 'text'));
             if (tag === 'select') {
-                options = Array.from(el.options || []).map((o) => norm(o.textContent)).filter(Boolean).slice(0, 40);
+                options = Array.from(el.options || []).map((o) => norm(o.textContent)).filter(Boolean).slice(0, 60);
                 const so = el.selectedOptions && el.selectedOptions[0];
                 value = so ? norm(so.textContent) : '';
             } else if (tag === 'input' || tag === 'textarea') {
@@ -740,9 +834,23 @@ _JS_SNAPSHOT = r"""
             } else {
                 value = norm(el.innerText);
             }
+            caption = captionOf(el);
         } else if (kind === 'DROPDOWN') {
-            const field = innerField(el);                    // выбранное значение tui-select
-            if (field && typeof field.value === 'string') value = field.value;
+            // Подпись списка стабильна («Цвет»), а видимый текст — это выбранное значение
+            // или заглушка «Выберите значение»: ключ памяти не должен меняться при выборе.
+            const shown = rec.label;
+            const field = innerField(el);
+            const ph = field ? norm(attr(field, 'placeholder')) : '';
+            const fieldVal = field && typeof field.value === 'string' ? norm(field.value) : '';
+            const isPh = !meaningful(shown) || shown === ph || PLACEHOLDER_RE.test(shown);
+            caption = captionOf(el);
+            if (caption) {
+                text = caption;
+                value = fieldVal || (isPh ? '' : shown);
+                placeholder = isPh ? shown : ph;
+            } else {
+                value = fieldVal;
+            }
         }
         let choiceType = '';
         if (kind === 'OPTION' || kind === 'FOLDER') {
@@ -752,17 +860,20 @@ _JS_SNAPSHOT = r"""
                 if (c) choiceType = inputTypeOf(c);
             }
         }
+        let href = '';
+        const link = tag === 'a' ? el : (el.querySelector ? el.querySelector('a[href]') : null);
+        if (link && nearestKept(link) === el && /^https?:/i.test(String(link.href || ''))) href = String(link.href);
+        const aux = inMediaWidget(el) || isPagerControl(el, norm(text));
         elements.push({
-            uid, tag, kind,
-            text: rec.textInput ? '' : rec.label,
-            placeholder: rec.textInput ? rec.label : '',
-            value: String(value).slice(0, 300), inputType, choiceType, options,
+            uid, tag, kind, text, placeholder,
+            value: String(value).slice(0, 2000), inputType, choiceType, options,
             selected: kind !== 'INPUT' && kind !== 'DROPDOWN' ? selectedOf(el, rec) : false,
             disabled: disabledOf(el, rec),
             expanded: (kind === 'FOLDER' || kind === 'DROPDOWN') ? !!rec.expanded : null,
             selectable: !!rec.selectable, hasToggle, hasSelect,
             depth: rec.depth || 0, path: rec.path || [],
             container: containerOf(el), inViewport, occluded: !!occ,
+            caption, href, aux,
         });
     });
     let overlay = '';
@@ -770,52 +881,242 @@ _JS_SNAPSHOT = r"""
     for (const [o, n] of occluders) if (n > topN) { topOcc = o; topN = n; }
     if (topOcc && topN >= 2) overlay = describe(topOcc);
 
-    // --------------------------------------------- 8. текст задания и подсказки
-    const insideKept = (x) => nearestKept(x) !== null;
-    const collectTexts = (selectors, limit) => {
-        const out = [], taken = [];
-        for (const sel of selectors) {
-            let nodes = [];
-            try { nodes = document.querySelectorAll(sel); } catch (e) { continue; }
-            for (const n of nodes) {
-                if (taken.some((t) => t.contains(n) || n.contains(t))) continue;
-                if (insideKept(n)) continue;
-                const r = n.getBoundingClientRect();
-                if (r.width < 1 || r.height < 1) continue;
-                if (n.checkVisibility && !n.checkVisibility(VIS)) continue;
-                const t = textOf(n, keptSet, limit);
-                if (!meaningful(t)) continue;
-                out.push(t); taken.push(n);
+    // --------------------------------------------- 9. медиа: фото и аудио
+    const images = [], imageIndex = new Map();
+    const IMG_SKIP_RE = /(^|[_-])(icon|logo|avatar|emoji|badge|flag|spinner|loader)([_-]|$)/i;
+    for (const n of ALL) {
+        if (tagOf(n) !== 'img' || images.length >= 120) continue;
+        const src = String(n.currentSrc || n.src || '');
+        if (!src || /^data:image\/svg|\.svg(\?|#|$)/i.test(src)) continue;
+        if (hasToken(n, IMG_SKIP_RE)) continue;
+        // скрытые слайды карусели нужны (overflow-обрезка не в счёт), display:none — нет
+        if (n.checkVisibility && !n.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true })) continue;
+        const r = n.getBoundingClientRect();
+        const nw = n.naturalWidth || 0, nh = n.naturalHeight || 0;
+        if (!((nw >= 64 && nh >= 64) || (r.width >= 48 && r.height >= 48))) continue;
+        const k = images.length + 1;
+        const uid = GEN + '-i' + k;
+        n.setAttribute(A_MEDIA, uid);
+        imageIndex.set(n, k);
+        images.push({
+            n: k, uid, src, alt: norm(attr(n, 'alt')).slice(0, 120),
+            loaded: !(n.complete && nw === 0), width: nw, height: nh,
+        });
+    }
+    const audios = [], audioIndex = new Map();
+    const PLAY_RE = /(play|pause|воспроизв|пауз)/i;
+    for (const [root, m] of mediaRootOf) {
+        const rr = root.getBoundingClientRect();
+        const shown = (rr.width >= 1 && rr.height >= 1 && rendered(root)) || (m.controls && rendered(m));
+        if (!shown) continue;
+        let src = String(m.currentSrc || m.src || '');
+        if (!src) {
+            const so = m.querySelector('source[src]');
+            if (so) src = String(so.src || '');
+        }
+        const k = audios.length + 1;
+        const uid = GEN + '-a' + k;
+        m.setAttribute(A_MEDIA, uid);
+        audioIndex.set(root, k);
+        let playUid = '';
+        if (root !== m && root.querySelectorAll) {
+            for (const b of root.querySelectorAll('button, [role="button"]')) {
+                const label = [attr(b, 'title'), attr(b, 'aria-label'), attr(b, 'automation-id'), clsOf(b)].join(' ');
+                if (PLAY_RE.test(label)) { playUid = uid + 'p'; b.setAttribute(A_MEDIA, playUid); break; }
             }
         }
-        return out;
-    };
-    let taskTexts = collectTexts(args.taskSelectors, 1500);
-    const taskFromSelectors = taskTexts.length > 0;
-    if (!taskFromSelectors && document.body) {
-        const t = textOf(document.body, keptSet, 1500);          // фоллбэк: весь неинтерактивный текст
-        if (meaningful(t)) taskTexts = [t];
+        const dur = Number.isFinite(m.duration) ? m.duration : 0;
+        audios.push({
+            n: k, uid, playUid, src, duration: dur, current: m.currentTime || 0,
+            paused: !!m.paused, ended: !!m.ended || (dur > 0 && m.currentTime >= dur - 0.25),
+            kind: tagOf(m),
+        });
     }
-    const hintTexts = collectTexts(args.hintSelectors, 800)
-        .filter((h) => !taskTexts.some((t) => t.includes(h)));
 
-    const alerts = [];
+    // --------------------------------------------- 10. сообщения платформы
+    // Уведомления Taiga (tui-notification/tui-alert), role=alert, ошибки полей.
+    // v3 искал [class*="invalid"] — это совпадало с Angular-классом ng-invalid у любого
+    // незаполненного поля, и подпись «Цвет» попадала в «сообщения страницы».
+    const NOTICE_SEL = 'tui-notification, tui-alert, tui-error, [role="alert"], [role="status"], '
+        + '[class*="notification" i], [class*="toast" i], [class*="alert" i], [class*="error" i], '
+        + '[class*="warning" i], [class*="hint" i]';
+    const APPEARANCE = { error: 'error', negative: 'error', danger: 'error', warning: 'warning',
+                         success: 'success', positive: 'success', info: 'hint', neutral: 'info', action: 'hint' };
+    const noticeTokens = (el) => tokensOf(el).filter((t) => !/^_?ng-/.test(t) && !/^_/.test(t));
+    const noticeKind = (el) => {
+        const ap = String(attr(el, 'data-appearance') || attr(el, 'appearance') || '').toLowerCase();
+        for (const key of Object.keys(APPEARANCE)) if (ap.includes(key)) return APPEARANCE[key];
+        const toks = noticeTokens(el).join(' ');
+        if (/(error|invalid|danger|negative|fail)/i.test(toks)) return 'error';
+        if (/warning/i.test(toks)) return 'warning';
+        if (/success|positive/i.test(toks)) return 'success';
+        if (/(hint|tip|help|notification|info)/i.test(toks)) return 'hint';
+        const role = roleOf(el), tag = tagOf(el);
+        if (role === 'alert' || tag === 'tui-error') return 'error';
+        return 'info';
+    };
+    const noticeMatches = (el) => {
+        const tag = tagOf(el), role = roleOf(el);
+        if (tag === 'tui-notification' || tag === 'tui-alert' || tag === 'tui-error') return true;
+        if (role === 'alert' || role === 'status') return true;
+        return noticeTokens(el).some((t) => /(^|[_-])(notification|toast|alert|error|warning|hint)([_-]|$)/i.test(t));
+    };
+    const notices = [], noticeIndex = new Map();
     try {
-        const ALERT_SEL = '[role="alert"], [aria-live="assertive"], tui-error, tui-notification, tui-alert, '
-            + '[class*="error" i], [class*="invalid" i], [class*="warning" i], [class*="toast" i], [class*="notification" i]';
-        for (const n of document.querySelectorAll(ALERT_SEL)) {
-            if (alerts.length >= 5) break;
+        for (const n of document.querySelectorAll(NOTICE_SEL)) {
+            if (notices.length >= 12) break;
+            if (!noticeMatches(n) || keptSet.has(n)) continue;
+            let inside = false;
+            for (const x of noticeIndex.keys()) if (contains(x, n)) { inside = true; break; }
+            if (inside) continue;
+            if ((keptCount.get(n) || 0) > 2) continue;            // обёртка формы, а не сообщение
             const r = n.getBoundingClientRect();
             if (r.width < 1 || r.height < 1) continue;
             if (n.checkVisibility && !n.checkVisibility(VIS)) continue;
-            const t = textOf(n, keptSet, 300);
-            if (t.length < 3 || t.length >= 300) continue;
-            if (alerts.some((a) => a.includes(t) || t.includes(a))) continue;
-            alerts.push(t);
+            if (n.closest && n.closest('tui-hint, [role="tooltip"]')) continue;
+            const t = textOf(n, keptSet, 800);
+            if (t.length < 3) continue;
+            const where = (n.closest && n.closest('tui-alerts, tui-alert, [class*="toast" i]')) ? 'toast'
+                : (n.closest && n.closest(DIALOG_SEL)) ? 'dialog' : 'inline';
+            noticeIndex.set(n, notices.length);
+            notices.push({ kind: noticeKind(n), text: t, where });
         }
     } catch (e) {}
 
-    // --------------------------------------------- 9. капча, загрузка, картинка
+    // --------------------------------------------- 11. reader-view страницы
+    // Весь видимый текст по порядку документа: заголовки, абзацы (с переносами <br>),
+    // таблицы, фото, аудио и интерактивные элементы НА СВОИХ МЕСТАХ — вопрос стоит
+    // строкой выше своих вариантов, подпись «Цвет» — строкой выше списка.
+    const sinks = { main: [], dialog: [], popup: [], toast: [] };
+    let sink = 'main', cur = '', budget = 60000;
+    const pushLine = (line) => { if (budget > 0) { sinks[sink].push(line); budget -= line.length; } };
+    const flush = () => {
+        const t = cur.replace(/[ \t ​]+/g, ' ').trim();
+        if (t) pushLine(t);
+        cur = '';
+    };
+    const SKIP_TAGS = new Set(['script', 'style', 'noscript', 'template', 'svg', 'head', 'meta', 'link',
+                               'title', 'object', 'embed', 'canvas', 'select', 'option', 'input',
+                               'textarea', 'button', 'audio', 'video', 'source', 'track', 'map']);
+    const BLOCK_RE = /^(block|flex|grid|table|list-item|flow-root|table-row|table-caption|table-row-group|table-header-group|table-footer-group)/;
+    const isBlock = (st) => BLOCK_RE.test(st.display);
+    const HEAD_RE = /(^|__|-)(title|header|heading|subtitle)(__|-|$)|^tui-text_h\d$/i;
+    const headingLevel = (el) => {
+        const t = tagOf(el);
+        const m = /^h([1-6])$/.exec(t);
+        if (m) return +m[1];
+        if (roleOf(el) === 'heading') return parseInt(attr(el, 'aria-level'), 10) || 2;
+        if (!tokensOf(el).some((c) => HEAD_RE.test(c))) return 0;
+        if ((keptCount.get(el) || 0) > 0) return 0;
+        for (const ch of el.children) if (isBlock(styleOf(ch))) return 0;
+        const txt = textOf(el, keptSet, 200);
+        return (txt && txt.length <= 150) ? 4 : 0;         // «заголовок по классу» — младший уровень
+    };
+    const tableLines = (tbl) => {
+        const out = [];
+        for (const row of tbl.querySelectorAll('tr')) {
+            if (row.closest('table') !== tbl) continue;
+            const cells = [];
+            for (const c of row.children) {
+                const tc = tagOf(c);
+                if (tc !== 'td' && tc !== 'th') continue;
+                cells.push(textOf(c, keptSet, 600) || '—');
+            }
+            if (cells.some(meaningful)) out.push('| ' + cells.join(' | ') + ' |');
+            if (out.length >= 300) break;
+        }
+        return out;
+    };
+    const DIALOG_ROOT = (el) => { try { return el.matches(DIALOG_SEL); } catch (e) { return false; } };
+    const POPUP_ROOT = (el) => {
+        const t = tagOf(el);
+        if (t === 'tui-dropdown' || hasToken(el, /^cdk-overlay-pane$/)) return true;
+        const role = roleOf(el);
+        if (role === 'listbox' || role === 'menu') {
+            const pos = styleOf(el).position;
+            return pos === 'absolute' || pos === 'fixed';
+        }
+        return false;
+    };
+    let muted = 0;
+    const walk = (node) => {
+        if (budget <= 0) return;
+        if (node.nodeType === 3) { if (!muted) cur += node.nodeValue; return; }
+        if (node.nodeType !== 1 && node.nodeType !== 11) return;
+        if (node.nodeType === 11) { for (const ch of node.childNodes) walk(ch); return; }
+        const el = node, tag = tagOf(el);
+        if (keptSet.has(el)) { flush(); pushLine('\u0000E' + elIndexOf.get(el) + '\u0000'); return; }
+        if (attr(el, 'aria-hidden') === 'true' && el.childElementCount <= 3 && !imageIndex.has(el)) return;
+        if (noticeIndex.has(el)) {
+            flush();
+            const k = noticeIndex.get(el);
+            const prev = sink;
+            if (notices[k].where === 'toast') sink = 'toast';
+            pushLine('\u0001N' + k + '\u0001');
+            sink = prev;
+            return;
+        }
+        if (audioIndex.has(el)) { flush(); pushLine('\u0000A' + audioIndex.get(el) + '\u0000'); return; }
+        if (tag === 'img') { if (imageIndex.has(el)) cur += ' \u0000I' + imageIndex.get(el) + '\u0000 '; return; }
+        if (tag === 'br') { flush(); return; }
+        if (tag === 'hr') { flush(); return; }
+        if (tag === 'iframe') {
+            const r = el.getBoundingClientRect();
+            if (r.width >= 100 && r.height >= 100) { flush(); pushLine('[встроенная страница]'); }
+            return;
+        }
+        if (SKIP_TAGS.has(tag)) return;
+        // всплывающие подсказки при наведении — временные, в текст страницы не входят
+        if (tag === 'tui-hints' || tag === 'tui-hint' || roleOf(el) === 'tooltip') return;
+        const st = styleOf(el);
+        if (st.display === 'none' || st.visibility === 'hidden' || st.visibility === 'collapse') return;
+        if (st.display !== 'contents') {
+            const r = el.getBoundingClientRect();
+            const clips = st.overflowX !== 'visible' || st.overflowY !== 'visible';
+            if ((r.width < 1 || r.height < 1) && clips) return;      // схлопнутая ветка/аккордеон
+        }
+        const level = headingLevel(el);
+        if (level) {
+            flush();
+            const t = textOf(el, keptSet, 300);
+            if (meaningful(t)) pushLine('#'.repeat(Math.min(level, 4)) + ' ' + t);
+            return;
+        }
+        if (tag === 'table' && !(keptCount.get(el) || 0)) {
+            flush();
+            for (const line of tableLines(el)) pushLine(line);
+            return;
+        }
+        let switched = null;
+        if (sink === 'main' && DIALOG_ROOT(el) && rendered(el)) switched = 'dialog';
+        else if (sink === 'main' && POPUP_ROOT(el)) switched = 'popup';
+        const prev = sink;
+        const block = isBlock(st) || switched;
+        if (block) flush();
+        if (switched) sink = switched;
+        if (tag === 'li') cur += '• ';
+        if (st.display === 'table-cell') cur += ' ';
+        const mute = fieldWraps.has(el);
+        if (mute) muted++;
+        for (const ch of flatChildren(el)) walk(ch);
+        if (mute) muted--;
+        if (st.display === 'table-cell') cur += ' ';
+        if (block) flush();
+        sink = prev;
+    };
+    const elIndexOf = new Map(kept.map((el, i) => [el, i]));
+    // Обёртки полей ввода: их текст — это подпись и «зеркало» значения, которые уже есть
+    // в строке элемента; в тексте страницы они дублировали бы введённое значение
+    const fieldWraps = new Set();
+    for (const el of kept) {
+        const k = info.get(el).kind;
+        if (k !== 'INPUT' || !el.closest) continue;
+        const w = el.closest('tui-input, tui-textfield, tui-input-number, tui-textarea, tui-input-date, tui-input-tag');
+        if (w && !keptSet.has(w)) fieldWraps.add(w);
+    }
+    try { if (document.body) walk(document.body); flush(); } catch (e) { sinks.main.push('[ошибка чтения страницы: ' + e + ']'); }
+
+    // --------------------------------------------- 12. капча, загрузка
     // Капча — только видимый iframe виджета. По тексту/классам не ищем: задание
     // ПРО капчу или подпись «protected by reCAPTCHA» вешали v2 навсегда.
     let captcha = false;
@@ -829,29 +1130,69 @@ _JS_SNAPSHOT = r"""
         }
     } catch (e) {}
 
-    let loading = false;
+    // Лоадер считается, только если его крутилка реально видна. В v3 хватало класса
+    // _loading — а у T-Work global-loader с data-visible="false" лежит в DOM всегда,
+    // и агент на каждом шаге «ждал загрузку». Мелкие лоадеры (галерея фото) не блокируют.
+    let loading = false, dialogLoading = false, localLoading = 0;
     try {
         const LOADER_RE = /(^|[_-])(spinner|loader|loading|preloader|skeleton)($|[_-])/i;
-        const sel = '[aria-busy="true"], [class*="spin" i], [class*="load" i], [class*="skeleton" i], [role="progressbar"], tui-loader';
+        const sel = '[aria-busy="true"], [class*="spin" i], [class*="load" i], [class*="skeleton" i], '
+                  + '[role="progressbar"], tui-loader';
+        const seen = [];
         for (const n of document.querySelectorAll(sel)) {
             const tag = tagOf(n);
-            if (tag === 'tui-loader') { if (hasToken(n, /^_loading$/)) { loading = true; break; } continue; }
-            if (attr(n, 'aria-busy') !== 'true' && roleOf(n) !== 'progressbar' && !hasToken(n, LOADER_RE)) continue;
-            if ((keptCount.get(n) || 0) > 0) continue;            // обёртка с контентом — не спиннер
-            const r = n.getBoundingClientRect();
+            if (tag === 'tui-loader') { if (!hasToken(n, /^_loading$/)) continue; }
+            else if (attr(n, 'aria-busy') !== 'true' && roleOf(n) !== 'progressbar' && !hasToken(n, LOADER_RE)) continue;
+            if (seen.some((x) => contains(x, n))) continue;
+            if ((keptCount.get(n) || 0) > 0 && tag !== 'tui-loader') continue;   // обёртка с контентом
+            const spin = tag === 'tui-loader' ? (n.querySelector('.t-loader') || null) : n;
+            if (!spin) continue;
+            const r = spin.getBoundingClientRect();
             if (r.width < 4 || r.height < 4) continue;
+            if (spin.checkVisibility && !spin.checkVisibility(VIS)) continue;
             if (n.checkVisibility && !n.checkVisibility(VIS)) continue;
-            loading = true; break;
+            if (r.bottom < 0 || r.right < 0 || r.top > vh || r.left > vw) continue;
+            seen.push(n);
+            const box = n.getBoundingClientRect();
+            if (n.closest && n.closest(DIALOG_SEL)) { dialogLoading = true; continue; }
+            const pos = styleOf(n).position;
+            if (box.width * box.height >= 0.25 * vw * vh || pos === 'fixed' || /global/i.test(tag)) loading = true;
+            else localLoading++;
         }
     } catch (e) {}
 
+    let dialogOpen = false, dialogFrames = 0;
+    const boxOf = (d) => {
+        // у кастомных элементов (tui-dialog) без display:block собственный bbox бывает нулевым
+        let r = d.getBoundingClientRect();
+        if (r.width >= 100 && r.height >= 60) return r;
+        for (const ch of d.children) {
+            const cr = ch.getBoundingClientRect();
+            if (cr.width * cr.height > r.width * r.height) r = cr;
+        }
+        return r;
+    };
+    try {
+        for (const d of document.querySelectorAll(DIALOG_SEL)) {
+            if (d.closest('tui-alerts, tui-alert')) continue;
+            const r = boxOf(d);
+            if (r.width < 100 || r.height < 60 || !rendered(d)) continue;
+            dialogOpen = true;
+            for (const f of d.querySelectorAll('iframe')) {
+                const fr = f.getBoundingClientRect();
+                if (fr.width >= 100 && fr.height >= 100) dialogFrames++;
+            }
+        }
+    } catch (e) {}
+
+    // Главная картинка — для совместимости с LLM_VISION=image/frame и отпечатком v3
     let image = null, bestArea = 0;
     for (const n of ALL) {
         const tag = tagOf(n);
         if (tag !== 'img' && tag !== 'canvas' && tag !== 'video') continue;
         const r = n.getBoundingClientRect();
         if (r.width < 48 || r.height < 48) continue;              // иконки и логотипы-миниатюры
-        if (insideKept(n)) continue;
+        if (nearestKept(n)) continue;
         if (n.checkVisibility && !n.checkVisibility(VIS)) continue;
         if (r.width * r.height > bestArea) { bestArea = r.width * r.height; image = n; }
     }
@@ -864,7 +1205,7 @@ _JS_SNAPSHOT = r"""
         if (imageSrc.startsWith('data:')) imageSrc = 'data:' + imageSrc.length + ':' + imageSrc.slice(-64);
     }
 
-    // --------------------------------------------- 10. прокручиваемые списки
+    // --------------------------------------------- 13. прокручиваемые списки
     const scrollables = [];
     const seenScroll = new Set();
     for (const el of kept) {
@@ -892,8 +1233,10 @@ _JS_SNAPSHOT = r"""
     return JSON.stringify({
         gen: GEN, url: location.href,
         elements, total: totalKept, hidden: hiddenCount,
-        taskTexts, taskFromSelectors, hintTexts, alerts,
-        captcha, loading, overlay, imageSrc, scrollables,
+        reader: sinks.main, dialog: sinks.dialog, popup: sinks.popup, toast: sinks.toast,
+        notices, images, audios,
+        captcha, loading, dialogLoading, localLoading, dialogOpen, dialogFrames,
+        overlay, imageSrc, scrollables,
     });
 }
 """
@@ -902,6 +1245,17 @@ _JS_SNAPSHOT = r"""
 # ---------------------------------------------------------------------------
 # Python-обёртка
 # ---------------------------------------------------------------------------
+
+# Плейсхолдеры reader-view (ставит JS): элемент, фото, аудио, уведомление
+_PH_RE = re.compile(r"\x00([EIA])(\d+)\x00|\x01N(\d+)\x01")
+_ONLY_PHOTOS_RE = re.compile(r"^(?:\s*\[ФОТО \d+(?: не загрузилось)?\]\s*)+$")
+# Заголовки, которые есть у любого задания — не описывают вид задания
+_GENERIC_HEADINGS = {"выполните задание", "задание", "инструкция", "подробная инструкция"}
+
+
+def _clean_basis(text: str) -> str:
+    return normalize_text(_TIMER_RE.sub("", text))
+
 
 class DomParser:
     """Асинхронный парсер DOM целевого фрейма (один evaluate на снимок)."""
@@ -921,21 +1275,42 @@ class DomParser:
                 "gen": generation,
                 "max": _JS_MAX_ELEMENTS,
                 "selectors": INTERACTIVE_SELECTOR,
-                "taskSelectors": list(TASK_TEXT_SELECTORS),
-                "hintSelectors": list(HINT_SELECTORS),
                 "pointer": True,
             },
         )
         raw: dict = json.loads(payload)
 
         elements = self._build_elements(raw.get("elements") or [])
-        task_text = "\n".join(raw.get("taskTexts") or [])
-        hint_text = "\n".join(raw.get("hintTexts") or [])
-        alerts = [str(a) for a in raw.get("alerts") or []]
+        notices = [
+            Notice(kind=str(n.get("kind") or "info"), text=str(n.get("text") or ""),
+                   where=str(n.get("where") or "inline"))
+            for n in raw.get("notices") or []
+        ]
+        images = [MediaImage(**{k: v for k, v in img.items() if k in MediaImage.model_fields})
+                  for img in raw.get("images") or []]
+        audios = [
+            MediaAudio(n=int(a.get("n", 0)), uid=str(a.get("uid", "")), play_uid=str(a.get("playUid", "")),
+                       src=str(a.get("src", "")), duration=float(a.get("duration") or 0),
+                       current=float(a.get("current") or 0), paused=bool(a.get("paused", True)),
+                       ended=bool(a.get("ended", False)))
+            for a in raw.get("audios") or []
+        ]
+        reader = [str(line) for line in raw.get("reader") or []]
+        dialog = [str(line) for line in raw.get("dialog") or []]
+        popup = [str(line) for line in raw.get("popup") or []]
+        toast = [str(line) for line in raw.get("toast") or []]
+
+        task_text = _plain_text(reader)
+        headings = [line for line in reader if line.startswith("#")]
+        hint_text = "\n".join(n.text for n in notices if n.kind == "hint")
+        alerts = [n.text for n in notices if n.kind in ("error", "warning") or n.where == "toast"]
         image_src = str(raw.get("imageSrc") or "")
-        task_id, preview = self._fingerprint(
-            raw.get("url", ""), image_src, task_text, bool(raw.get("taskFromSelectors")),
+        url = str(raw.get("url") or "")
+        task_id, preview, content_hash, loose_hash = self._fingerprint(
+            url, reader, elements, images, audios, headings,
         )
+        pool_key, pool_title, pool_signature = self._pool(headings, elements, task_text)
+        headings = [h.lstrip("#").strip() for h in headings]
 
         state = PageState(
             task_text=task_text,
@@ -943,7 +1318,7 @@ class DomParser:
             elements=elements,
             task_identifier=task_id,
             task_preview=preview,
-            state_hash=self._state_hash(elements, alerts),
+            state_hash=self._state_hash(elements, alerts + [n.text for n in notices]),
             has_captcha=bool(raw.get("captcha")),
             loading=bool(raw.get("loading")),
             alerts=alerts,
@@ -951,20 +1326,39 @@ class DomParser:
             scroll_hints=self._scroll_hints(raw.get("scrollables") or []),
             image_src=image_src,
             generation=generation,
-            frame_url=str(raw.get("url") or ""),
+            frame_url=url,
             total_elements=int(raw.get("total") or len(elements)),
             hidden_elements=int(raw.get("hidden") or 0),
+            reader=reader,
+            dialog_lines=dialog,
+            popup_lines=popup,
+            toast_lines=toast,
+            notices=notices,
+            images=images,
+            audios=audios,
+            headings=headings,
+            pool_key=pool_key,
+            pool_title=pool_title,
+            pool_signature=pool_signature,
+            dialog_open=bool(raw.get("dialogOpen")),
+            dialog_loading=bool(raw.get("dialogLoading")),
+            dialog_frames=int(raw.get("dialogFrames") or 0),
+            local_loading=int(raw.get("localLoading") or 0),
+            content_hash=content_hash,
+            loose_hash=loose_hash,
+            media_srcs=[i.src for i in images] + [a.src for a in audios],
         )
         folders = [e for e in elements if e.kind == ElementKind.FOLDER]
         logger.log(
             logging.DEBUG if quiet else logging.INFO,
-            "Снимок #%s: элементов=%d (папок откр./закр.=%d/%d, опций=%d, скрытых совпадений=%d), "
-            "task_id=%s, captcha=%s, loading=%s",
+            "Снимок #%s: элементов=%d (папок откр./закр.=%d/%d, опций=%d, скрытых=%d), фото=%d, аудио=%d, "
+            "сообщений=%d, task_id=%s, loading=%s%s",
             generation, len(elements),
             sum(1 for f in folders if f.folder_state == FolderState.OPEN),
             sum(1 for f in folders if f.folder_state == FolderState.CLOSED),
             sum(1 for e in elements if e.kind == ElementKind.OPTION),
-            state.hidden_elements, task_id, state.has_captcha, state.loading,
+            state.hidden_elements, len(images), len(audios), len(notices), task_id, state.loading,
+            ", диалог" if state.dialog_open else "",
         )
         return state
 
@@ -1011,6 +1405,9 @@ class DomParser:
                 has_select=bool(raw.get("hasSelect", False)),
                 in_viewport=bool(raw.get("inViewport", True)),
                 occluded=bool(raw.get("occluded", False)),
+                caption=str(raw.get("caption", "")),
+                href=str(raw.get("href", "")),
+                aux=bool(raw.get("aux", False)),
             ))
         DomParser._assign_keys(elements)
         return elements
@@ -1027,22 +1424,86 @@ class DomParser:
                 group = "button"
             else:
                 group = "row"
-            base = f"{group}|{' › '.join(el.path)}|{normalize_text(el.text or el.placeholder)}"
+            label = el.text or el.placeholder or el.caption
+            if el.kind == ElementKind.INPUT and el.caption:
+                label = f"{el.caption}|{label}"
+            base = f"{group}|{' › '.join(el.path)}|{normalize_text(label)}"
             n = seen[base]
             seen[base] += 1
             el.key = base if n == 0 else f"{base}#{n}"
 
     @staticmethod
-    def _fingerprint(url: str, image_src: str, task_text: str, from_selectors: bool) -> tuple[str, str]:
-        """Отпечаток задания: не зависит от состояния дерева, таймеров и логотипов."""
-        text = _TIMER_RE.sub("", task_text)
-        if not from_selectors:
-            # фоллбэк-текст всей страницы содержит счётчики «Задание 5 из 100» — цифры убираем
-            text = re.sub(r"\d+", "", text)
-        basis = f"{urlsplit(url).path}|{image_src}|{normalize_text(text)[:600]}"
-        digest = hashlib.sha1(basis.encode("utf-8")).hexdigest()[:16]
-        preview = (task_text.strip().splitlines() or [""])[0][:80]
-        return digest, preview
+    def _fingerprint(
+        url: str,
+        reader: list[str],
+        elements: list[ParsedElement],
+        images: list[MediaImage],
+        audios: list[MediaAudio],
+        headings: list[str],
+    ) -> tuple[str, str, str, str]:
+        """Отпечаток задания: содержимое страницы БЕЗ сообщений платформы, таймеров,
+        подсказок при наведении, состояний и значений полей. «Неверный ответ» и подсказка
+        после отправки отпечаток не меняют (в v3 меняли — и память о неверном ответе стиралась).
+
+        Возвращает (task_id, превью, хэш текста, хэш текста без цифр). Хэши текста нужны
+        агенту, чтобы отличать новое задание от догрузившихся фото (TaskIdentity)."""
+        by_index = {e.index: e for e in elements}
+        parts: list[str] = []
+        for line in reader:
+            def repl(m: re.Match) -> str:
+                kind, num, notice = m.group(1), m.group(2), m.group(3)
+                if notice is not None or kind != "E":
+                    return " "
+                el = by_index.get(int(num))
+                # строки раскрытых веток (depth > 0) появляются и исчезают при раскрытии —
+                # в отпечаток не входят, иначе каждое «open» сбрасывало бы память задания
+                if el is None or el.aux or el.depth > 0 or el.container in ("dialog", "popup", "toast"):
+                    return " "
+                return f" {el.kind.value}:{el.text or el.placeholder or el.caption} "
+            parts.append(_PH_RE.sub(repl, line))
+        text = f"{urlsplit(url).path}|{_clean_basis(chr(10).join(parts))[:6000]}"
+        content_hash = hashlib.sha1(text.encode("utf-8")).hexdigest()[:16]
+        loose_hash = hashlib.sha1(re.sub(r"\d+", "", text).encode("utf-8")).hexdigest()[:16]
+        # первое фото/аудио различает задания с одинаковым текстом («оцените фото»)
+        media = (images[0].src if images else "") + "|" + (audios[0].src if audios else "")
+        digest = hashlib.sha1(f"{text}|{media}".encode("utf-8")).hexdigest()[:16]
+        titled = [t for t in (_heading_text(h) for h in _content_headings(headings))
+                  if normalize_text(t) not in _GENERIC_HEADINGS]
+        plain = _plain_text(reader)
+        preview = (titled[0] if titled else (plain.strip().splitlines() or [""])[0])[:80]
+        return digest, preview, content_hash, loose_hash
+
+    @staticmethod
+    def _pool(headings: list[str], elements: list[ParsedElement], task_text: str) -> tuple[str, str, list[str]]:
+        """«Вид задания»: структура формы без данных — заголовки, варианты radio/checkbox,
+        подписи полей. Одинаков у всех заданий одного пула → общая инструкция и уроки."""
+        content = _content_headings(headings)
+        heads = sorted({re.sub(r"\d+", "", normalize_text(_heading_text(h)))
+                        for h in content if 2 < len(_heading_text(h)) <= 80})
+        fields = sorted({
+            re.sub(r"\d+", "", normalize_text(e.caption or e.placeholder or e.text))
+            for e in elements
+            if not e.aux and e.container not in ("dialog", "popup") and (
+                (e.kind == ElementKind.OPTION and e.choice_type)
+                or e.kind in (ElementKind.INPUT, ElementKind.DROPDOWN)
+            )
+        })
+        signature = "|".join(heads) + "#" + "|".join(fields[:80])
+        key = hashlib.sha1(signature.encode("utf-8")).hexdigest()[:12] if (heads or fields) else ""
+        parts = [f"h:{h}" for h in heads] + [f"f:{f}" for f in fields[:80]]
+        titled = [(len(h) - len(h.lstrip("#")), _heading_text(h)) for h in content]
+        titled = [(lvl, t) for lvl, t in titled if normalize_text(t) not in _GENERIC_HEADINGS and len(t) <= 80]
+        major = [t for lvl, t in titled if lvl <= 3]
+        if major or titled:
+            return key, (major or [t for _, t in titled])[0], parts
+        # заголовка нет — первая строка текста после панели режима
+        lines = [ln for ln in task_text.splitlines() if ln.strip() and not ln.startswith("#")]
+        start = next((i for i, h in enumerate(task_text.splitlines()) if h.startswith("#")
+                      and len(h) - len(h.lstrip("#")) <= 3), None)
+        if start is not None:
+            after = [ln for ln in task_text.splitlines()[start + 1:] if ln.strip() and not ln.startswith("#")]
+            lines = after or lines
+        return key, (lines[0][:60] if lines else ""), parts
 
     @staticmethod
     def _state_hash(elements: list[ParsedElement], alerts: list[str]) -> str:
@@ -1070,6 +1531,31 @@ class DomParser:
         return hints
 
 
+_PANEL_HEADINGS = re.compile(r"^(тренировка|экзамен|обучение|цена задания|задание)\b", re.IGNORECASE)
+
+
+def _heading_text(line: str) -> str:
+    return line.lstrip("#").strip()
+
+
+def _content_headings(headings: list[str]) -> list[str]:
+    """Заголовки содержимого: начиная с первого настоящего заголовка (h1–h3), без
+    панели режима («Тренировка», «Экзамен», «Цена задания») — иначе у тренировки и
+    обычных заданий одного вида получались разные «виды заданий»."""
+    first = next((i for i, h in enumerate(headings) if len(h) - len(h.lstrip("#")) <= 3), 0)
+    return [h for h in headings[first:] if not _PANEL_HEADINGS.match(_heading_text(h))]
+
+
+def _plain_text(lines: list[str]) -> str:
+    """Текст страницы без элементов, фото и уведомлений (для логов, отпечатка, превью)."""
+    out = []
+    for line in lines:
+        text = _PH_RE.sub(" ", line).strip()
+        if text:
+            out.append(re.sub(r"\s{2,}", " ", text))
+    return "\n".join(out)
+
+
 # ---------------------------------------------------------------------------
 # Представление для LLM
 # ---------------------------------------------------------------------------
@@ -1090,10 +1576,11 @@ def select_for_prompt(
     """Выбрать элементы для промпта. В v2 обрезка шла по порядку документа,
     и при большом раскрытом дереве из списка пропадала кнопка «Завершить».
     Теперь кнопки/поля/выбранные/папки сохраняются всегда, а кнопки из
-    стоп-списка не показываются вовсе."""
+    стоп-списка и служебные элементы (плеер, карусель) не показываются вовсе."""
     visible = [
         e for e in elements
         if not (e.is_disabled and e.kind == ElementKind.OTHER) and not is_denied_button(e)
+        and not e.aux and e.container != "toast"
     ]
     if len(visible) <= limit:
         return visible, 0
@@ -1119,7 +1606,7 @@ def select_for_prompt(
 
 
 def build_elements_prompt(elements: list[ParsedElement], limit: int = MAX_ELEMENTS) -> str:
-    """Строковое представление элементов для LLM-промпта."""
+    """Список элементов для LLM-промпта (формат v3; reader-view — render_page)."""
     shown, omitted = select_for_prompt(elements, limit)
     label_counts = Counter(normalize_text(e.text) for e in elements if e.text)
     lines = [
@@ -1128,3 +1615,251 @@ def build_elements_prompt(elements: list[ParsedElement], limit: int = MAX_ELEMEN
     if omitted:
         lines.append(f"… ещё {omitted} элементов не показано (лимит {limit}).")
     return "\n".join(lines) if lines else "(интерактивных элементов нет)"
+
+
+_URL_IN_TEXT = re.compile(r"https?://[^\s<>«»\"']+")
+
+
+def _coords_from_url(url: str) -> Optional[tuple[float, float]]:
+    """Координаты (широта, долгота) из ссылки на карту: Google (ll=/q=/@lat,lon) —
+    «широта,долгота»; Яндекс (ll=/pt=) — «долгота,широта»."""
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    host = parts.netloc.lower()
+    yandex = "yandex" in host or host.endswith("ya.ru")
+    query = parse_qs(parts.query)
+    pair = None
+    for key in ("ll", "pt", "q", "query", "center"):
+        if key in query:
+            pair = query[key][0]
+            break
+    if pair is None:
+        m = re.search(r"@(-?\d+\.\d+),(-?\d+\.\d+)", parts.path)
+        pair = f"{m.group(1)},{m.group(2)}" if m else None
+    if not pair:
+        return None
+    m = re.match(r"^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)", pair)
+    if not m:
+        return None
+    a, b = float(m.group(1)), float(m.group(2))
+    lat, lon = (b, a) if yandex else (a, b)
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+        return None
+    return lat, lon
+
+
+def _distance_m(p1: tuple[float, float], p2: tuple[float, float]) -> float:
+    lat1, lon1, lat2, lon2 = map(math.radians, (*p1, *p2))
+    h = math.sin((lat2 - lat1) / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin((lon2 - lon1) / 2) ** 2
+    return 2 * 6371000 * math.asin(math.sqrt(h))
+
+
+def geo_facts(state: PageState) -> list[str]:
+    """Расстояния между точками из ссылок на карты («Открыть карту» у двух карточек) —
+    модели не нужно сравнивать координаты в уме."""
+    points: list[tuple[str, tuple[float, float]]] = []
+    seen: set[str] = set()
+    for el in state.elements:
+        if el.href and not el.aux and el.href not in seen:
+            c = _coords_from_url(el.href)
+            if c:
+                seen.add(el.href)
+                points.append((f"[{el.index}] «{el.label()}»", c))
+    for url in _URL_IN_TEXT.findall(_plain_text(state.reader)):
+        if url not in seen:
+            c = _coords_from_url(url)
+            if c:
+                seen.add(url)
+                points.append((url[:60], c))
+    facts: list[str] = []
+    points = points[:4]
+    for i in range(len(points)):
+        for j in range(i + 1, len(points)):
+            (la, pa), (lb, pb) = points[i], points[j]
+            d = _distance_m(pa, pb)
+            dist = f"≈ {d:.0f} м" if d < 1000 else f"≈ {d / 1000:.1f} км"
+            facts.append(f"Точки на карте {la} ({pa[0]:.5f}, {pa[1]:.5f}) и {lb} ({pb[0]:.5f}, {pb[1]:.5f}): "
+                         f"расстояние {dist}")
+    return facts
+
+
+def media_facts(state: PageState) -> list[str]:
+    """Одинаковые файлы фото под разными номерами (одно фото в обеих карточках)."""
+    by_src: dict[str, list[int]] = {}
+    for img in state.images:
+        by_src.setdefault(img.src, []).append(img.n)
+    return [f"ФОТО {', '.join(map(str, ns))} — один и тот же файл (одинаковый адрес)"
+            for ns in by_src.values() if len(ns) > 1]
+
+
+def photo_groups(state: PageState) -> list[list[int]]:
+    """Блоки фото в порядке страницы: подряд идущие [ФОТО n] без текста и элементов между
+    ними (галерея, карусель одной карточки). Коллажи не смешивают фото разных блоков."""
+    groups: list[list[int]] = []
+    current: list[int] = []
+    for line in state.reader:
+        found = [int(m.group(2)) for m in _PH_RE.finditer(line) if m.group(1) == "I"]
+        rest = _PH_RE.sub(lambda m: "" if m.group(1) == "I" else "#", line).strip()
+        if found and not rest:
+            current.extend(found)
+            continue
+        if current:
+            groups.append(current)
+            current = []
+        if found:
+            groups.append(found)
+    if current:
+        groups.append(current)
+    known = {n for g in groups for n in g}
+    missing = [i.n for i in state.images if i.n not in known]   # фото вне основного текста
+    if missing:
+        groups.append(missing)
+    return groups
+
+
+def _fmt_time(seconds: float) -> str:
+    seconds = max(0, int(round(seconds)))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def audio_label(audio: MediaAudio) -> str:
+    if audio.ended:
+        status = "прослушана до конца"
+    elif audio.paused:
+        status = f"на паузе, {_fmt_time(audio.current)}"
+    else:
+        status = f"играет, {_fmt_time(audio.current)}"
+    length = f"{_fmt_time(audio.duration)}, " if audio.duration else ""
+    return f"[АУДИО {audio.n}: {length}{status}]"
+
+
+def _photo_runs(line: str) -> str:
+    """«[ФОТО 1] [ФОТО 2] [ФОТО 3]» → «[ФОТО 1–3]» (подряд идущие номера)."""
+    nums = [int(n) for n in re.findall(r"\[ФОТО (\d+)\]", line)]
+    broken = set(int(n) for n in re.findall(r"\[ФОТО (\d+) не загрузилось\]", line))
+    nums = sorted(set(nums) | broken)
+    if not nums:
+        return line
+    parts, start, prev = [], nums[0], nums[0]
+    for n in nums[1:] + [None]:  # type: ignore[list-item]
+        if n is not None and n == prev + 1:
+            prev = n
+            continue
+        parts.append(str(start) if start == prev else f"{start}–{prev}")
+        if n is not None:
+            start = prev = n
+    note = f" (не загрузились: {', '.join(map(str, sorted(broken)))})" if broken else ""
+    return f"[ФОТО {', '.join(parts)}]{note}"
+
+
+def render_page(state: PageState, *, limit: int = READER_MAX_CHARS) -> tuple[str, list[ParsedElement]]:
+    """Reader-view для LLM: страница по порядку, элементы — на своих местах.
+
+    Возвращает текст и список показанных элементов (для проверки номеров)."""
+    shown, omitted = select_for_prompt(state.elements)
+    shown_by_index = {e.index: e for e in shown}
+    label_counts = Counter(normalize_text(e.text) for e in state.elements if e.text)
+    images = {i.n: i for i in state.images}
+    audios = {a.n: a for a in state.audios}
+    placed: set[int] = set()
+
+    def expand(lines: list[str]) -> list[str]:
+        out: list[str] = []
+        photos: list[str] = []            # подряд идущие строки из одних фото → одна строка
+
+        def flush_photos() -> None:
+            if photos:
+                out.append(_photo_runs(" ".join(photos)))
+                photos.clear()
+
+        for line in lines:
+            element_line = False
+
+            def repl(m: re.Match) -> str:
+                nonlocal element_line
+                kind, num, notice = m.group(1), m.group(2), m.group(3)
+                if notice is not None:
+                    k = int(notice)
+                    return state.notices[k].render() if k < len(state.notices) else ""
+                n = int(num)
+                if kind == "E":
+                    el = shown_by_index.get(n)
+                    if el is None:
+                        return ""
+                    placed.add(n)
+                    element_line = True
+                    above = normalize_text(out[-1]) if out else ""
+                    return el.prompt_line(
+                        show_path=label_counts[normalize_text(el.text)] > 1,
+                        show_caption=not el.caption or normalize_text(el.caption) != above,
+                    )
+                if kind == "I":
+                    img = images.get(n)
+                    return f"[ФОТО {n}{'' if img is None or img.loaded else ' не загрузилось'}]"
+                audio = audios.get(n)
+                return audio_label(audio) if audio else f"[АУДИО {n}]"
+
+            text = _PH_RE.sub(repl, line)
+            lead = re.match(r"^ *", text).group(0) if element_line else ""   # отступ дерева
+            text = lead + re.sub(r"[ \t]{2,}", " ", text.strip())
+            if not text.strip():
+                continue
+            if not element_line and _ONLY_PHOTOS_RE.match(text):
+                photos.append(text)
+                continue
+            flush_photos()
+            if "[ФОТО" in text:
+                text = re.sub(r"(?:\[ФОТО \d+(?: не загрузилось)?\]\s*){2,}",
+                              lambda m: _photo_runs(m.group(0)) + " ", text).rstrip()
+            out.append(text)
+        flush_photos()
+        return out
+
+    main = expand(state.reader)
+    dialog = expand(state.dialog_lines)
+    popup = expand(state.popup_lines)
+    toasts = expand(state.toast_lines)
+    rest = [e for e in shown if e.index not in placed]
+
+    main = _fit(main, limit)
+    parts = main or ["(текст страницы не обнаружен)"]
+    if rest:
+        parts += ["", "Прочие элементы:"] + [
+            e.prompt_line(show_path=label_counts[normalize_text(e.text)] > 1) for e in rest
+        ]
+    if omitted:
+        parts.append(f"… ещё {omitted} элементов не показано (лимит {MAX_ELEMENTS}).")
+    if dialog:
+        parts += ["", "═══ ОТКРЫТЫЙ ДИАЛОГ (поверх страницы) ═══"] + _fit(dialog, limit // 2)
+    if popup:
+        parts += ["", "═══ ОТКРЫТЫЙ ВЫПАДАЮЩИЙ СПИСОК ═══"] + _fit(popup, limit // 3)
+    if toasts:
+        parts += ["", "═══ ВСПЛЫВАЮЩИЕ УВЕДОМЛЕНИЯ ═══"] + toasts[:10]
+    return "\n".join(parts), shown
+
+
+def _fit(lines: list[str], limit: int) -> list[str]:
+    """Уложить текст в лимит, сохранив строки элементов, заголовки и уведомления."""
+    total = sum(len(line) + 1 for line in lines)
+    if total <= limit:
+        return lines
+    essential = re.compile(r"^\s*(\[\d+\]|#|‼|⚠|💡|✓|ℹ|\[АУДИО|\[ФОТО)")
+    out: list[str] = []
+    used = sum(len(line) + 1 for line in lines if essential.match(line))
+    budget = max(limit - used, limit // 4)
+    cut = False
+    for line in lines:
+        if essential.match(line):
+            out.append(line)
+            continue
+        if budget <= 0:
+            cut = True
+            continue
+        piece = line if len(line) <= budget else line[:budget] + " …"
+        budget -= len(piece) + 1
+        out.append(piece)
+    if cut:
+        out.append("[… часть текста страницы не поместилась в лимит …]")
+    return out

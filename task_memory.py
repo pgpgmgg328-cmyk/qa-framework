@@ -73,6 +73,15 @@ class TaskMemory:
     image_b64: Optional[str] = None
     image_src: str = ""
     image_checked: bool = False
+    # --- v4 ---
+    plan: str = ""                                               # план модели с прошлого шага
+    wrong_answers: list[str] = field(default_factory=list)       # ответы, отклонённые платформой
+    feedback: list[str] = field(default_factory=list)            # «Неверный ответ» + подсказка
+    web_results: list = field(default_factory=list)              # research.WebResult
+    web_queries: Counter = field(default_factory=Counter)        # нормализованный запрос → раз
+    submits: int = 0
+    dialog_attempts: Counter = field(default_factory=Counter)    # текст диалога → попыток закрыть
+    instruction_pages: int = 0                                   # прочитано страниц инструкции в этом задании
 
     def reset(self, task_id: str) -> None:
         """Полный сброс при смене задания (раскрытие папок задание не меняет)."""

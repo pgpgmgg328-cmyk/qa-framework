@@ -14,6 +14,8 @@ from models import (
     ElementKind,
     FolderState,
     LLMDecision,
+    MediaImage,
+    Notice,
     PageState,
     ParsedElement,
 )
@@ -101,12 +103,20 @@ def test_user_message_contains_history_forbidden_and_notes():
         forbidden=["click «Другое» ⟨Одежда⟩ — 2 раз(а) без эффекта"],
         notes=["Осталось шагов на это задание: 3."], step_in_task=4,
     )
+    ctx.plan = "Смартфон → Электроника › Смартфоны, затем submit"
+    ctx.wrong_answers = ["«Ноутбуки»"]
+    ctx.knowledge = "Инструкция к заданиям этого вида:\nВыбирайте самую узкую категорию."
     state = tree_state()
-    state.alerts = ["Выберите вариант"]
+    state.notices = [Notice(kind="error", text="Выберите вариант")]
+    state.reader = ["Выберите категорию для товара", "\x01N0\x01"] + [f"\x00E{e.index}\x00" for e in state.elements]
     text = oc.LLMConnector.build_user_message(state, ctx)
-    for part in ("═══ ИСТОРИЯ (шаг 4", "✓ раскрыто", "═══ НЕ ПОВТОРЯТЬ", "═══ ВНИМАНИЕ",
-                 "═══ СООБЩЕНИЯ СТРАНИЦЫ", "  [3] [OPTION] «Смартфоны»"):
+    for part in ("═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ", "Выбирайте самую узкую", "═══ СТРАНИЦА ЗАДАНИЯ",
+                 "‼ Выберите вариант", "  [3] [OPTION] «Смартфоны»", "═══ ТВОЙ ПЛАН", "Электроника › Смартфоны",
+                 "═══ НЕВЕРНЫЕ ОТВЕТЫ", "✗ «Ноутбуки»", "═══ ИСТОРИЯ (шаг 4", "✓ раскрыто",
+                 "═══ НЕ ПОВТОРЯТЬ", "═══ ВНИМАНИЕ"):
         assert part in text, part
+    # знания — первыми, страница — до истории
+    assert text.index("ЗНАНИЯ") < text.index("СТРАНИЦА") < text.index("ИСТОРИЯ")
 
 
 def test_truncation_keeps_buttons_and_folders():
@@ -199,22 +209,37 @@ def test_memory_reset_on_new_task():
 
 # --------------------------------------------------------------------- отпечаток задания
 
+def _fp(text: str, image: str = "img.png", notices: tuple[str, ...] = ()) -> tuple[str, str, str, str]:
+    reader = [text] + [f"\x01N{i}\x01" for i in range(len(notices))]
+    images = [MediaImage(n=1, src=image)] if image else []
+    return DomParser._fingerprint("https://x/task", reader, [], images, [], [])
+
+
 @pytest.mark.parametrize("tick_a, tick_b", [
     ("Осталось 04:59", "Осталось 04:58"),
     ("осталось 59 сек.", "осталось 58 сек."),
     ("Таймер: 3 мин", "Таймер: 2 мин"),
 ])
 def test_fingerprint_ignores_timers(tick_a, tick_b):
-    a, _ = DomParser._fingerprint("https://x/task", "img.png", f"Выберите категорию. {tick_a}", True)
-    b, _ = DomParser._fingerprint("https://x/task", "img.png", f"Выберите категорию. {tick_b}", True)
-    assert a == b
+    a = _fp(f"Выберите категорию. {tick_a}")
+    b = _fp(f"Выберите категорию. {tick_b}")
+    assert a[0] == b[0] and a[2] == b[2]
 
 
 def test_fingerprint_changes_with_task_content():
-    a, _ = DomParser._fingerprint("https://x/task", "img.png", "Товар №12345", True)
-    b, _ = DomParser._fingerprint("https://x/task", "img.png", "Товар №12346", True)
-    c, _ = DomParser._fingerprint("https://x/task", "other.png", "Товар №12345", True)
-    assert len({a, b, c}) == 3
+    a = _fp("Товар №12345")
+    b = _fp("Товар №12346")
+    c = _fp("Товар №12345", image="other.png")
+    assert len({a[0], b[0], c[0]}) == 3
+    assert a[2] != b[2] and a[3] == b[3]         # отличаются только цифры → «мягкий» хэш совпадает
+    assert a[2] == c[2]                           # тот же текст, другое фото → тот же хэш текста
+
+
+def test_fingerprint_ignores_platform_messages():
+    """«Неверный ответ» и подсказка после отправки — то же задание (память не сбрасывается)."""
+    plain = _fp("Оцените чистоту банкомата")
+    feedback = _fp("Оцените чистоту банкомата", notices=("Неверный ответ", "Правильный ответ: Да"))
+    assert plain[0] == feedback[0]
 
 
 # --------------------------------------------------------------------- предохранители
@@ -273,7 +298,8 @@ def test_deny_list_buttons_are_hidden_and_never_resolved():
     )
     prompt = build_elements_prompt(state.elements)
     assert "Завершить смену" not in prompt and "«Выйти»" not in prompt
-    assert "═══ ЭЛЕМЕНТЫ (4) ═══" in oc.LLMConnector.build_user_message(state, DecisionContext())
+    message = oc.LLMConnector.build_user_message(state, DecisionContext())
+    assert "Завершить смену" not in message and "«Выйти»" not in message
     assert "Выходная обувь" in prompt and "Сменить категорию" in prompt and "Начать работу" in prompt
     # ни по номеру, ни по тексту, ни по нечёткому совпадению «Завершить» ≈ «Завершить смену»
     assert resolve({"action": "click", "target_index": 1, "target_text": "Завершить смену"}, state) is None

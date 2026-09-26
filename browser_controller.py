@@ -453,9 +453,14 @@ class BrowserController:
                 if not focus.ok:
                     return focus
                 await locator.fill("", timeout=3_000)
-                await locator.press_sequentially(
-                    text, delay=TYPE_DELAY_MS, timeout=max(5_000, len(text) * (TYPE_DELAY_MS + 50)),
-                )
+                if len(text) > 40:
+                    # длинные значения (URL на 300 символов) посимвольно печатались бы
+                    # десятки секунд — вставляем целиком, как из буфера обмена
+                    await locator.fill(text, timeout=5_000)
+                else:
+                    await locator.press_sequentially(
+                        text, delay=TYPE_DELAY_MS, timeout=max(5_000, len(text) * (TYPE_DELAY_MS + 50)),
+                    )
                 actual = await locator.evaluate(_JS_READ_VALUE)
                 if _compact(actual) != _compact(text):
                     # маска/автоформатирование съели символы — вводим значение целиком
@@ -466,7 +471,7 @@ class BrowserController:
         matches = _compact(actual) == _compact(text)
         return ActionOutcome(
             ok=matches or bool(actual.strip()), method="type",
-            detail=f"в поле: «{actual[:80]}»" + ("" if matches else " (отличается от введённого)"),
+            detail=f"в поле: «{actual[:200]}»" + ("" if matches else " (отличается от введённого)"),
         )
 
     async def scroll(
@@ -588,6 +593,10 @@ class BrowserController:
     # ------------------------------------------------------------------
     # Клик: проверка кликабельности → мышь → JS-фоллбэк
     # ------------------------------------------------------------------
+
+    async def click_locator(self, locator: Locator, what: str) -> ActionOutcome:
+        """Клик по произвольному локатору той же цепочкой (проверка → мышь → JS)."""
+        return await self._click_locator(locator, what)
 
     async def _click_locator(self, locator: Locator, what: str) -> ActionOutcome:
         try:

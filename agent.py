@@ -1,15 +1,22 @@
-"""agent.py v3 — главный цикл агента.
+"""agent.py v4 — главный цикл агента.
+
+Агент решает задания любого вида, пока платформа не вернёт его на список заказов.
+Шаблонов под виды заданий нет: страница задания целиком (текст, таблицы, ссылки, фото,
+аудио, поля) уходит модели, а модель сама решает, как выполнить задание.
 
 Шаг агента:
-  1. Найти видимый целевой фрейм (иначе — ожидание, шаг не расходуется).
-  2. Капча в отдельном iframe → ожидание ручного решения (с таймаутом).
-  3. Атомарный снимок DomParser: элементы размечены метками data-agent-id.
-  4. Смена отпечатка задания → сброс памяти. Проверка эффекта прошлого действия.
-  5. Загрузка/спиннер → ждём стабилизации DOM.
-  6. Локальный флоу «Приступить/ОК» — только на заставке или в диалоге.
-  7. Решение LLM (история, запреты, бюджет, картинка задания).
-  8. Сверка target_index с target_text (с учётом типа элемента и дублей).
-  9. Выполнение по метке + проверка submit по смене задания.
+  1. Всплывающие окна сайта (новости T-Work) поверх фрейма — закрыть.
+  2. Найти видимый фрейм задания; капча — ждать ручного решения.
+  3. Снимок DomParser (reader-view, элементы размечены метками data-agent-id).
+  4. Список заказов («Приступить») после выполненных заданий — остановка.
+  5. Новое задание (TaskIdentity) → сброс памяти, знания о виде задания.
+  6. Диалоги: «Выйти из задания?» → «остаться»; инструкция → прочитать, сохранить,
+     закрыть; «Тренировка … Начать» → начать.
+  7. Инструкция и подсказки «?» вида задания — прочитать один раз за запуск.
+  8. Аудио — расшифровка в фоне и воспроизведение; фото — скачивание для модели.
+  9. Решение LLM (знания, страница, фото, аудио, поиск, план, история, неверные ответы).
+ 10. Выполнение по метке; web — поиск в отдельной вкладке; submit — дослушать аудио,
+     нажать и дождаться: следующее задание или «Неверный ответ» (тогда урок + исправление).
 """
 
 from __future__ import annotations
@@ -19,28 +26,43 @@ import difflib
 import logging
 import re
 import time
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import Error as PlaywrightError, Frame
 
 from browser_controller import BrowserController, is_connection_lost
 from config import (
     ACTION_WAIT,
+    AUDIO_PLAY_TO_END,
     CAPTCHA_TIMEOUT,
+    DIALOG_CLOSE_TEXTS,
+    EXIT_CANCEL_TEXTS,
     FINISH_BUTTON_TEXTS,
     FINISH_DENY_SUBSTRINGS,
     FRAME_LOAD_WAIT,
+    INSTRUCTION_WAIT,
     LLM_HISTORY_SIZE,
     LLM_TEMPERATURE,
     LLM_VISION,
     MAX_IDLE_SECONDS,
     MAX_STEPS,
     MAX_STEPS_PER_TASK,
+    MAX_WEB_PER_TASK,
+    ORDERS_BUTTON_TEXTS,
+    READ_INSTRUCTIONS,
+    READ_TOOLTIPS,
     START_BUTTON_TEXTS,
+    STOP_ON_ORDERS_LIST,
     SUBMIT_WAIT,
+    TASK_URL_KEYWORDS,
+    WEB_RESEARCH,
 )
-from dom_parser import DomParser, is_denied_button
+from dom_parser import DomParser, _plain_text, is_denied_button
+from knowledge import KnowledgeBase, PoolKnowledge
+from media import MediaManager
 from models import (
     FLAG_DISABLED,
     FLAG_IN_DIALOG,
@@ -58,6 +80,7 @@ from models import (
     normalize_text,
 )
 from openrouter_connector import LLMConnector
+from research import WebResearch
 from task_memory import TaskMemory
 
 logger = logging.getLogger("twork.agent")
@@ -84,6 +107,79 @@ _FALLBACK_KINDS: dict[ActionType, set[ElementKind]] = {
     ActionType.OPEN: {ElementKind.OPTION, ElementKind.OTHER},
 }
 _MATCH_THRESHOLD = 0.85
+_WRONG_RE = re.compile(r"(неверн|неправильн|ошибк[аи] в ответе|incorrect|wrong)", re.IGNORECASE)
+_INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
+
+# Всплывающее окно на ГЛАВНОЙ странице сайта (новости, объявления) поверх фрейма задания
+_JS_PAGE_POPUP = r"""
+() => {
+    const SEL = '[role="dialog"], [aria-modal="true"], dialog[open], tui-dialog, [class*="modal" i]';
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return false;
+        return el.checkVisibility ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : true;
+    };
+    document.querySelectorAll('[data-agent-popup]').forEach((b) => b.removeAttribute('data-agent-popup'));
+    const frames = Array.from(document.querySelectorAll('iframe'));
+    for (const d of document.querySelectorAll(SEL)) {
+        let box = d.getBoundingClientRect();
+        for (const ch of d.children) {
+            const r = ch.getBoundingClientRect();
+            if (r.width * r.height > box.width * box.height) box = r;
+        }
+        if (box.width < 150 || box.height < 100 || !visible(d)) continue;
+        if (frames.some((f) => d.contains(f))) continue;         // это оболочка самого задания
+        const buttons = [];
+        d.querySelectorAll('button, [role="button"], a[href]').forEach((b, i) => {
+            if (!visible(b)) return;
+            b.setAttribute('data-agent-popup', String(i));
+            buttons.push({ i, text: norm(b.innerText || b.getAttribute('aria-label') || b.title || ''),
+                           aria: norm((b.getAttribute('aria-label') || '') + ' ' + (b.getAttribute('class') || '')) });
+        });
+        if (buttons.length) return { text: norm(d.innerText).slice(0, 300), buttons };   // подложка без кнопок — дальше
+    }
+    return null;
+}
+"""
+
+# Подсказки «?» у вариантов ответа: иконки-триггеры внутри строк формы
+_JS_TOOLTIP_TRIGGERS = r"""
+() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const SEL = 'tui-tooltip, [tuitooltip], [tuihint], [data-tooltip], [class*="tooltip" i]';
+    document.querySelectorAll('[data-agent-tip]').forEach((x) => x.removeAttribute('data-agent-tip'));
+    const out = [], rows = new Set();
+    let n = 0;
+    for (const t of document.querySelectorAll(SEL)) {
+        const r = t.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4 || r.width > 48 || r.height > 48) continue;
+        const row = t.closest('[data-agent-id]');
+        if (!row || rows.has(row)) continue;
+        if (t.checkVisibility && !t.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+        rows.add(row);
+        t.setAttribute('data-agent-tip', String(n));
+        out.push({ n, uid: row.getAttribute('data-agent-id') });
+        n++;
+        if (n >= 16) break;
+    }
+    return out;
+}
+"""
+
+_JS_HINT_TEXT = r"""
+() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const out = [];
+    for (const h of document.querySelectorAll('tui-hint, [role="tooltip"], [class*="tooltip" i][class*="content" i]')) {
+        const r = h.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4) continue;
+        const t = norm(h.innerText);
+        if (t) out.push(t);
+    }
+    return out.join(' ').slice(0, 800);
+}
+"""
 
 
 def _similarity(a: str, b: str) -> float:
@@ -107,6 +203,7 @@ def _clean_target_text(text: str) -> str:
     for flag in (FLAG_SELECTED, FLAG_DISABLED, FLAG_OCCLUDED, FLAG_SELECTABLE, FLAG_IN_DIALOG, FLAG_IN_POPUP):
         t = t.replace(flag, "")
     t = re.sub(r"⟨[^⟩]*⟩", "", t)
+    t = re.sub(r"\s→\s\S+$", "", t)
     return t.strip()
 
 
@@ -114,38 +211,76 @@ def _short(exc: BaseException) -> str:
     return str(exc).strip().splitlines()[0][:160] if str(exc).strip() else exc.__class__.__name__
 
 
+def _label_matches(label: str, texts: tuple[str, ...]) -> bool:
+    label = normalize_text(label)
+    return any(label == t or label.startswith(t + " ") for t in texts)
+
+
+@dataclass(frozen=True)
+class TaskIdentity:
+    """Что считать «тем же заданием».
+
+    Один хэш не годится: фото карусели догружаются (набор адресов растёт), счётчик
+    символов в поле меняет цифры, а в заданиях «оцените фото» текст одинаков у всех
+    заданий — различаются только фото."""
+    content: str
+    loose: str
+    media: frozenset[str]
+
+    @classmethod
+    def of(cls, state: PageState) -> "TaskIdentity":
+        return cls(state.content_hash, state.loose_hash, frozenset(state.media_srcs))
+
+    def same_task(self, other: "TaskIdentity", *, submitted: bool) -> bool:
+        media_related = (not self.media or not other.media or bool(self.media & other.media))
+        if self.content == other.content:
+            return media_related
+        if self.loose == other.loose and not submitted:
+            return media_related          # отличаются только цифры: таймер, счётчик, «1 из 14»
+        return False
+
+
 class Agent:
-    """Автономный агент для платформы T-Work v3."""
+    """Автономный агент для платформы T-Work v4."""
 
     def __init__(
         self,
         *,
         browser: Optional[BrowserController] = None,
         llm: Optional[LLMConnector] = None,
+        knowledge: Optional[KnowledgeBase] = None,
     ) -> None:
         # зависимости можно подменить (тесты, другой провайдер LLM)
         self._browser = browser or BrowserController()
         self._llm = llm or LLMConnector()
         self._memory = TaskMemory()
+        self._identity: Optional[TaskIdentity] = None
         self._task_identifier: str = ""
-        self._task_basis: tuple[str, str] = ("", "")
-        self._submitted = False             # отправка подтверждена — следующая смена отпечатка ожидаема
+        self._submitted = False             # после нажатия «Завершить» новое задание ожидаемо
         self._tasks_done = 0
+        self._wrong_total = 0
+        self._seen_task = False             # агент уже был в задании (для остановки на списке заказов)
         self._captcha_suppressed_until = 0.0
         self._last_idle_log = 0.0
+        self._popup_attempts: dict[str, int] = {}
+        self._media = MediaManager(self._browser, getattr(self._llm, "transcribe", None))
+        self._web = WebResearch(self._browser)
+        self._knowledge = knowledge or KnowledgeBase()
+        self._pool: Optional[PoolKnowledge] = None
+        self._frame_shot: Optional[str] = None
+        self._frame_shot_task = ""
 
     # ------------------------------------------------------------------
     # Главная точка входа
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
-        """Запустить агента."""
+        """Запустить агента: работает до возврата на список заказов (или лимитов)."""
+        started = time.monotonic()
         async with self._browser:
             logger.info("=" * 60)
-            logger.info(
-                "АГЕНТ v3 ЗАПУЩЕН. Шагов с действием: %d, на одно задание: %d",
-                MAX_STEPS, MAX_STEPS_PER_TASK,
-            )
+            logger.info("АГЕНТ v4 ЗАПУЩЕН. Работаю, пока платформа не вернёт на список заказов.")
+            logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
             logger.info("=" * 60)
             acted = 0
             idle_since: Optional[float] = None
@@ -184,35 +319,56 @@ class Agent:
                 await asyncio.sleep(0.2)
             else:
                 logger.warning("ДОСТИГНУТ ЛИМИТ ШАГОВ (%d)", MAX_STEPS)
-            logger.info("ИТОГ: отправлено заданий=%d, шагов с действием=%d", self._tasks_done, acted)
+            await self._web.close()
+            self._media.close()
+            minutes = (time.monotonic() - started) / 60
+            logger.info(
+                "ИТОГ: отправлено заданий=%d, из них платформа признала неверными=%d, "
+                "шагов с действием=%d, время %.1f мин",
+                self._tasks_done, self._wrong_total, acted, minutes,
+            )
 
     # ------------------------------------------------------------------
     # Один шаг агента
     # ------------------------------------------------------------------
 
     async def _step(self) -> StepResult:
-        # 1. Целевой фрейм
+        # 1. Окно новостей сайта поверх задания
+        if await self._dismiss_page_popup():
+            return StepResult.IDLE
+
+        # 2. Фрейм задания
         frame = await self._browser.find_target_frame()
         if frame is None:
-            self._log_idle("Целевой фрейм не найден — жду (если нужен вход в аккаунт, войдите в окне браузера)")
+            self._log_idle("Фрейм задания не найден — жду (если нужен вход в аккаунт, войдите в окне "
+                           "браузера и откройте заказ кнопкой «Приступить»)")
             await asyncio.sleep(FRAME_LOAD_WAIT)
             return StepResult.IDLE
 
-        # 2. Капча в отдельном iframe страницы
         if time.monotonic() > self._captcha_suppressed_until and await self._browser.page_has_captcha():
             await self._wait_captcha_solved()
             return StepResult.IDLE
 
-        # 3. Атомарный снимок + память задания
+        # 3. Снимок
         state = await DomParser(frame).parse()
-        self._refresh_task_context(state)
+
+        # 4. Список заказов
+        if self._is_orders_list(state):
+            return await self._on_orders_list()
+
+        self._refresh_task_context(frame, state)
         self._memory.verify(state)          # фактический результат прошлого действия → в историю
 
         if state.has_captcha and time.monotonic() > self._captcha_suppressed_until:
             await self._wait_captcha_solved()
             return StepResult.IDLE
 
-        # 4. Загрузка: ждём, но не бесконечно (ложный «спиннер» не должен вешать агента)
+        # 5. Диалоги поверх задания
+        handled = await self._handle_dialog(frame, state)
+        if handled is not None:
+            return handled
+
+        # 6. Загрузка на всю страницу: ждём, но не бесконечно
         if state.loading and self._memory.loading_waits < 5:
             self._memory.loading_waits += 1
             logger.info("Идёт загрузка — жду стабилизации DOM")
@@ -222,22 +378,33 @@ class Agent:
         if not state.loading:
             self._memory.loading_waits = 0
 
-        # 5. Локальный флоу «Приступить / ОК»
+        # 7. Локальный флоу «Начать / ОК» (заставки и диалоги тренировки)
         if await self._maybe_click_start(frame, state):
             return StepResult.ACTED
 
-        # 6. Нет активных элементов — ждём
-        if not any(not e.is_disabled for e in state.elements):
+        # 8. Нет активных элементов — ждём
+        if not any(not e.is_disabled for e in state.visible_elements):
             self._log_idle("Активных элементов нет — жду загрузки/следующего задания")
             await asyncio.sleep(max(ACTION_WAIT, 1.0))
             return StepResult.IDLE
+        self._seen_task = True
 
-        # 7. Бюджет шагов на задание
+        # 9. Знания о виде задания: инструкция и подсказки «?» (один раз за запуск)
+        if await self._maybe_open_instruction(frame, state):
+            return StepResult.IDLE
+        await self._maybe_read_tooltips(frame, state)
+
+        # 10. Аудио: расшифровка в фоне, воспроизведение
+        if state.audios:
+            self._media.start_transcription(frame, state)
+            await self._media.ensure_playing(frame, state)
+
+        # 11. Бюджет шагов на задание
         self._memory.steps += 1
         if self._memory.steps > MAX_STEPS_PER_TASK:
             return await self._handle_budget_exhausted(frame, state)
 
-        # 8. Решение LLM
+        # 12. Решение LLM
         logger.info(
             "%s задание %s · шаг %d/%d · «%s» %s",
             "-" * 10, state.task_identifier[:8], self._memory.steps, MAX_STEPS_PER_TASK,
@@ -245,38 +412,103 @@ class Agent:
         )
         context = await self._build_context(frame, state)
         decision = await self._llm.decide(state, context)
+        if decision.plan:
+            self._memory.plan = decision.plan
 
-        # 9. Сверка цели и выполнение
+        # 13. Сверка цели и выполнение
         target = self._resolve_target(decision, state)
         await self._execute(frame, decision, target, state)
         await self._browser.wait_settle(frame)
         return StepResult.ACTED
 
     # ------------------------------------------------------------------
-    # Память задания
+    # Список заказов и окна сайта
     # ------------------------------------------------------------------
 
-    def _refresh_task_context(self, state: PageState) -> None:
-        """Сбрасывать память ТОЛЬКО при смене задания.
+    @staticmethod
+    def _is_orders_list(state: PageState) -> bool:
+        """Список заказов: фрейм не на странице задания и есть кнопки «Приступить»."""
+        url = state.frame_url.lower()
+        if any(keyword in url for keyword in TASK_URL_KEYWORDS):
+            return False
+        return any(
+            e.kind == ElementKind.BUTTON and _label_matches(e.text, ORDERS_BUTTON_TEXTS)
+            for e in state.elements
+        )
 
-        Отпечаток не включает текст дерева, поэтому раскрытие папок память не сбрасывает.
-        """
-        new_id = state.task_identifier
-        basis = (re.sub(r"\d+", "", normalize_text(state.task_text)), state.image_src)
-        if new_id and new_id != self._task_identifier:
+    async def _on_orders_list(self) -> StepResult:
+        if self._seen_task and STOP_ON_ORDERS_LIST:
+            logger.info("✅ Платформа вернула на список заказов — заказ выполнен, агент завершает работу")
+            return StepResult.STOP
+        self._log_idle("Открыт список заказов. Выберите заказ и нажмите «Приступить» — агент начнёт решать "
+                       "задания и остановится, когда платформа вернёт сюда")
+        await asyncio.sleep(FRAME_LOAD_WAIT)
+        return StepResult.IDLE
+
+    async def _dismiss_page_popup(self) -> bool:
+        """Новости/объявления сайта (например, «Одноразовые пароли для TWork») открываются
+        поверх фрейма задания и перехватывают клики. Закрываем кнопкой «Закрыть/Далее/OK»."""
+        page = self._browser.page
+        try:
+            popup = await page.main_frame.evaluate(_JS_PAGE_POPUP)
+        except PlaywrightError:
+            return False
+        if not popup:
+            return False
+        text = str(popup.get("text") or "")
+        key = normalize_text(text)[:120]
+        if self._popup_attempts.get(key, 0) >= 3:
+            return False
+        buttons = popup.get("buttons") or []
+
+        def pick(texts: tuple[str, ...]) -> Optional[dict]:
+            for b in buttons:
+                label = str(b.get("text") or "")
+                if label and _label_matches(label, texts) and not any(d in normalize_text(label)
+                                                                      for d in FINISH_DENY_SUBSTRINGS):
+                    return b
+            return None
+
+        button = pick(DIALOG_CLOSE_TEXTS) or pick(EXIT_CANCEL_TEXTS)
+        if button is None:
+            button = next((b for b in buttons if not b.get("text")
+                           and re.search(r"(закрыть|close|cross)", str(b.get("aria") or ""), re.IGNORECASE)), None)
+        if button is None:
+            return False
+        self._popup_attempts[key] = self._popup_attempts.get(key, 0) + 1
+        logger.info("Закрываю всплывающее окно сайта «%s» кнопкой «%s»", text[:60], button.get("text") or "×")
+        locator = page.main_frame.locator(f'[data-agent-popup="{button["i"]}"]')
+        try:
+            if await locator.count():
+                await self._browser.click_locator(locator.first, str(button.get("text") or "закрыть"))
+                await asyncio.sleep(0.6)
+                return True
+        except PlaywrightError as exc:
+            logger.debug("Окно сайта не закрылось: %s", _short(exc))
+        return False
+
+    # ------------------------------------------------------------------
+    # Память и знания задания
+    # ------------------------------------------------------------------
+
+    def _refresh_task_context(self, frame: Frame, state: PageState) -> None:
+        """Сбрасывать память ТОЛЬКО при смене задания (см. TaskIdentity)."""
+        identity = TaskIdentity.of(state)
+        if self._identity is None or not self._identity.same_task(identity, submitted=self._submitted):
             logger.info(
                 "СМЕНА ЗАДАНИЯ: %s → %s «%s»",
-                self._task_identifier[:8] or "—", new_id[:8], state.task_preview[:60],
+                self._task_identifier[:8] or "—", state.task_identifier[:8], state.task_preview[:60],
             )
-            if self._task_identifier and basis == self._task_basis and not self._submitted:
-                # Отличаются только цифры, картинка та же, отправки не было — вероятно,
-                # в текст задания попал таймер/счётчик. Память сбрасывается, но стоит
-                # сузить TASK_TEXT_SELECTORS, иначе защита от зацикливания не работает.
-                logger.warning("Отпечаток задания изменился только в цифрах — проверьте, "
-                               "не попал ли в текст задания таймер или счётчик")
-            self._task_identifier = new_id
-            self._memory.reset(new_id)
-        self._task_basis = basis
+            self._memory.reset(state.task_identifier)
+            self._media.forget_task()
+            self._frame_shot = None
+            pool = self._knowledge.for_state(state)
+            if pool is not None and pool is not self._pool:
+                known = "есть инструкция" if pool.has_instruction else "инструкции пока нет"
+                logger.info("Вид задания: «%s» (%s, уроков: %d)", pool.title, known, len(pool.lessons))
+            self._pool = pool
+        self._identity = identity
+        self._task_identifier = state.task_identifier
         self._submitted = False
 
     async def _build_context(self, frame: Frame, state: PageState) -> DecisionContext:
@@ -285,44 +517,281 @@ class Agent:
         notes: list[str] = []
         if steps_left <= 5:
             notes.append(
-                f"Осталось шагов на это задание: {steps_left}. Если ответ уже выбран — submit; "
-                "иначе выбери лучший доступный вариант."
+                f"Осталось шагов на это задание: {steps_left}. Если ответ уже заполнен — submit; "
+                "иначе заверши заполнение лучшими доступными вариантами."
             )
         if mem.consecutive_skips >= 2:
             notes.append(f"Ты пропустил {mem.consecutive_skips} шага подряд — выбери конкретное действие.")
         if mem.invalid_targets:
             notes.append("Прошлое действие ссылалось на несуществующий элемент: бери номер и текст "
-                         "ТОЛЬКО из текущего списка.")
+                         "ТОЛЬКО из текущей страницы.")
         if mem.repeated_forbidden:
             notes.append("Ты повторил действие из НЕ ПОВТОРЯТЬ — выбери другой элемент или другое действие.")
+        if mem.web_queries and sum(mem.web_queries.values()) >= MAX_WEB_PER_TASK:
+            notes.append("Лимит поисковых запросов на задание исчерпан — отвечай по уже найденным данным.")
 
         # При зацикливании слегка «встряхиваем» детерминированную модель
         temperature = None
         if mem.consecutive_skips >= 3 or mem.repeated_forbidden >= 1:
             temperature = max(LLM_TEMPERATURE, 0.4)
 
+        images, image_notes = [], []
+        image_b64 = None
+        if LLM_VISION in ("auto", "image") and state.images:
+            images, image_notes = await self._media.vision_images(frame, state)
+        if LLM_VISION == "frame" or (LLM_VISION in ("auto", "image") and not state.images and state.image_src):
+            image_b64 = await self._frame_screenshot(frame, state)
+
+        transcripts = await self._media.transcripts(state) if state.audios else []
+        research = [
+            r.render(i + 1, full=i >= len(mem.web_results) - 2) for i, r in enumerate(mem.web_results)
+        ]
         return DecisionContext(
             history=mem.history_lines(LLM_HISTORY_SIZE),
             forbidden=mem.forbidden_lines(),
             notes=notes,
             step_in_task=mem.steps,
             steps_left=steps_left,
-            image_b64=await self._task_image(frame, state),
+            image_b64=image_b64,
             temperature=temperature,
+            images=images,
+            image_notes=image_notes,
+            transcripts=transcripts,
+            knowledge=self._knowledge.prompt_text(self._pool),
+            research=research,
+            plan=mem.plan,
+            feedback=list(mem.feedback),
+            wrong_answers=list(mem.wrong_answers),
         )
 
-    async def _task_image(self, frame: Frame, state: PageState) -> Optional[str]:
-        """Картинка задания для vision-модели; для режима image кэшируется на задание."""
-        if LLM_VISION == "off":
+    async def _frame_screenshot(self, frame: Frame, state: PageState) -> Optional[str]:
+        """Скриншот фрейма (LLM_VISION=frame или картинка без <img>, например canvas)."""
+        if LLM_VISION == "frame" or self._frame_shot_task != state.task_identifier:
+            self._frame_shot = await self._browser.screenshot_b64(frame, "frame")
+            self._frame_shot_task = state.task_identifier
+        return self._frame_shot
+
+    # ------------------------------------------------------------------
+    # Диалоги поверх задания
+    # ------------------------------------------------------------------
+
+    async def _handle_dialog(self, frame: Frame, state: PageState) -> Optional[StepResult]:
+        """Диалоги, которые агент закрывает сам. None — диалога нет или решает LLM."""
+        if not state.dialog_open:
             return None
-        mem = self._memory
-        if LLM_VISION == "frame":
-            return await self._browser.screenshot_b64(frame, "frame")
-        if not mem.image_checked or mem.image_src != state.image_src:
-            mem.image_checked = True
-            mem.image_src = state.image_src
-            mem.image_b64 = await self._browser.screenshot_b64(frame, "image") if state.image_src else None
-        return mem.image_b64
+        dialog = [e for e in state.visible_elements if e.container == "dialog"]
+        buttons = [e for e in dialog if e.kind == ElementKind.BUTTON and not e.is_disabled]
+        text = _plain_text(state.dialog_lines)
+
+        # «Выйти из задания?» — агент задания не бросает: «Нет, остаться»
+        denied = [e for e in state.elements if e.container == "dialog" and is_denied_button(e)]
+        if denied:
+            cancel = next((b for b in buttons if _label_matches(b.text, EXIT_CANCEL_TEXTS)), None)
+            if cancel is not None:
+                logger.warning("Открыт диалог «%s» — отвечаю «%s»", text[:60], cancel.label())
+                await self._browser.click_element(frame, cancel)
+                await self._browser.wait_settle(frame)
+                return StepResult.ACTED
+
+        # Инструкция к заданию: дождаться загрузки, прочитать, сохранить, закрыть.
+        # Заставка «Тренировка … изучите инструкцию … [Начать]» — не инструкция: её
+        # закрывает локальный флоу кнопкой «Начать».
+        start_button = any(_label_matches(b.text, START_BUTTON_TEXTS) for b in buttons)
+        size = len(re.sub(r"\s+", "", text))
+        instruction = (state.dialog_loading or state.dialog_frames > 0 or size > 700
+                       or (bool(_INSTRUCTION_RE.search(text[:120])) and not start_button))
+        if instruction:
+            key = normalize_text(text)[:80]
+            if self._memory.dialog_attempts[key] < 3:
+                self._memory.dialog_attempts[key] += 1
+                return await self._read_instruction_dialog(frame, state)
+        return None
+
+    async def _read_instruction_dialog(self, frame: Frame, state: PageState) -> StepResult:
+        deadline = time.monotonic() + INSTRUCTION_WAIT
+        if state.dialog_loading:
+            logger.info("Открыта инструкция — жду загрузки (до %.0f с)", INSTRUCTION_WAIT)
+        while state.dialog_loading and time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            state = await DomParser(frame).parse(quiet=True)
+            if not state.dialog_open:
+                return StepResult.IDLE
+        text = _plain_text(state.dialog_lines)
+        if state.dialog_frames:
+            text = "\n".join(filter(None, [text, await self._read_child_frames(frame)]))
+        failed = any("ошибка загрузки" in n.lower() for n in state.notice_texts())
+        title = (text.strip().splitlines() or ["инструкция"])[0][:80]
+        body = text
+        if len(re.sub(r"\s+", "", body)) < 200 and not failed:
+            extra = await self._read_instruction_tab(frame, state)
+            if extra:
+                body = f"{text}\n{extra}"
+        if self._pool is not None:
+            self._pool.instruction_attempted = True
+            if len(re.sub(r"\s+", "", body)) >= 200:
+                # вторая и следующие страницы (кнопка «Далее») дописываются, а не заменяют первую
+                self._knowledge.save_instruction(self._pool, body, f"диалог «{title}»",
+                                                 append=self._memory.instruction_pages > 0)
+                self._memory.instruction_pages += 1
+                self._memory.add(ActionType.CLICK, None, note="(авто)",
+                                 result=f"📘 прочитана инструкция «{title[:60]}» — она в разделе ЗНАНИЯ")
+        if failed:
+            logger.warning("Инструкция не загрузилась (сообщение платформы) — продолжаю без неё")
+        elif len(re.sub(r"\s+", "", body)) < 200:
+            logger.warning("Инструкция открыта, но текста в ней не найдено (%d симв.)", len(body))
+        await self._close_dialog(frame, state)
+        return StepResult.ACTED
+
+    async def _read_child_frames(self, frame: Frame) -> str:
+        """Текст документов во вложенных iframe (инструкция бывает отдельной страницей)."""
+        texts: list[str] = []
+        for child in frame.child_frames:
+            try:
+                element = await child.frame_element()
+                inside = await element.evaluate(
+                    "(f) => !!f.closest('[role=\"dialog\"], [aria-modal=\"true\"], dialog[open], tui-dialog')"
+                )
+                if not inside:
+                    continue
+                await child.wait_for_load_state("load", timeout=10_000)
+                texts.append(await child.evaluate("() => document.body ? document.body.innerText : ''"))
+            except PlaywrightError as exc:
+                logger.debug("Вложенный документ не прочитан: %s", _short(exc))
+        return "\n".join(t for t in texts if t and t.strip())
+
+    async def _read_instruction_tab(self, frame: Frame, state: PageState) -> str:
+        """Инструкция без текста в диалоге: кнопка «открыть в новой вкладке» → читаем вкладку."""
+        close_like = DIALOG_CLOSE_TEXTS + START_BUTTON_TEXTS
+        candidates = [
+            e for e in state.visible_elements
+            if e.container == "dialog" and e.kind in (ElementKind.BUTTON, ElementKind.OTHER)
+            and not _label_matches(e.text, close_like) and _INSTRUCTION_RE.search(e.text or "")
+        ]
+        if not candidates:
+            return ""
+        context = self._browser.context
+        before = set(context.pages)
+        await self._browser.click_element(frame, candidates[0])
+        await asyncio.sleep(2.0)
+        new_pages = [p for p in context.pages if p not in before]
+        text = ""
+        for page in new_pages:
+            try:
+                await page.wait_for_load_state("load", timeout=15_000)
+                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                logger.info("Инструкция прочитана из вкладки %s (%d симв.)", page.url[:80], len(text))
+            except PlaywrightError as exc:
+                logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
+            finally:
+                try:
+                    await page.close()
+                except PlaywrightError:
+                    pass
+        try:
+            await self._browser.page.bring_to_front()
+        except PlaywrightError:
+            pass
+        return text.strip()
+
+    async def _close_dialog(self, frame: Frame, state: PageState) -> None:
+        fresh = await DomParser(frame).parse(quiet=True)
+        buttons = [e for e in fresh.visible_elements
+                   if e.container == "dialog" and e.kind == ElementKind.BUTTON and not e.is_disabled]
+        button = next((b for b in buttons if _label_matches(b.text, DIALOG_CLOSE_TEXTS)), None) \
+            or next((b for b in buttons if _label_matches(b.text, START_BUTTON_TEXTS)), None)
+        if button is not None:
+            logger.info("Закрываю диалог кнопкой «%s»", button.label())
+            await self._browser.click_element(frame, button)
+        else:
+            logger.info("Закрываю диалог клавишей Escape")
+            try:
+                await self._browser.page.keyboard.press("Escape")
+            except PlaywrightError:
+                pass
+        await self._browser.wait_settle(frame)
+
+    # ------------------------------------------------------------------
+    # Инструкция и подсказки вида задания
+    # ------------------------------------------------------------------
+
+    async def _maybe_open_instruction(self, frame: Frame, state: PageState) -> bool:
+        """Открыть «Подробную инструкцию» один раз для вида задания без сохранённой инструкции."""
+        pool = self._pool
+        if not READ_INSTRUCTIONS or pool is None or pool.has_instruction or pool.instruction_attempted:
+            return False
+        if state.dialog_open or state.loading:
+            return False
+        link = next((
+            e for e in state.visible_elements
+            if e.kind in (ElementKind.BUTTON, ElementKind.OTHER) and not e.occluded and not e.is_disabled
+            and e.container == "" and _INSTRUCTION_RE.search(e.text or "") and len(e.text) <= 60
+        ), None)
+        pool.instruction_attempted = True
+        if link is None:
+            return False
+        logger.info("📘 Открываю «%s», чтобы прочитать правила задания", link.label())
+        context = self._browser.context
+        before = set(context.pages)
+        outcome = await self._browser.click_element(frame, link)
+        if not outcome.ok:
+            return False
+        await self._browser.wait_settle(frame)
+        await asyncio.sleep(0.5)
+        # инструкция открылась в новой вкладке, а не диалогом
+        for page in [p for p in context.pages if p not in before]:
+            try:
+                await page.wait_for_load_state("load", timeout=15_000)
+                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+                self._knowledge.save_instruction(pool, text, f"вкладка {page.url[:80]}")
+            except PlaywrightError as exc:
+                logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
+            finally:
+                try:
+                    await page.close()
+                except PlaywrightError:
+                    pass
+            await self._browser.page.bring_to_front()
+        return True
+
+    async def _maybe_read_tooltips(self, frame: Frame, state: PageState) -> None:
+        """Прочитать подсказки «?» у вариантов ответа (наведение мыши) — один раз для вида."""
+        pool = self._pool
+        if not READ_TOOLTIPS or pool is None or pool.tooltips_attempted or state.dialog_open or state.loading:
+            return
+        pool.tooltips_attempted = True
+        try:
+            triggers = await frame.evaluate(_JS_TOOLTIP_TRIGGERS)
+        except PlaywrightError:
+            return
+        if not triggers:
+            return
+        by_uid = {e.uid: e for e in state.elements}
+        tips: dict[str, str] = {}
+        page = self._browser.page
+        started = time.monotonic()
+        for trig in triggers:
+            if time.monotonic() - started > 25:
+                break
+            row = by_uid.get(str(trig.get("uid")))
+            if row is None or row.aux:
+                continue
+            locator = frame.locator(f'[data-agent-tip="{trig["n"]}"]')
+            try:
+                await locator.scroll_into_view_if_needed(timeout=2_000)
+                box = await locator.bounding_box(timeout=1_000)
+                if not box:
+                    continue
+                await page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2, steps=4)
+                await asyncio.sleep(0.9)
+                text = str(await frame.evaluate(_JS_HINT_TEXT) or "").strip()
+                await page.mouse.move(5, 5, steps=2)
+                await asyncio.sleep(0.2)
+            except PlaywrightError:
+                continue
+            if text and normalize_text(text) != normalize_text(row.label()):
+                tips[row.label()] = text
+        if tips:
+            self._knowledge.save_tooltips(pool, tips)
 
     # ------------------------------------------------------------------
     # Сверка цели (автокоррекция v3)
@@ -331,26 +800,27 @@ class Agent:
     def _resolve_target(self, decision: LLMDecision, state: PageState) -> Optional[ParsedElement]:
         """Найти элемент, который имела в виду LLM.
 
-        v2: первое совпадение по тексту перетирало индекс ВСЕГДА — при дублях
-        («Другое» в каждой папке) выбиралась первая ветка, а частичное совпадение
-        цепляло контейнер с текстом всех детей. v3: индекс, подтверждённый текстом,
-        приоритетнее; поиск по тексту учитывает тип элемента, а при дублях берёт
-        ближайший к названному индексу и не запрещённый.
+        Индекс, подтверждённый текстом, приоритетнее; поиск по тексту учитывает тип
+        элемента, а при дублях берёт ближайший к названному индексу и не запрещённый.
+        Служебные элементы (плеер, карусель) и кнопки стоп-списка не выбираются никогда.
         """
         action = decision.action
-        if action == ActionType.SKIP:
+        if action in (ActionType.SKIP, ActionType.WEB):
             return None
         kinds = _ACTION_KINDS[action]
         fallback = _FALLBACK_KINDS.get(action, set())
         by_index = state.by_index(decision.target_index)
-        if by_index is not None and is_denied_button(by_index):
-            logger.warning("LLM указала кнопку из стоп-списка «%s» — игнорирую", by_index.label())
+        if by_index is not None and (is_denied_button(by_index) or by_index.aux):
+            logger.warning("LLM указала недоступный элемент «%s» — игнорирую", by_index.label())
             by_index = None
         text = _clean_target_text(decision.target_text or "")
 
+        def label(e: ParsedElement) -> str:
+            return e.text or e.placeholder or e.caption
+
         # 1. Индекс и текст согласованы
         if by_index is not None and by_index.kind in kinds and (
-            not text or _similarity(by_index.text or by_index.placeholder, text) >= 0.9
+            not text or _similarity(label(by_index), text) >= 0.9
         ):
             return by_index
 
@@ -358,8 +828,8 @@ class Agent:
         if text:
             for allowed in (kinds, fallback):
                 scored = [
-                    (_similarity(e.text or e.placeholder, text), e)
-                    for e in state.elements if e.kind in allowed and not is_denied_button(e)
+                    (_similarity(label(e), text), e)
+                    for e in state.elements if e.kind in allowed and not is_denied_button(e) and not e.aux
                 ]
                 good = [(s, e) for s, e in scored if s >= _MATCH_THRESHOLD]
                 if not good:
@@ -408,7 +878,9 @@ class Agent:
         mem = self._memory
         logger.info(
             "ВЫПОЛНЯЕМ: %s → %s conf=%.2f",
-            action.value, f"[{target.index}] «{target.label()}»" if target else "—", decision.confidence,
+            action.value,
+            f"[{target.index}] «{target.label()}»" if target else (decision.query or "—"),
+            decision.confidence,
         )
 
         if action == ActionType.SKIP:
@@ -417,6 +889,10 @@ class Agent:
             await asyncio.sleep(ACTION_WAIT * 2)
             return
         mem.consecutive_skips = 0
+
+        if action == ActionType.WEB:
+            await self._do_web(decision.query or decision.type_text or decision.target_text or "")
+            return
 
         if action == ActionType.SUBMIT:
             await self._do_submit(frame, state, target)
@@ -457,13 +933,18 @@ class Agent:
             return
         mem.repeated_forbidden = 0
 
+        # Ссылка на внешний сайт: переход увёл бы фрейм задания со страницы (задание
+        # потерялось бы) — открываем её во вкладке поиска и показываем модели как web
+        if action == ActionType.CLICK and target.href and self._is_external(target.href, frame):
+            await self._do_web(target.href, label=target.label())
+            return
+
         if action == ActionType.OPEN:
             if (target.kind in (ElementKind.FOLDER, ElementKind.DROPDOWN)
                     and target.folder_state == FolderState.OPEN
                     and mem.insist[(action, target.key)] == 0):
                 # Первый раз не кликаем (клик свернул бы папку), а подсказываем. Если модель
                 # настаивает — эвристика состояния могла ошибиться, выполняем.
-                # v2 в этом случае банил индекс — после сдвига индексов бан попадал на чужой элемент.
                 mem.insist[(action, target.key)] += 1
                 mem.add(action, target, result="уже раскрыта — её содержимое ниже, с бо́льшим отступом")
                 return
@@ -472,7 +953,6 @@ class Agent:
         elif action == ActionType.CLICK:
             if (target.is_selected and target.kind in (ElementKind.OPTION, ElementKind.FOLDER)
                     and target.choice_type != "checkbox" and mem.insist[(action, target.key)] == 0):
-                # v2 здесь сразу жал submit — при нескольких вопросах это отправляло неполный ответ.
                 # Checkbox можно снять сознательно, поэтому для него клик выполняется.
                 mem.insist[(action, target.key)] += 1
                 mem.add(action, target, result="уже ✓ВЫБРАН — повторный клик снял бы выбор; если всё готово — submit")
@@ -482,7 +962,7 @@ class Agent:
                 return
             outcome = await self._browser.click_element(frame, target)
         elif action == ActionType.TYPE:
-            if not decision.type_text:
+            if decision.type_text is None:
                 mem.add(action, target, result="✗ пустой type_text")
                 return
             outcome = await self._browser.type_into(frame, target, decision.type_text)
@@ -497,10 +977,46 @@ class Agent:
             mem.add(action, target, result=f"✗ {outcome.detail}")
             mem.mark_no_effect(action, target.key)
             return
-        note = f"«{decision.type_text[:60]}»" if action == ActionType.TYPE and decision.type_text else ""
+        note = f"«{decision.type_text[:80]}»" if action == ActionType.TYPE and decision.type_text else ""
         if outcome.method == "js":
             note = (note + " (js-клик)").strip()
         mem.expect(action, target, state, typed=decision.type_text, note=note)
+
+    @staticmethod
+    def _is_external(href: str, frame: Frame) -> bool:
+        try:
+            return urlsplit(href).netloc.lower() != urlsplit(frame.url).netloc.lower()
+        except ValueError:
+            return True
+
+    async def _do_web(self, query: str, *, label: str = "") -> None:
+        mem = self._memory
+        query = (query or "").strip()
+        if not WEB_RESEARCH:
+            mem.add(ActionType.WEB, None, note=f"«{query[:80]}»",
+                    result="✗ поиск в интернете отключён (WEB_RESEARCH=false)")
+            return
+        if not query:
+            mem.add(ActionType.WEB, None, result="✗ пустой query — укажи запрос или адрес")
+            return
+        key = normalize_text(query)
+        if sum(mem.web_queries.values()) >= MAX_WEB_PER_TASK:
+            mem.add(ActionType.WEB, None, note=f"«{query[:80]}»", result="⛔ лимит запросов на задание исчерпан")
+            return
+        if mem.web_queries[key] >= 2:
+            mem.repeated_forbidden += 1
+            mem.add(ActionType.WEB, None, note=f"«{query[:80]}»",
+                    result="⛔ этот запрос уже выполнялся — его результаты в разделе ВЕБ-ПОИСК")
+            return
+        mem.web_queries[key] += 1
+        result = await self._web.run(query)
+        mem.web_results.append(result)
+        note = f"«{label or query[:100]}»"
+        if result.error:
+            mem.add(ActionType.WEB, None, note=note, result=f"✗ {result.error}")
+        else:
+            mem.add(ActionType.WEB, None, note=note,
+                    result=f"✓ прочитано: {result.url[:160]} (результат #{len(mem.web_results)} в ВЕБ-ПОИСК)")
 
     # ------------------------------------------------------------------
     # Отправка ответа
@@ -516,7 +1032,8 @@ class Agent:
         return any(label == t or label.startswith(t + " ") for t in FINISH_BUTTON_TEXTS)
 
     def _find_finish_button(self, state: PageState) -> Optional[ParsedElement]:
-        buttons = [e for e in state.elements if e.kind == ElementKind.BUTTON and self._is_finish_button(e)]
+        buttons = [e for e in state.elements
+                   if e.kind == ElementKind.BUTTON and not e.aux and self._is_finish_button(e)]
         if not buttons:
             return None
 
@@ -529,18 +1046,41 @@ class Agent:
 
         return min(buttons, key=rank)
 
-    async def _do_submit(self, frame: Frame, state: PageState, target: Optional[ParsedElement]) -> None:
-        """Нажать кнопку отправки и убедиться, что задание действительно сменилось.
+    @staticmethod
+    def _describe_answer(state: PageState) -> str:
+        """Текущий ответ в форме: отмеченные варианты, значения полей и списков."""
+        parts: list[str] = []
+        for e in state.visible_elements:
+            if e.container in ("dialog", "popup", "toast"):
+                continue
+            if e.is_selected and e.kind in (ElementKind.OPTION, ElementKind.FOLDER):
+                parts.append(f"«{e.label()}»")
+            elif e.kind in (ElementKind.INPUT, ElementKind.DROPDOWN) and e.value:
+                parts.append(f"{e.text or e.placeholder or e.caption or 'поле'} = «{e.value[:120]}»")
+        return ", ".join(parts) or "(ничего не выбрано)"
 
-        v2 сбрасывал память сразу после клика, даже если форма не прошла
-        валидацию — агент начинал задание «с нуля» и зацикливался.
+    async def _do_submit(self, frame: Frame, state: PageState, target: Optional[ParsedElement]) -> None:
+        """Нажать кнопку отправки и дождаться исхода: следующее задание или ответ платформы.
+
+        v2 сбрасывал память сразу после клика, даже если форма не прошла валидацию.
+        v4: «Неверный ответ» (тренировка) — отмечается в памяти, превращается в урок
+        для этого вида заданий, модель исправляет ответ на следующем шаге.
         """
         mem = self._memory
+        # «Прослушайте звонок до конца»: запись доигрывается ДО нажатия
+        if AUDIO_PLAY_TO_END and any(not a.ended for a in state.audios):
+            fresh = await DomParser(frame).parse(quiet=True)
+            await self._media.wait_finished(frame, fresh)
+            state = await DomParser(frame).parse(quiet=True)
+            target = state.by_key(target.key) if target is not None else None
+
+        answer = self._describe_answer(state)
         if target is not None and target.kind == ElementKind.BUTTON and self._is_finish_button(target, strict=False):
             button: Optional[ParsedElement] = target
         else:
             button = self._find_finish_button(state)
 
+        errors_before = set(state.notice_texts("error", "warning"))
         if button is None:
             logger.info("SUBMIT: кнопка в снимке не найдена — поиск по тексту")
             if not await self._browser.click_by_text(frame, FINISH_BUTTON_TEXTS, deny=FINISH_DENY_SUBSTRINGS):
@@ -559,7 +1099,9 @@ class Agent:
                 mem.submit_failures += 1
                 return
 
-        changed, after = await self._wait_task_change(state.task_identifier)
+        mem.submits += 1
+        logger.info("SUBMIT: ответ %s", answer)
+        changed, after = await self._wait_task_change(errors_before)
         if changed:
             self._submitted = True
             self._tasks_done += 1
@@ -568,21 +1110,42 @@ class Agent:
             return
 
         mem.submit_failures += 1
+        errors = [t for t in (after.notice_texts("error", "warning") if after else []) if t not in errors_before]
+        hints = after.notice_texts("hint") if after else []
+        if any(_WRONG_RE.search(t) for t in errors):
+            self._wrong_total += 1
+            mem.wrong_answers.append(answer)
+            mem.feedback = errors + [f"Подсказка платформы: {h}" for h in hints]
+            logger.warning("❌ Платформа: неверный ответ (%s)%s", answer,
+                           f"; подсказка: {hints[0][:160]}" if hints else "")
+            if self._pool is not None:
+                lesson = f"Задание «{state.task_preview[:70]}»: ответ {answer} — неверно."
+                if hints:
+                    lesson += " Подсказка платформы: " + " ".join(hints)[:600]
+                self._knowledge.add_lesson(self._pool, lesson)
+            mem.add(ActionType.SUBMIT, button, result="✗ платформа: НЕВЕРНЫЙ ОТВЕТ — прочитай подсказку и исправь ответ")
+            return
+
         result = "✗ задание не сменилось"
-        if after is not None and after.alerts:
-            result += "; сообщения: " + " | ".join(after.alerts)
-        dialog = [e.label() for e in (after.elements if after else []) if e.container == "dialog"][:4]
+        if errors:
+            result += "; сообщения: " + " | ".join(errors)
+            mem.feedback = errors
+        dialog = [e.label() for e in (after.visible_elements if after else []) if e.container == "dialog"][:4]
         if dialog:
             result += "; открыт диалог: " + ", ".join(f"«{d}»" for d in dialog)
         logger.warning("SUBMIT: %s", result)
         mem.add(ActionType.SUBMIT, button, result=result)
 
-    async def _wait_task_change(self, old_id: str) -> tuple[bool, Optional[PageState]]:
-        """Поллинг отпечатка задания до SUBMIT_WAIT секунд."""
-        deadline = time.monotonic() + SUBMIT_WAIT
+    async def _wait_task_change(self, errors_before: set[str]) -> tuple[bool, Optional[PageState]]:
+        """Поллинг до SUBMIT_WAIT: сменилось задание (True) или платформа ответила
+        сообщением об ошибке на том же задании (False, снимок с сообщением)."""
+        identity = self._identity
+        started = time.monotonic()
+        deadline = started + SUBMIT_WAIT
+        hard_deadline = started + SUBMIT_WAIT + 30        # «вечный» лоадер не вешает агента
         last: Optional[PageState] = None
         missing = 0
-        while time.monotonic() < deadline:
+        while time.monotonic() < min(deadline, hard_deadline):
             await asyncio.sleep(0.6)
             frame = await self._browser.find_target_frame()
             if frame is None:
@@ -594,8 +1157,21 @@ class Agent:
                 last = await DomParser(frame).parse(quiet=True)
             except PlaywrightError:
                 continue                  # фрейм перезагружается
-            if last.task_identifier != old_id:
+            if last.loading:
+                deadline = max(deadline, time.monotonic() + 1.0)   # идёт отправка — ждём дольше
+                continue
+            if self._is_orders_list(last):
                 return True, last
+            if identity is None or not identity.same_task(TaskIdentity.of(last), submitted=True):
+                return True, last
+            fresh = [t for t in last.notice_texts("error", "warning") if t not in errors_before]
+            if fresh:
+                await asyncio.sleep(0.8)  # подсказка обычно появляется вместе с «Неверный ответ»
+                try:
+                    last = await DomParser(frame).parse(quiet=True)
+                except PlaywrightError:
+                    pass
+                return False, last
         return False, last
 
     # ------------------------------------------------------------------
@@ -603,28 +1179,27 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _maybe_click_start(self, frame: Frame, state: PageState) -> bool:
-        """«Приступить/ОК/Понятно» — без LLM, но только на заставке или в диалоге.
+        """«Начать/ОК/Понятно» — без LLM, но только на заставке или в диалоге.
 
         v2 искал эти слова на КАЖДОМ шаге до LLM, подстрокой и по любому элементу:
-        вариант ответа «Хорошо», кнопка «Далее» до ответа на вопрос или абзац
-        «Чтобы приступить…» нажимались бесконечно, LLM не получала управления.
+        вариант ответа «Хорошо» или кнопка «Далее» до ответа нажимались бесконечно.
         """
+        visible = state.visible_elements
         enabled_buttons = [
-            e for e in state.elements
+            e for e in visible
             if e.kind == ElementKind.BUTTON and not e.is_disabled and not e.occluded and not is_denied_button(e)
         ]
         dialog_buttons = [b for b in enabled_buttons if b.container == "dialog"]
         working = [
-            e for e in state.elements
+            e for e in visible
             if e.kind in (ElementKind.OPTION, ElementKind.FOLDER, ElementKind.INPUT, ElementKind.DROPDOWN)
-            and not e.is_disabled and not e.occluded and e.container != "dialog"
+            and not e.is_disabled and not e.occluded and e.container not in ("dialog", "popup")
         ]
         if working and not dialog_buttons:
             return False
 
         def start_like(b: ParsedElement) -> bool:
-            label = normalize_text(b.text)
-            return any(label == t or label.startswith(t + " ") for t in START_BUTTON_TEXTS)
+            return _label_matches(b.text, START_BUTTON_TEXTS)
 
         pool = dialog_buttons or enabled_buttons
         if not dialog_buttons and any(not start_like(b) for b in pool):
@@ -664,6 +1239,7 @@ class Agent:
             "Бюджет задания (%d шагов) исчерпан, ответ не найден. Нужна помощь человека: "
             "жду смены задания до %.0f с", MAX_STEPS_PER_TASK, MAX_IDLE_SECONDS,
         )
+        identity = self._identity
         deadline = time.monotonic() + MAX_IDLE_SECONDS
         while time.monotonic() < deadline:
             await asyncio.sleep(5.0)
@@ -676,7 +1252,7 @@ class Agent:
                 snapshot = await DomParser(current).parse(quiet=True)
             except PlaywrightError:
                 continue
-            if snapshot.task_identifier != self._task_identifier:
+            if identity is None or not identity.same_task(TaskIdentity.of(snapshot), submitted=True):
                 logger.info("Задание сменилось — продолжаю")
                 return StepResult.IDLE
         return StepResult.STOP
