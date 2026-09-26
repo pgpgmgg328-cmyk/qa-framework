@@ -21,6 +21,28 @@ async def main() -> None:
     await Agent().run()
 
 
+# Частые ошибки запуска → понятная подсказка вместо трассировки
+_STARTUP_HINTS = (
+    ("Executable doesn't exist",
+     "Браузер для Playwright не установлен. Выполните: python -m playwright install chromium "
+     "(или впишите в .env строку BROWSER_CHANNEL=chrome, чтобы использовать установленный Google Chrome)."),
+    ("distribution 'chrome' is not found",
+     "BROWSER_CHANNEL=chrome, но Google Chrome не найден. Установите Chrome или уберите эту строку из .env."),
+    ("ProcessSingleton",
+     "Профиль браузера уже открыт другим окном агента или записи. Закройте его и запустите снова."),
+    ("user data directory is already in use",
+     "Профиль браузера уже открыт другим окном агента или записи. Закройте его и запустите снова."),
+)
+
+
+def startup_hint(exc: BaseException) -> "str | None":
+    text = str(exc)
+    for marker, hint in _STARTUP_HINTS:
+        if marker in text:
+            return hint
+    return None
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Агент T-Work v3")
     parser.add_argument(
@@ -48,3 +70,9 @@ if __name__ == "__main__":
         # asyncio.run превращает Ctrl+C в KeyboardInterrupt снаружи корутины,
         # поэтому ловить его внутри main(), как в v2, бесполезно
         logger.info("Остановлен пользователем (Ctrl+C)")
+    except Exception as exc:  # noqa: BLE001 — известные ошибки запуска объясняем по-человечески
+        hint = startup_hint(exc)
+        if hint is None:
+            raise
+        logger.error(hint)
+        sys.exit(1)

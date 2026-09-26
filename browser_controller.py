@@ -75,6 +75,27 @@ class ActionOutcome:
     detail: str = ""
 
 
+_NAVIGATION_ERRORS = {
+    "ERR_NAME_NOT_RESOLVED": "сайт с таким адресом не найден (опечатка в адресе или нет доступа к DNS)",
+    "ERR_INTERNET_DISCONNECTED": "нет подключения к интернету",
+    "ERR_CONNECTION_REFUSED": "сайт отказал в соединении",
+    "ERR_CONNECTION_TIMED_OUT": "сайт не отвечает",
+    "ERR_TIMED_OUT": "сайт не отвечает",
+    "ERR_PROXY_CONNECTION_FAILED": "не удалось подключиться через прокси",
+    "ERR_TUNNEL_CONNECTION_FAILED": "не удалось подключиться через прокси или VPN",
+    "ERR_CERT": "проблема с сертификатом сайта",
+    "Timeout": "страница грузилась дольше 60 секунд",
+}
+
+
+def _navigation_hint(exc: BaseException) -> str:
+    text = str(exc)
+    for marker, hint in _NAVIGATION_ERRORS.items():
+        if marker in text:
+            return f"{hint} ({_short(exc)})"
+    return _short(exc)
+
+
 def is_connection_lost(exc: BaseException) -> bool:
     """Связь с браузером потеряна (закрыт, упал или завершён драйвер) — шаги повторять бессмысленно."""
     text = str(exc)
@@ -238,7 +259,17 @@ class BrowserController:
         if self._on_context is not None:
             await self._on_context(self._context)
         logger.info("Переход на %s", TARGET_URL)
-        await self._page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+        try:
+            await self._page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+        except PlaywrightError as exc:
+            # Не падаем: окно остаётся открытым, адрес можно ввести вручную,
+            # а агент/запись дождутся страницы с заданием
+            logger.error("Не удалось открыть TARGET_URL=%s — %s", TARGET_URL, _navigation_hint(exc))
+            logger.error(
+                "Впишите в .env в TARGET_URL адрес страницы, где вы открываете задания "
+                "(скопируйте его из адресной строки своего браузера). Сейчас этот адрес "
+                "можно ввести вручную в открывшемся окне."
+            )
         logger.info("Браузер готов")
 
     async def _headful_user_agent(self) -> Optional[str]:
@@ -267,7 +298,13 @@ class BrowserController:
                 logger.debug("Ошибка при остановке: %s", _short(exc))
 
     async def __aenter__(self) -> "BrowserController":
-        await self.start()
+        try:
+            await self.start()
+        except BaseException:
+            # __aexit__ при сбое __aenter__ не вызывается: без этого драйвер Playwright
+            # и браузер оставались висеть (на Windows — «I/O operation on closed pipe»)
+            await self.stop()
+            raise
         return self
 
     async def __aexit__(self, *_: object) -> None:
