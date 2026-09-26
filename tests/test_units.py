@@ -376,3 +376,26 @@ def test_page_hints_follow_the_page():
     assert "web" in hints(["Оцените фото"], el(0, "Да", **radio), context=DecisionContext(research=["…"]))
     # текст страницы и подписи элементов не склеиваются в одну строку
     assert "web" in hints(["Ответ изменить нельзя"], el(0, "Поиск по каталогу", ElementKind.BUTTON))
+
+
+def test_missing_key_message_names_the_file_problem(tmp_path, monkeypatch):
+    """Ключ не прочитан — сообщение говорит, что именно не так с файлом .env."""
+    import sys
+
+    import config
+
+    monkeypatch.setattr(config, "PROJECT_DIR", tmp_path)
+    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(sys, "platform", "win32")
+    example = tmp_path / ".env.example"
+    example.write_text("# образец\nOPENAI_API_KEY=\nLLM_MODEL=gpt-4o\n", encoding="utf-8")
+    assert "copy .env.example .env" in config._missing_key_hint()
+    example.write_text("# образец\nOPENAI_API_KEY=sk-test\n", encoding="utf-8")   # ключ вписан в образец
+    with pytest.raises(ValueError, match=r"ren \.env\.example \.env"):
+        config.validate_config()
+    (tmp_path / ".env.txt").write_text("OPENAI_API_KEY=sk-test\n", encoding="utf-8")  # Блокнот добавил .txt
+    assert "ren .env.txt .env" in config._missing_key_hint()
+    (tmp_path / ".env").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    hint = config._missing_key_hint()
+    assert "впишите ключ в файл" in hint and ".env.example" in hint
+    config.validate_config(require_llm=False)                                    # режим записи — без ключа

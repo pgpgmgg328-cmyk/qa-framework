@@ -8,7 +8,7 @@ import os
 import sys
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
@@ -241,13 +241,35 @@ WEB_TIMEOUT: float = float(os.getenv("WEB_TIMEOUT", "30"))
 MAX_WEB_PER_TASK: int = int(os.getenv("MAX_WEB_PER_TASK", "12"))  # запросов на одно задание
 
 
+def _missing_key_hint() -> str:
+    """Почему ключ не прочитан: частые ошибки с файлом .env (особенно в Windows)."""
+    win = sys.platform == "win32"
+    env, example = PROJECT_DIR / ".env", PROJECT_DIR / ".env.example"
+    try:
+        key_in_example = example.is_file() and bool((dotenv_values(example).get("OPENAI_API_KEY") or "").strip())
+    except (OSError, UnicodeDecodeError):
+        key_in_example = False
+    if env.is_file():
+        where = " (сейчас ключ вписан в .env.example — этот файл агент не читает)" if key_in_example else ""
+        return f"впишите ключ в файл {env} после OPENAI_API_KEY={where}"
+    for name in (".env.txt", "env", "env.txt"):
+        if (PROJECT_DIR / name).is_file():
+            return (f"файла .env нет, но есть «{name}» — Блокнот сохранил его под другим именем. "
+                    f"Выполните в папке агента: {'ren' if win else 'mv'} {name} .env")
+    if key_in_example:
+        return ("ключ вписан в .env.example, а агент читает только файл .env. Выполните в папке агента: "
+                f"{'ren' if win else 'mv'} .env.example .env")
+    return (f"файла .env нет в папке {PROJECT_DIR}. Выполните: {'copy' if win else 'cp'} .env.example .env "
+            "и впишите ключ в .env")
+
+
 def validate_config(*, require_llm: bool = True) -> None:
     """Проверить критичные параметры до запуска браузера (fail fast).
 
     require_llm=False — для режима записи: там LLM не вызывается и ключ не нужен."""
     problems: list[str] = []
     if require_llm and not OPENAI_API_KEY:
-        problems.append("OPENAI_API_KEY пуст — все запросы к LLM завершатся 401")
+        problems.append("OPENAI_API_KEY пуст — все запросы к LLM завершатся 401; " + _missing_key_hint())
     if LLM_VISION not in ("off", "auto", "image", "frame"):
         problems.append(f"LLM_VISION={LLM_VISION!r}: допустимо auto | frame | off")
     if "{query}" not in SEARCH_URL:
