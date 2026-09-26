@@ -49,6 +49,7 @@ from config import (
     FRAME_LOAD_WAIT,
     HEADLESS,
     MOUSE_MOVE_STEPS,
+    PAGE_ZOOM,
     PAGE_ZOOM_FACTOR,
     SETTLE_QUIET_MS,
     SETTLE_TIMEOUT_MS,
@@ -211,11 +212,12 @@ class BrowserController:
 
     async def start(self) -> None:
         zoom = PAGE_ZOOM_FACTOR
-        # «Отдалить» страницу = больше CSS-пикселей в том же окне
-        viewport = {"width": round(VIEWPORT_WIDTH / zoom), "height": round(VIEWPORT_HEIGHT / zoom)}
+        headed = not self._headless
         logger.info(
-            "Старт Playwright: headless=%s url=%s viewport=%s zoom=%.2f profile=%s",
-            self._headless, TARGET_URL, viewport, zoom, USER_DATA_DIR or "—",
+            "Старт Playwright: %s, url=%s, profile=%s",
+            "видимое окно на весь экран" if headed
+            else f"без окна, viewport {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}, масштаб {zoom:.0%}",
+            TARGET_URL, USER_DATA_DIR or "—",
         )
         self._playwright = await async_playwright().start()
         launch_opts: dict = {
@@ -231,13 +233,26 @@ class BrowserController:
         if BROWSER_CHANNEL:
             launch_opts["channel"] = BROWSER_CHANNEL
         context_opts: dict = {
-            "viewport": viewport,
             "ignore_https_errors": True,  # КРИТИЧНО: российские SSL
             "locale": "ru-RU",
             "timezone_id": "Europe/Moscow",
         }
-        if zoom != 1.0:
-            context_opts["device_scale_factor"] = zoom
+        if headed:
+            # Видимое окно ведёт себя как обычный браузер: страница занимает всё окно,
+            # подстраивается под его размер и масштаб Windows. С эмуляцией viewport страница
+            # рисовалась под фиксированный размер, и при масштабе Windows 125% не влезала
+            # в окно — съезжала вправо-вниз и обрезалась.
+            context_opts["no_viewport"] = True
+            launch_opts["args"].append("--start-maximized")
+            if zoom != 1.0:
+                logger.info("PAGE_ZOOM=%s действует только без окна (HEADLESS=true)", PAGE_ZOOM)
+        else:
+            # «Отдалить» страницу = больше CSS-пикселей в том же кадре
+            context_opts["viewport"] = {
+                "width": round(VIEWPORT_WIDTH / zoom), "height": round(VIEWPORT_HEIGHT / zoom),
+            }
+            if zoom != 1.0:
+                context_opts["device_scale_factor"] = zoom
         if USER_AGENT:
             context_opts["user_agent"] = USER_AGENT
 
@@ -470,7 +485,7 @@ class BrowserController:
                 box = await (await frame.frame_element()).bounding_box()
         except PlaywrightError:
             box = None
-        vp = page.viewport_size or {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+        vp = await self.viewport()
         if box:
             x = min(max(box["x"] + box["width"] / 2, 5), vp["width"] - 5)
             y = min(max(box["y"] + box["height"] / 2, 5), vp["height"] - 5)
@@ -658,6 +673,17 @@ class BrowserController:
     def page(self) -> Page:
         assert self._page is not None, "BrowserController не запущен"
         return self._page
+
+    async def viewport(self) -> dict:
+        """Размер видимой области страницы в CSS-пикселях. В видимом окне эмуляции нет
+        (page.viewport_size = None) — берём реальный размер окна."""
+        page = self.page
+        if page.viewport_size:
+            return page.viewport_size
+        try:
+            return await page.evaluate("() => ({ width: innerWidth, height: innerHeight })")
+        except PlaywrightError:
+            return {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
 
     @property
     def context(self) -> BrowserContext:

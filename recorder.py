@@ -35,7 +35,7 @@ from typing import Any, Optional
 from playwright.async_api import BrowserContext, Error as PlaywrightError, Frame, Page
 
 from browser_controller import BrowserController, is_connection_lost
-from config import PROJECT_DIR, VIEWPORT_HEIGHT, VIEWPORT_WIDTH
+from config import PROJECT_DIR
 from dom_parser import DomParser
 from models import DecisionContext, PageState
 from openrouter_connector import LLMConnector
@@ -286,7 +286,7 @@ class Recorder:
                 continue
             if box and box["width"] * box["height"] > best_area:
                 best, best_area = candidate, box["width"] * box["height"]
-        viewport = page.viewport_size or {"width": VIEWPORT_WIDTH, "height": VIEWPORT_HEIGHT}
+        viewport = await self._browser.viewport()
         if best is not None and best_area > 0.25 * viewport["width"] * viewport["height"]:
             return best, "iframe"
         return page.main_frame, "main"

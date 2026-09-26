@@ -108,10 +108,12 @@ USER_DATA_DIR: str = _project_path(os.getenv("USER_DATA_DIR", "").strip())
 # расходился с реальной версией браузера и заголовками Client Hints).
 USER_AGENT: str = os.getenv("USER_AGENT", "")
 
-# Масштаб страницы. В v3 реализован через device_scale_factor + увеличенный
-# viewport, а НЕ через document.body.style.zoom: CSS-zoom ломает координаты
-# Playwright внутри iframe — клики уходят мимо цели.
-PAGE_ZOOM: str = os.getenv("PAGE_ZOOM", "75%")
+# Масштаб страницы — только без окна (HEADLESS=true): device_scale_factor + увеличенный
+# viewport, а НЕ document.body.style.zoom (CSS-zoom ломает координаты Playwright внутри
+# iframe — клики уходят мимо цели). В видимом окне страница показывается как в обычном
+# браузере. Уменьшать страницу, чтобы «всё влезло», агенту не нужно: перед кликом он сам
+# прокручивает к элементу.
+PAGE_ZOOM: str = os.getenv("PAGE_ZOOM", "100%")
 PAGE_ZOOM_FACTOR: float = _parse_zoom(PAGE_ZOOM)
 
 # Задержки (секунды)
