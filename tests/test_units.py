@@ -399,3 +399,53 @@ def test_missing_key_message_names_the_file_problem(tmp_path, monkeypatch):
     hint = config._missing_key_hint()
     assert "впишите ключ в файл" in hint and ".env.example" in hint
     config.validate_config(require_llm=False)                                    # режим записи — без ключа
+
+
+def test_exam_mode_and_outcome_are_recognized():
+    from agent import _exam_outcome
+
+    exam = PageState(reader=["#### Экзамен", "1 из 2 заданий", "### Оценка качества выполненного клининга"])
+    training = PageState(reader=["#### Тренировка", "3 из 14 заданий"])
+    assert Agent._page_mode(exam) == "exam" and Agent._page_mode(training) == "training"
+    assert Agent._page_mode(PageState(reader=["### Выполните задание"])) == ""
+    assert _exam_outcome("Экзамен не пройден. Ошибок: 3") is False
+    assert _exam_outcome("Поздравляем! Экзамен сдан") is True
+    assert _exam_outcome("Тренировка завершена. Нажмите «Начать»") is None
+
+
+def test_inspection_tasks_get_single_photos_and_checklist_hint():
+    from media import MediaManager
+
+    photos = [MediaImage(n=i, src=f"https://x/{i}.jpg") for i in range(1, 13)]
+    cleaning = PageState(pool_title="Оценка качества выполненного клининга", images=photos,
+                         reader=["Оцени чистоту банкомата по фото."])
+    hotels = PageState(pool_title="Отели совпадают?", images=photos, reader=["Сравни фото отелей."])
+    jobs, captions = MediaManager._plan_jobs(cleaning, photos)
+    assert len(jobs) == 12 and all(j["kind"] == "single" for j in jobs)       # каждое фото отдельно
+    jobs, _ = MediaManager._plan_jobs(hotels, photos)
+    assert len(jobs) == 3 and all(j["kind"] == "grid" for j in jobs)          # сравнение — коллажами
+    hint = oc.HINTS["inspection"]
+    assert hint in oc.page_hints(cleaning, DecisionContext()) and oc.HINTS["photos"] not in oc.page_hints(
+        cleaning, DecisionContext())
+    assert "ФОТО n" in hint and "у основания" in hint
+
+
+def test_only_last_web_page_is_shown_in_full(tmp_path):
+    """В запрос к модели полностью идёт только последняя открытая страница поиска."""
+    from knowledge import KnowledgeBase
+    from media import MediaManager
+    from research import WebResult
+    from tests.helpers import run
+
+    agent = Agent.__new__(Agent)
+    agent._memory = TaskMemory()
+    agent._knowledge = KnowledgeBase(str(tmp_path))
+    agent._pool = None
+    agent._media = MediaManager(None, None)
+    agent._memory.web_results = [
+        WebResult(query="первый", url="https://yandex.ru/search/?text=a", title="Поиск", text="ТЕКСТ-1"),
+        WebResult(query="второй", url="https://yandex.ru/maps/org/x/1/", title="Карточка", text="ТЕКСТ-2"),
+    ]
+    context = run(agent._build_context(None, PageState()))
+    assert "ТЕКСТ-1" not in context.research[0] and "https://yandex.ru/search/?text=a" in context.research[0]
+    assert "ТЕКСТ-2" in context.research[1]

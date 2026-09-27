@@ -450,6 +450,71 @@ def test_skip_waits_for_page_change_instead_of_calling_model_again(tmp_path, mon
     assert 0.9 < times[1] - times[0] < 4.0          # дождался изменения, а не таймаута в 6 с
 
 
+def cleaning_answer(state: PageState, *, correct: bool) -> LLMDecision:
+    """Ответ в сценарии «клининг»: правильный по подсказке фикстуры или намеренно неверный."""
+    dirty = any("train-0" in i.src or "train-2" in i.src or "exam-0" in i.src for i in state.images)
+    right = "Выполнен некачественно" if dirty else "Выполнен качественно"
+    wrong = "Выполнен качественно" if dirty else "Выполнен некачественно"
+    return batch(click(find(state, right if correct else wrong)), submit(state))
+
+
+def test_exam_is_not_started_after_poor_training(tmp_path, monkeypatch):
+    """В тренировке с первого раза верно 1 из 3 — агент не нажимает «Начать» экзамена, не зовёт
+    модель на экзамене и пишет почему; статистика тренировки — в базе знаний."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("cleaning"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        first_task = any("train-0" in i.src for i in state.images)
+        return cleaning_answer(state, correct=bool(ctx.feedback) or first_task)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        task = asyncio.create_task(agent.run())
+        for _ in range(300):
+            if agent._exam_block_logged:
+                break
+            await asyncio.sleep(0.1)
+        calls = len(llm.calls)
+        await asyncio.sleep(2.0)                               # стоит на воротах, модель не зовёт
+        frame = await agent._browser.find_target_frame()
+        log = await frame.evaluate("() => window.__log")
+        await agent._browser.page.close()
+        await asyncio.wait_for(task, timeout=15)
+        return agent, llm, calls, log
+
+    agent, llm, calls, log = run(scenario())
+    assert agent._exam_block_logged and "exam:start" not in log
+    assert len(llm.calls) == calls
+    assert agent._order_train == [1, 3]
+    stats = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
+    assert "- с первого раза верно: 1 из 3" in stats
+    assert "- правильный ответ «Выполнен некачественно»: 2" in stats
+
+
+def test_exam_after_good_training_and_failed_result_is_recognized(tmp_path, monkeypatch):
+    """Тренировка без ошибок — экзамен агент начинает сам. Экзамен не сдан: окно «Экзамен не
+    пройден» агент распознаёт и закрывает без модели, итог — в логе заказа и в базе знаний."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("cleaning"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        exam = any("exam-" in i.src for i in state.images)
+        return cleaning_answer(state, correct=not exam)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._order_train == [3, 3] and agent._order_exam is False
+    assert len(llm.calls) == 5                                  # 3 тренировки + 2 экзамена, окно — без модели
+    assert all(not state.dialog_open for state, _ in llm.calls)
+    stats = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
+    assert "- с первого раза верно: 3 из 3" in stats and "- экзамен: не пройден" in stats
+    last_ctx = llm.calls[-1][1]
+    assert "Какие ответы в тренировке этого вида оказались правильными" in last_ctx.knowledge
+
+
 def test_media_manager_fetches_authorized_attachments(tmp_path):
     async def scenario():
         async with flex_frame("atm") as (context, page, frame):

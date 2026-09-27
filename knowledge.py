@@ -5,6 +5,8 @@
   ## Инструкция              — текст «Подробной инструкции» / диалога инструкции;
   ## Пояснения к вариантам   — подсказки «?» у вариантов ответа;
   ## Уроки из тренировки     — «Неверный ответ» + подсказка/правильный ответ платформы;
+  ## Статистика тренировки   — сколько ответов верны с первого раза, какие ответы оказывались
+                               правильными, результаты экзаменов;
   ## Заметки                 — ВАШИ правила: агент их не меняет и отдаёт модели.
 Всё это модель получает в каждом задании этого вида. Файл _general.md (если создать)
 модель получает во всех заданиях.
@@ -32,12 +34,13 @@ _SECTIONS = {
     "инструкция": "instruction",
     "пояснения к вариантам": "tooltips",
     "уроки из тренировки": "lessons",
+    "статистика тренировки": "stats",
     "заметки": "notes",
 }
 _MAX_LESSONS = 40
 _HEADER_HELP = (
-    "Файл ведёт агент: разделы «Инструкция», «Пояснения к вариантам» и «Уроки из тренировки» "
-    "он обновляет сам. Свои правила для этого вида заданий пишите в раздел «Заметки» — агент "
+    "Файл ведёт агент: разделы «Инструкция», «Пояснения к вариантам», «Уроки из тренировки» и "
+    "«Статистика тренировки» он обновляет сам. Свои правила для этого вида заданий пишите в раздел «Заметки» — агент "
     "его не меняет и передаёт модели в каждом таком задании."
 )
 
@@ -53,12 +56,24 @@ class PoolKnowledge:
     tooltips: dict[str, str] = field(default_factory=dict)
     lessons: list[str] = field(default_factory=list)
     notes: str = ""
+    # тренировка: заданий с первым ответом / из них верно с первого раза; какие ответы платформа
+    # приняла (правильные); результаты экзаменов
+    train_total: int = 0
+    train_first_ok: int = 0
+    train_answers: dict[str, int] = field(default_factory=dict)
+    exams: list[str] = field(default_factory=list)
     instruction_attempted: bool = False     # в этом запуске уже пытались открыть инструкцию
     tooltips_attempted: bool = False
 
     @property
     def has_instruction(self) -> bool:
         return len(self.instruction.strip()) >= 80
+
+    def training_line(self) -> str:
+        if not self.train_total:
+            return ""
+        return (f"с первого раза верно {self.train_first_ok} из {self.train_total} "
+                f"({self.train_first_ok * 100 // self.train_total}%)")
 
 
 class KnowledgeBase:
@@ -147,6 +162,24 @@ class KnowledgeBase:
         logger.info("📘 Пояснения к вариантам «%s»: %d", pool.title, len(fresh))
         self._write(pool)
 
+    def training_attempt(self, pool: PoolKnowledge, first_ok: bool) -> None:
+        """Первый ответ на задание тренировки: верен ли он."""
+        pool.train_total += 1
+        pool.train_first_ok += int(first_ok)
+        self._write(pool)
+
+    def training_answer(self, pool: PoolKnowledge, answer: str) -> None:
+        """Ответ, который платформа в тренировке приняла (правильный)."""
+        answer = re.sub(r"\s+", " ", answer).strip()
+        if answer:
+            pool.train_answers[answer] = pool.train_answers.get(answer, 0) + 1
+            self._write(pool)
+
+    def exam_result(self, pool: PoolKnowledge, passed: bool) -> None:
+        pool.exams.append(f"{'пройден' if passed else 'не пройден'} ({datetime.now():%Y-%m-%d %H:%M})")
+        pool.exams = pool.exams[-10:]
+        self._write(pool)
+
     def add_lesson(self, pool: PoolKnowledge, lesson: str) -> None:
         lesson = re.sub(r"\s+", " ", lesson).strip()
         if not lesson or any(normalize_text(lesson) == normalize_text(x) for x in pool.lessons):
@@ -174,6 +207,13 @@ class KnowledgeBase:
             if pool.tooltips:
                 parts.append("Пояснения к вариантам ответа (подсказки «?» на странице):\n"
                              + "\n".join(f"- «{k}»: {v}" for k, v in pool.tooltips.items()))
+            if pool.train_answers:
+                top = sorted(pool.train_answers.items(), key=lambda kv: -kv[1])[:6]
+                parts.append(
+                    "Какие ответы в тренировке этого вида оказались правильными (для калибровки, а не вместо "
+                    "проверки): " + "; ".join(f"{a} — {n}" for a, n in top)
+                    + (f". Твоя точность в тренировке: {pool.training_line()} — проверяй внимательнее."
+                       if pool.train_total and pool.train_first_ok < pool.train_total else "."))
             if pool.instruction:
                 parts.append("Инструкция к заданиям этого вида:\n" + pool.instruction)
         text = "\n\n".join(parts)
@@ -235,6 +275,11 @@ def _render(pool: PoolKnowledge) -> str:
     lines += [f"- «{k}»: {v}" for k, v in pool.tooltips.items()]
     lines += ["", "## Уроки из тренировки"]
     lines += [f"- {x}" for x in pool.lessons]
+    lines += ["", "## Статистика тренировки"]
+    if pool.train_total:
+        lines.append(f"- с первого раза верно: {pool.train_first_ok} из {pool.train_total}")
+    lines += [f"- правильный ответ {a}: {n}" for a, n in sorted(pool.train_answers.items(), key=lambda kv: -kv[1])]
+    lines += [f"- экзамен: {x}" for x in pool.exams]
     lines += ["", "## Заметки", pool.notes.strip(), ""]
     return "\n".join(lines)
 
@@ -271,5 +316,13 @@ def _parse(path: Path) -> PoolKnowledge:
         if m:
             pool.tooltips[m.group(1)] = m.group(2)
     pool.lessons = [ln.strip()[1:].strip() for ln in sections.get("lessons", []) if ln.strip().startswith("-")]
+    for line in sections.get("stats", []):
+        line = line.strip()
+        if m := re.match(r"^-\s*с первого раза верно:\s*(\d+)\s+из\s+(\d+)", line):
+            pool.train_first_ok, pool.train_total = int(m.group(1)), int(m.group(2))
+        elif m := re.match(r"^-\s*правильный ответ\s+(.+):\s*(\d+)$", line):
+            pool.train_answers[m.group(1).strip()] = int(m.group(2))
+        elif m := re.match(r"^-\s*экзамен:\s*(.+)$", line):
+            pool.exams.append(m.group(1).strip())
     pool.notes = _clean_block("\n".join(sections.get("notes", [])))
     return pool

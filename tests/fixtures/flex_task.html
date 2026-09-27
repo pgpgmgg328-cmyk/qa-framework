@@ -296,6 +296,12 @@ const SCENARIOS = {
       check: (f) => ({ ok: f.radio.join('|') === 'Да|Да', hint: '' }),
     }],
   },
+  // Как заказ из лога пользователя: тренировка с подсказками, потом экзамен без подсказок
+  cleaning: {
+    mode: 'Тренировка', title: 'Оценка качества выполненного клининга',
+    tasks: ['dirty', 'clean', 'dirty'].map((truth, i) => cleaningTask(truth, 'train-' + i)),
+    exam: { tasks: ['dirty', 'clean'].map((truth, i) => cleaningTask(truth, 'exam-' + i)) },
+  },
   atm: {
     mode: 'Тренировка', title: 'Проверка наличия фото поверхностей банкомата', instruction: true,
     tasks: [{
@@ -314,7 +320,21 @@ const SCENARIOS = {
 };
 
 // ------------------------------------------------------------------ движок
+function cleaningTask(truth, id) {
+  const answer = truth === 'dirty' ? 'Выполнен некачественно' : 'Выполнен качественно';
+  return {
+    render: () => [
+      text('Оцени чистоту банкомата после клининга по фото.'),
+      gallery([id + '-1', id + '-2']),
+      radios([{ text: 'Выполнен качественно' }, { text: 'Выполнен некачественно' }, { text: 'Фото некорректны' }]),
+    ],
+    check: (f) => ({ ok: f.radio[0] === answer, hint: truth === 'dirty' ? 'Загрязнение у основания фальш-двери' : '' }),
+  };
+}
 const sc = SCENARIOS[SCENARIO];
+let phase = 'training';          // тренировка → (окно «Экзамен … Начать») → экзамен
+let examWrong = 0;
+const tasksNow = () => (phase === 'exam' ? sc.exam.tasks : sc.tasks);
 let taskNo = 0;
 const clearFeedback = () => {
   $('#hint-slot').innerHTML = '';
@@ -325,9 +345,9 @@ const renderTask = () => {
   clearFeedback();
   $('#dropdowns').innerHTML = '';
   groupNo = 0;
-  const task = sc.tasks[taskNo];
-  $('#mode').textContent = sc.mode;
-  $('#progress').textContent = `${taskNo + 1} из ${sc.tasks.length} заданий`;
+  const task = tasksNow()[taskNo];
+  $('#mode').textContent = phase === 'exam' ? 'Экзамен' : sc.mode;
+  $('#progress').textContent = `${taskNo + 1} из ${tasksNow().length} заданий`;
   $('#title').textContent = sc.title;
   const f = $('#form');
   f.innerHTML = '';
@@ -339,7 +359,7 @@ const toast = (msg) => {
     h('span', {}, msg), h('button', { type: 'button', onclick: (e) => e.target.closest('tui-alert').remove() }, 'Закрыть'))));
 };
 $('#finish').addEventListener('click', () => {
-  const task = sc.tasks[taskNo];
+  const task = tasksNow()[taskNo];
   const f = form();
   const guard = task.guard ? task.guard() : '';
   const verdict = guard ? { ok: false, hint: '' } : task.check(f);
@@ -350,6 +370,13 @@ $('#finish').addEventListener('click', () => {
     loader.dataset.visible = 'false';
     clearFeedback();
     if (guard) { toast(guard); return; }
+    if (phase === 'exam') {                     // экзамен: без подсказок, итог — в конце
+      if (!verdict.ok) examWrong += 1;
+      taskNo += 1;
+      if (taskNo >= sc.exam.tasks.length) { openExamResult(); return; }
+      renderTask();
+      return;
+    }
     if (!verdict.ok) {
       if (verdict.hint) $('#hint-slot').append(h('tui-notification', { 'data-appearance': 'info', class: 'flex-common-view__hint' },
         h('span', {}, verdict.hint)));
@@ -359,7 +386,11 @@ $('#finish').addEventListener('click', () => {
       return;
     }
     taskNo += 1;
-    if (taskNo >= sc.tasks.length) { location.href = '/klecks/orders.html'; return; }
+    if (taskNo >= sc.tasks.length) {
+      if (sc.exam) { openExamStart(); return; }
+      location.href = '/klecks/orders.html';
+      return;
+    }
     renderTask();
   }, 350);
 });
@@ -393,6 +424,27 @@ const openInstruction = () => {
   }, 1200);
 };
 $('#instr').addEventListener('click', openInstruction);
+
+const openExamStart = () => {
+  const d = dialog(h('h2', {}, 'Экзамен'),
+    h('p', {}, `Тренировка завершена. Ответьте на ${sc.exam.tasks.length} задания без подсказок.`),
+    h('button', { type: 'button', onclick: () => {
+      window.__log.push('exam:start');
+      d.remove();
+      phase = 'exam';
+      taskNo = 0;
+      renderTask();
+    } }, 'Начать'));
+};
+const openExamResult = () => {
+  const d = dialog(h('h2', {}, examWrong ? 'Экзамен не пройден' : 'Экзамен пройден'),
+    h('p', {}, examWrong ? `Ошибок: ${examWrong}. Задания этого вида вам пока недоступны.` : 'Задания открыты.'),
+    h('button', { type: 'button', onclick: () => {
+      window.__log.push('exam:closed');
+      d.remove();
+      location.href = '/klecks/orders.html';
+    } }, 'К другим заданиям'));
+};
 
 // Заставка тренировки (как на T-Work): окно «Тренировка … [Начать]», а под ним ещё крутится
 // загрузка задания — она уходит, только когда нажата «Начать»

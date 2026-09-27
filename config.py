@@ -140,6 +140,9 @@ LLM_VISION: str = os.getenv("LLM_VISION", "auto").strip().lower()
 LLM_VISION_DETAIL: str = os.getenv("LLM_VISION_DETAIL", "high")   # low | high | auto
 VISION_MAX_IMAGES: int = int(os.getenv("VISION_MAX_IMAGES", "36"))   # больше — не отправляются
 VISION_SINGLE_MAX: int = int(os.getenv("VISION_SINGLE_MAX", "6"))    # до стольких фото — по одному
+# проверка качества по фото (клининг, грязь, дефекты): мелкие детали на коллаже не видны — до
+# стольких фото отправляются по одному, в хорошем разрешении (дороже, но точнее)
+VISION_DETAIL_MAX: int = int(os.getenv("VISION_DETAIL_MAX", "16"))
 VISION_IMAGE_SIDE: int = int(os.getenv("VISION_IMAGE_SIDE", "1024"))  # длинная сторона одиночного фото
 # ячейка коллажа, px: коллаж 2×2 — 774 px. gpt-4o всё равно уменьшает картинку до 768 px (и берёт
 # за неё столько же токенов), а новые модели считают токены по площади — коллаж в 1030 px был
@@ -273,6 +276,11 @@ STOP_ON_ORDERS_LIST: bool = _env_bool("STOP_ON_ORDERS_LIST", True)
 # остаётся открытым, агент ждёт — откройте следующий заказ, и он продолжит; закрыли окно
 # браузера или нажали Ctrl+C — агент завершает работу. true: сразу завершить работу (как в v4).
 CLOSE_BROWSER_WHEN_DONE: bool = _env_bool("CLOSE_BROWSER_WHEN_DONE", False)
+# Экзамен после тренировки агент начинает, только если в тренировке с первого раза верно не меньше
+# этой доли ответов (иначе экзамен, скорее всего, не будет сдан — денег за него не будет, а токены
+# уйдут). Решение принимается, когда в тренировке не меньше EXAM_MIN_TASKS заданий. 0 — не проверять
+EXAM_MIN_ACCURACY: float = float(os.getenv("EXAM_MIN_ACCURACY", "0.8"))
+EXAM_MIN_TASKS: int = int(os.getenv("EXAM_MIN_TASKS", "3"))
 # Признаки: в URL фрейма нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
 TASK_URL_KEYWORDS: tuple[str, ...] = _env_list("TASK_URL_KEYWORDS", ("/task",))
 ORDERS_BUTTON_TEXTS: tuple[str, ...] = _env_list("ORDERS_BUTTON_TEXTS", ("приступить",))
@@ -292,7 +300,7 @@ KNOWLEDGE_PROMPT_CHARS: int = int(os.getenv("KNOWLEDGE_PROMPT_CHARS", "9000"))
 WEB_RESEARCH: bool = _env_bool("WEB_RESEARCH", True)
 SEARCH_URL: str = os.getenv("SEARCH_URL", "https://yandex.ru/search/?text={query}")
 WEB_TEXT_LIMIT: int = int(os.getenv("WEB_TEXT_LIMIT", "6000"))    # символов текста страницы в промпте
-WEB_LINKS_LIMIT: int = int(os.getenv("WEB_LINKS_LIMIT", "40"))
+WEB_LINKS_LIMIT: int = int(os.getenv("WEB_LINKS_LIMIT", "25"))
 WEB_TIMEOUT: float = float(os.getenv("WEB_TIMEOUT", "30"))
 MAX_WEB_PER_TASK: int = int(os.getenv("MAX_WEB_PER_TASK", "12"))  # запросов на одно задание
 

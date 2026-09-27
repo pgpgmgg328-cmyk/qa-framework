@@ -32,9 +32,10 @@ from config import (
     VISION_CELL,
     VISION_IMAGE_SIDE,
     VISION_MAX_IMAGES,
+    VISION_DETAIL_MAX,
     VISION_SINGLE_MAX,
 )
-from dom_parser import photo_groups
+from dom_parser import inspection_task, photo_groups
 from models import MediaAudio, MediaImage, PageState, VisionImage
 
 logger = logging.getLogger("twork.media")
@@ -248,12 +249,14 @@ class MediaManager:
     @staticmethod
     def _plan_jobs(state: PageState, images: list[MediaImage]) -> tuple[list[dict], list[str]]:
         """До VISION_SINGLE_MAX фото — по одному (детали: грязь, надписи на экране);
-        больше — коллажами 2×2 (до 16 фото) или 3×3, не смешивая блоки фото."""
+        больше — коллажами 2×2 (до 16 фото) или 3×3, не смешивая блоки фото.
+        Проверка качества по фото (клининг, грязь, дефекты): до VISION_DETAIL_MAX фото — по одному:
+        на коллаже фото занимает ~390 px, и пыль, остатки скотча, грязь у основания не видны."""
         def item(img: MediaImage) -> dict:
             return {"n": img.n, "uid": img.uid, "src": img.src}
 
         wanted = {i.n for i in images}
-        if len(images) <= VISION_SINGLE_MAX:
+        if len(images) <= (VISION_DETAIL_MAX if inspection_task(state) else VISION_SINGLE_MAX):
             jobs = [{"kind": "single", "items": [item(i)], "maxSide": VISION_IMAGE_SIDE, "quality": 0.85}
                     for i in images]
             return jobs, [f"ФОТО {i.n}" for i in images]

@@ -40,6 +40,8 @@ from config import (
     BATCH_ACTIONS,
     CAPTCHA_TIMEOUT,
     CLOSE_BROWSER_WHEN_DONE,
+    EXAM_MIN_ACCURACY,
+    EXAM_MIN_TASKS,
     DIALOG_CLOSE_TEXTS,
     EXIT_CANCEL_TEXTS,
     FINISH_BUTTON_TEXTS,
@@ -118,6 +120,21 @@ _FALLBACK_KINDS: dict[ActionType, set[ElementKind]] = {
 }
 _MATCH_THRESHOLD = 0.85
 _WRONG_RE = re.compile(r"(неверн|неправильн|ошибк[аи] в ответе|incorrect|wrong)", re.IGNORECASE)
+# Режим задания на панели страницы: «Тренировка» (есть подсказки) или «Экзамен» (без подсказок)
+_MODE_RE = re.compile(r"^#*\s*(тренировка|экзамен)\s*$", re.IGNORECASE)
+_EXAM_FAILED_RE = re.compile(r"(не\s+(пройден|сдан|прош[её]л|прошли|удалось)|провал)", re.IGNORECASE)
+_EXAM_PASSED_RE = re.compile(r"(пройден|сдан|прош[её]л|прошли|поздравля)", re.IGNORECASE)
+
+
+def _exam_outcome(text: str) -> Optional[bool]:
+    """Окно с итогом экзамена: False — «Экзамен не пройден», True — пройден, None — не итог."""
+    if "экзамен" not in text.lower():
+        return None
+    if _EXAM_FAILED_RE.search(text):
+        return False
+    if _EXAM_PASSED_RE.search(text):
+        return True
+    return None
 _INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
 
 # Всплывающее окно на ГЛАВНОЙ странице сайта (новости, объявления) поверх фрейма задания
@@ -273,6 +290,9 @@ class Agent:
         self._wrong_total = 0
         self._seen_task = False             # агент уже был в задании (для итога заказа на списке заказов)
         self._order_mark: Optional[tuple] = None   # начало заказа: (заданий, ошибок, токены, время)
+        self._order_train = [0, 0]          # тренировка в этом заказе: верно с первого раза, всего
+        self._order_exam: Optional[bool] = None    # итог экзамена в этом заказе
+        self._exam_block_logged: set[str] = set()
         self._captcha_suppressed_until = 0.0
         self._last_idle_log = 0.0
         self._popup_attempts: dict[str, int] = {}
@@ -299,7 +319,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.2 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.3 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -409,7 +429,11 @@ class Agent:
         if handled is not None:
             return handled
 
-        # 5а. Заставка «Тренировка … [Начать]» — сразу. Под ней часто ещё крутится загрузка
+        # 5а. Экзамен после плохой тренировки не начинаем и не решаем (см. EXAM_MIN_ACCURACY)
+        if await self._exam_gate(state):
+            return StepResult.WAITING
+
+        # 5б. Заставка «Тренировка … [Начать]» — сразу. Под ней часто ещё крутится загрузка
         # задания (и не уходит, пока не нажата «Начать»): раньше агент сначала ждал её до ~25 с,
         # и человек успевал нажать «Начать» сам
         if state.dialog_open and await self._maybe_click_start(frame, state):
@@ -491,12 +515,14 @@ class Agent:
             self._seen_task = False
             self._log_task_usage()
             self._log_order_summary()
+            done = ("❌ Экзамен не пройден — платформа вернула на список заказов" if self._order_exam is False
+                    else "✅ Платформа вернула на список заказов — заказ выполнен")
             if STOP_ON_ORDERS_LIST and CLOSE_BROWSER_WHEN_DONE:
-                logger.info("✅ Платформа вернула на список заказов — заказ выполнен, агент завершает работу")
+                logger.info("%s, агент завершает работу", done)
                 return StepResult.STOP
-            logger.info("✅ Платформа вернула на список заказов — заказ выполнен. Браузер остаётся открытым: "
-                        "откройте следующий заказ («Приступить») — агент продолжит сам. Закончить работу — "
-                        "закройте окно браузера или нажмите Ctrl+C в этом окне.")
+            logger.info("%s. Браузер остаётся открытым: откройте следующий заказ («Приступить») — агент "
+                        "продолжит сам. Закончить работу — закройте окно браузера или нажмите Ctrl+C в этом окне.",
+                        done)
             self._last_idle_log = time.monotonic()
         else:
             self._log_idle("Открыт список заказов. Выберите заказ и нажмите «Приступить» — агент начнёт решать "
@@ -508,6 +534,78 @@ class Agent:
         usage = getattr(self._llm, "usage", None)
         self._order_mark = (self._tasks_done, self._wrong_total,
                             usage.snapshot() if usage is not None else None, time.monotonic())
+        self._order_train = [0, 0]
+        self._order_exam = None
+
+    # ------------------------------------------------------------------
+    # Тренировка и экзамен
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _page_mode(state: PageState) -> str:
+        """«training» / «exam» по панели режима страницы, «» — не видно."""
+        for line in _plain_text(state.reader).splitlines()[:15]:
+            m = _MODE_RE.match(line.strip())
+            if m:
+                return "exam" if m.group(1).lower() == "экзамен" else "training"
+        return ""
+
+    def _record_training(self, mode: str, *, accepted: bool, answer: str) -> None:
+        """Первый ответ на задание тренировки: верен ли он; принятый ответ — правильный.
+        Вне тренировки правильность неизвестна (экзамен подсказок не даёт)."""
+        pool, mem = self._pool, self._memory
+        if mode == "exam" or (accepted and mode != "training"):
+            return
+        if accepted:
+            if not mem.wrong_answers:
+                self._order_train[0] += 1
+                self._order_train[1] += 1
+                if pool is not None:
+                    self._knowledge.training_attempt(pool, True)
+            if pool is not None and " = «" not in answer and answer.startswith("«"):
+                self._knowledge.training_answer(pool, answer)
+        elif len(mem.wrong_answers) == 1:
+            self._order_train[1] += 1
+            if pool is not None:
+                self._knowledge.training_attempt(pool, False)
+
+    def _training_accuracy(self) -> Optional[tuple[int, int]]:
+        """Точность тренировки для решения об экзамене: этого заказа, иначе — вида заданий."""
+        ok, total = self._order_train
+        if total >= EXAM_MIN_TASKS:
+            return ok, total
+        pool = self._pool
+        if pool is not None and pool.train_total >= EXAM_MIN_TASKS:
+            return pool.train_first_ok, pool.train_total
+        return None
+
+    async def _exam_gate(self, state: PageState) -> bool:
+        """Экзамен после тренировки с низкой точностью не начинать (окно «Экзамен … Начать»)
+        и не решать (страница в режиме «Экзамен») — человек решает сам или меняет настройку."""
+        if EXAM_MIN_ACCURACY <= 0:
+            return False
+        dialog_text = normalize_text(_plain_text(state.dialog_lines))
+        dialog_buttons = [e for e in state.visible_elements
+                          if e.container == "dialog" and e.kind == ElementKind.BUTTON]
+        exam_start = (state.dialog_open and "экзамен" in dialog_text
+                      and any(_label_matches(b.text, START_BUTTON_TEXTS) for b in dialog_buttons))
+        if not exam_start and self._page_mode(state) != "exam":
+            return False
+        accuracy = self._training_accuracy()
+        if accuracy is None or accuracy[0] >= EXAM_MIN_ACCURACY * accuracy[1]:
+            return False
+        key = self._pool.key if self._pool is not None else ""
+        if key not in self._exam_block_logged:
+            self._exam_block_logged.add(key)
+            ok, total = accuracy
+            logger.warning(
+                "⛔ ЭКЗАМЕН НЕ НАЧИНАЮ: в тренировке с первого раза верно %d из %d (%d%%), а нужно не меньше "
+                "%d%%. С такой точностью экзамен, скорее всего, не будет сдан — денег за него не будет, а "
+                "токены уйдут. Пройдите экзамен сами (агент не мешает и ждёт) или, чтобы агент решал его, "
+                "поставьте в .env EXAM_MIN_ACCURACY=0",
+                ok, total, ok * 100 // total, round(EXAM_MIN_ACCURACY * 100))
+        await asyncio.sleep(FRAME_LOAD_WAIT)
+        return True
 
     def _log_order_summary(self) -> None:
         if self._order_mark is None:
@@ -516,6 +614,11 @@ class Agent:
         self._order_mark = None
         line = (f"ИТОГ ЗАКАЗА: отправлено заданий={self._tasks_done - tasks0}, из них неверных="
                 f"{self._wrong_total - wrong0}, время {(time.monotonic() - started) / 60:.1f} мин")
+        ok, total = self._order_train
+        if total:
+            line += f"; тренировка: с первого раза верно {ok} из {total}"
+        if self._order_exam is not None:
+            line += f"; экзамен: {'пройден' if self._order_exam else 'НЕ ПРОЙДЕН'}"
         usage = getattr(self._llm, "usage", None)
         if usage is not None and usage0 is not None:
             spent = usage.since(usage0)
@@ -635,8 +738,9 @@ class Agent:
             image_b64 = await self._frame_screenshot(frame, state)
 
         transcripts = await self._media.transcripts(state) if state.audios else []
+        # полностью — только последняя открытая страница; факты с прежних модель переносит в plan
         research = [
-            r.render(i + 1, full=i >= len(mem.web_results) - 2) for i, r in enumerate(mem.web_results)
+            r.render(i + 1, full=i == len(mem.web_results) - 1) for i, r in enumerate(mem.web_results)
         ]
         return DecisionContext(
             history=mem.history_lines(LLM_HISTORY_SIZE),
@@ -689,6 +793,26 @@ class Agent:
         # Заставка «Тренировка … изучите инструкцию … [Начать]» — не инструкция: её
         # закрывает локальный флоу кнопкой «Начать».
         start_button = any(_label_matches(b.text, START_BUTTON_TEXTS) for b in buttons)
+
+        # «Экзамен не пройден / пройден» — записать итог и закрыть окно без модели
+        outcome = None if start_button else _exam_outcome(text)
+        if outcome is not None and buttons:
+            key = "exam:" + normalize_text(text)[:80]
+            if self._memory.dialog_attempts[key] < 3:
+                if self._memory.dialog_attempts[key] == 0:
+                    self._order_exam = outcome
+                    if self._pool is not None:
+                        self._knowledge.exam_result(self._pool, outcome)
+                    if outcome:
+                        logger.info("✅ ЭКЗАМЕН ПРОЙДЕН: «%s»", text[:120])
+                    else:
+                        logger.warning("❌ ЭКЗАМЕН НЕ ПРОЙДЕН: «%s»", text[:120])
+                self._memory.dialog_attempts[key] += 1
+                button = next((b for b in buttons if _label_matches(b.text, DIALOG_CLOSE_TEXTS)), buttons[0])
+                logger.info("Закрываю окно итога экзамена кнопкой «%s»", button.label())
+                await self._browser.click_element(frame, button)
+                await self._browser.wait_settle(frame)
+                return StepResult.ACTED
         size = len(re.sub(r"\s+", "", text))
         instruction = (state.dialog_loading or state.dialog_frames > 0 or size > 700
                        or (bool(_INSTRUCTION_RE.search(text[:120])) and not start_button))
@@ -1305,6 +1429,7 @@ class Agent:
             target = state.by_key(target.key) if target is not None else None
 
         answer = self._describe_answer(state)
+        mode = self._page_mode(state)
         if target is not None and target.kind == ElementKind.BUTTON and self._is_finish_button(target, strict=False):
             button: Optional[ParsedElement] = target
         else:
@@ -1336,6 +1461,7 @@ class Agent:
             self._submitted = True
             self._tasks_done += 1
             logger.info("✅ ЗАДАНИЕ ОТПРАВЛЕНО (всего: %d)", self._tasks_done)
+            self._record_training(mode, accepted=True, answer=answer)
             mem.add(ActionType.SUBMIT, button, result="✓ отправлено, задание сменилось")
             return
 
@@ -1345,6 +1471,7 @@ class Agent:
         if any(_WRONG_RE.search(t) for t in errors):
             self._wrong_total += 1
             mem.wrong_answers.append(answer)
+            self._record_training(mode, accepted=False, answer=answer)
             mem.feedback = errors + [f"Подсказка платформы: {h}" for h in hints]
             logger.warning("❌ Платформа: неверный ответ (%s)%s", answer,
                            f"; подсказка: {hints[0][:160]}" if hints else "")
@@ -1363,6 +1490,9 @@ class Agent:
         dialog = [e.label() for e in (after.visible_elements if after else []) if e.container == "dialog"][:4]
         if dialog:
             result += "; открыт диалог: " + ", ".join(f"«{d}»" for d in dialog)
+            if not errors and any(_label_matches(d, START_BUTTON_TEXTS) for d in dialog):
+                # последнее задание тренировки: вместо следующего задания — окно «…экзамен / Начать»
+                self._record_training(mode, accepted=True, answer=answer)
         logger.warning("SUBMIT: %s", result)
         mem.add(ActionType.SUBMIT, button, result=result)
 

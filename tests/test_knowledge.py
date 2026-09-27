@@ -83,3 +83,22 @@ def test_search_urls():
                          text="строка 1\nстрока 2", links=[("X", "https://x.example/")]).render(1, full=True)
     assert "Адрес без параметров: https://yandex.ru/maps/org/x/1/" in rendered
     assert "   | строка 2" in rendered and "   - X → https://x.example/" in rendered
+
+
+def test_training_stats_and_exam_results_survive_restart(tmp_path):
+    kb = KnowledgeBase(str(tmp_path))
+    pool = kb.for_state(pool_state())
+    kb.training_attempt(pool, False)
+    kb.training_attempt(pool, True)
+    kb.training_answer(pool, "«Выполнен некачественно»")
+    kb.training_answer(pool, "«Выполнен некачественно»")
+    kb.training_answer(pool, "«Выполнен качественно»")
+    kb.exam_result(pool, False)
+
+    again = KnowledgeBase(str(tmp_path)).for_state(pool_state())
+    assert (again.train_first_ok, again.train_total) == (1, 2)
+    assert again.train_answers == {"«Выполнен некачественно»": 2, "«Выполнен качественно»": 1}
+    assert again.exams and again.exams[0].startswith("не пройден")
+    text = KnowledgeBase(str(tmp_path)).prompt_text(again)
+    assert "«Выполнен некачественно» — 2; «Выполнен качественно» — 1" in text
+    assert "с первого раза верно 1 из 2 (50%)" in text

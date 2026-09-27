@@ -85,6 +85,11 @@ class WebResult:
         if self.title:
             lines.append(f"   Заголовок: {self.title}")
         if not full:
+            # прежняя страница: без текста, но с главными ссылками — вдруг понадобится другой результат
+            key = sorted(self.links, key=lambda link: not re.search(r"/maps/org/|otzovik\.com/reviews", link[1]))[:6]
+            if key:
+                lines.append("   Главные ссылки:")
+                lines += [f"   - {t} → {h}" for t, h in key]
             return "\n".join(lines)
         if self.text:
             lines.append("   Текст страницы:")

@@ -1545,6 +1545,17 @@ def _content_headings(headings: list[str]) -> list[str]:
     return [h for h in headings[first:] if not _PANEL_HEADINGS.match(_heading_text(h))]
 
 
+# Проверка качества по фото: мелкие детали (пыль, скотч, пятна) решают ответ
+_INSPECTION_RE = re.compile(r"(качеств|чистот|грязн|загрязн|клининг|уборк|дефект|поврежден)", re.IGNORECASE)
+
+
+def inspection_task(state: PageState) -> bool:
+    """Задание — проверка качества по фото (нужны фото в хорошем разрешении и осмотр каждого)."""
+    if not state.images:
+        return False
+    return bool(_INSPECTION_RE.search(f"{state.pool_title}\n{_plain_text(state.reader)[:3000]}"))
+
+
 def _plain_text(lines: list[str]) -> str:
     """Текст страницы без элементов, фото и уведомлений (для логов, отпечатка, превью)."""
     out = []
