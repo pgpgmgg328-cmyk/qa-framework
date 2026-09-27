@@ -481,6 +481,7 @@ class DecisionContext:
     plan:        str = ""                                  # план модели с прошлого шага
     feedback:    list[str] = field(default_factory=list)   # «Неверный ответ» после отправки, подсказки
     wrong_answers: list[str] = field(default_factory=list)  # ответы, признанные неверными
+    model:       str = ""                                  # модель для этого вида заданий (лестница)
 
 
 @dataclass

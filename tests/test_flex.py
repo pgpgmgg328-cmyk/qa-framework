@@ -515,6 +515,55 @@ def test_exam_after_good_training_and_failed_result_is_recognized(tmp_path, monk
     assert "Какие ответы в тренировке этого вида оказались правильными" in last_ctx.knowledge
 
 
+def test_model_ladder_moves_task_type_to_stronger_model(tmp_path, monkeypatch):
+    """Лестница моделей: дешёвая модель ошиблась в первом же задании тренировки — порог 80% из
+    3 заданий ей уже не набрать, вид заданий сразу переходит к следующей модели (она исправляет
+    ответ, решает остальную тренировку и экзамен); выбор сохраняется в базе знаний."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("cleaning"))
+    monkeypatch.setattr(agent_module, "LLM_MODELS", ("cheap", "strong"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        return cleaning_answer(state, correct=ctx.model == "strong" or bool(ctx.feedback))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert [ctx.model for _, ctx in llm.calls] == ["cheap"] + ["strong"] * 5
+    assert agent._order_train == [2, 3] and agent._order_exam is True
+    stats = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
+    assert "- текущая модель: strong" in stats and "- модель cheap: с первого раза верно 0 из 1" in stats
+    assert "- модель strong: с первого раза верно 2 из 2" in stats and "- экзамен: пройден" in stats
+
+
+def test_failed_exam_moves_task_type_to_next_model_and_pinned_model_stays(tmp_path, monkeypatch):
+    """Экзамен не сдан — следующий заказ этого вида решает следующая модель лестницы. Модель,
+    закреплённую в «Заметках» строкой «Модель агента: …», агент не меняет."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("cleaning"))
+    monkeypatch.setattr(agent_module, "LLM_MODELS", ("cheap", "mid", "strong"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        return cleaning_answer(state, correct=not any("exam-" in i.src for i in state.images))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert {ctx.model for _, ctx in llm.calls} == {"cheap"} and agent._order_exam is False
+    path = next((tmp_path / "knowledge").glob("*.md"))
+    stats = path.read_text(encoding="utf-8")
+    assert "- текущая модель: mid" in stats and "- модель cheap: с первого раза верно 3 из 3" in stats
+
+    path.write_text(stats.replace("## Заметки\n", "## Заметки\nМодель агента: strong\n"), encoding="utf-8")
+    agent, llm = run(scenario())
+    assert {ctx.model for _, ctx in llm.calls} == {"strong"} and agent._order_exam is False
+    assert "- текущая модель: mid" in path.read_text(encoding="utf-8")
+
+
 def test_media_manager_fetches_authorized_attachments(tmp_path):
     async def scenario():
         async with flex_frame("atm") as (context, page, frame):

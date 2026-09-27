@@ -449,3 +449,39 @@ def test_only_last_web_page_is_shown_in_full(tmp_path):
     context = run(agent._build_context(None, PageState()))
     assert "ТЕКСТ-1" not in context.research[0] and "https://yandex.ru/search/?text=a" in context.research[0]
     assert "ТЕКСТ-2" in context.research[1]
+
+
+class _NoLLM:
+    """Заглушка модели: для правил лестницы и экзамена вызовы модели не нужны."""
+
+
+def test_exam_gate_and_ladder_decide_early_on_few_training_tasks(tmp_path, monkeypatch):
+    """Порог 80% из 3 заданий: одна ошибка в первых заданиях — порог уже недостижим (экзамен
+    не начинать / перейти к следующей модели); без ошибок — ждать данных."""
+    import agent as agent_module
+    from knowledge import KnowledgeBase
+
+    kb = KnowledgeBase(str(tmp_path))
+    agent = Agent(llm=_NoLLM(), knowledge=kb)
+    agent._pool = kb.for_state(PageState(pool_key="k1", pool_title="Клининг", pool_signature=["h:клининг"]))
+
+    agent._order_train = [1, 1]
+    assert agent._training_accuracy() is None                       # 1 из 1: 3 из 3 ещё возможно
+    agent._order_train = [1, 2]
+    assert agent._training_accuracy() == (1, 2)                     # максимум 2 из 3 < 80%
+    agent._order_train = [4, 5]
+    assert agent._training_accuracy() == (4, 5)
+
+    monkeypatch.setattr(agent_module, "LLM_MODELS", ("cheap", "mid", "strong"))
+    pool = agent._pool
+    kb.model_attempt(pool, "cheap", True)
+    agent._climb_ladder(pool, "cheap")
+    assert agent._model_for(pool) == "cheap"
+    kb.model_attempt(pool, "cheap", False)
+    agent._climb_ladder(pool, "cheap")
+    assert agent._model_for(pool) == "mid" and agent._training_accuracy() is None   # у mid данных нет
+    agent._climb_ladder(pool, "mid", reason="экзамен не пройден")
+    agent._climb_ladder(pool, "strong", reason="экзамен не пройден")          # выше некуда
+    assert agent._model_for(pool) == "strong"
+    monkeypatch.setattr(agent_module, "LLM_MODELS", ("other-cheap", "other-strong"))
+    assert agent._model_for(pool) == "other-cheap"                  # лестницу в .env поменяли

@@ -37,6 +37,7 @@ from config import (
     LLM_MAX_RETRIES,
     LLM_MAX_TOKENS,
     LLM_MODEL,
+    LLM_MODELS,
     LLM_PRICE,
     LLM_PRICE_CURRENCY,
     LLM_REASONING_EFFORT,
@@ -47,6 +48,7 @@ from config import (
     LLM_VISION_DETAIL,
     OPENAI_API_KEY,
     OPENAI_BASE_URL,
+    OPENROUTER,
     OPENROUTER_REFERER,
     TRANSCRIBE_LANGUAGE,
     TRANSCRIBE_MODELS,
@@ -317,19 +319,40 @@ def parse_price(text: str) -> Optional[tuple[float, float, float]]:
     return tuple(values) if len(values) == 3 else None  # type: ignore[return-value]
 
 
+# Цены, загруженные при запуске со списка моделей прокси (OpenRouter отдаёт их в /models)
+LIVE_PRICES: dict[str, tuple[float, float, float]] = {}
+
+
 def model_price(model: str) -> Optional[tuple[float, float, float]]:
     """Цена модели для оценки стоимости. Свои цены (LLM_PRICE) — для основной модели и
-    модели перепроверки (LLM_CHECK_PRICE); иначе прайс OpenAI для известных моделей."""
+    модели перепроверки (LLM_CHECK_PRICE); иначе цены OpenRouter, иначе прайс OpenAI."""
     if LLM_PRICE:
         if model == LLM_MODEL:
             return parse_price(LLM_PRICE)
         return parse_price(LLM_CHECK_PRICE) if LLM_CHECK_PRICE and model == LLM_CHECK_MODEL else None
-    return OPENAI_PRICES.get(_model_name(model))
+    return LIVE_PRICES.get(model) or OPENAI_PRICES.get(_model_name(model))
+
+
+def _live_price(pricing: Any) -> Optional[tuple[float, float, float]]:
+    """pricing OpenRouter ($ за токен, строками) → $ за 1 млн: вход, вход из кэша, выход."""
+    if not isinstance(pricing, dict):
+        return None
+    try:
+        prompt = round(float(pricing.get("prompt") or 0) * 1_000_000, 6)
+        completion = round(float(pricing.get("completion") or 0) * 1_000_000, 6)
+        cached = round(float(pricing.get("input_cache_read") or 0) * 1_000_000, 6) or prompt
+    except (TypeError, ValueError):
+        return None
+    return (prompt, cached, completion) if prompt or completion else None
 
 
 def _money(value: float, currency: str) -> str:
     if currency in ("$", "USD", "usd"):
-        return f"${value:.4f}" if value < 1 else f"${value:.2f}"
+        if value >= 1:
+            return f"${value:.2f}"
+        if value >= 0.001 or value <= 0:
+            return f"${value:.4f}"
+        return "$" + f"{value:.6f}".rstrip("0")        # доли цента у дешёвых моделей
     return f"{value:.2f} {currency}"
 
 
@@ -353,7 +376,10 @@ class UsageStats:
         self.prompt += prompt
         self.completion += completion
         self.cached += cached
-        if price is None:
+        reported = getattr(usage, "cost", None)             # OpenRouter сообщает точную стоимость, $
+        if isinstance(reported, (int, float)) and self.currency in ("$", "USD", "usd"):
+            self.cost += float(reported)
+        elif price is None:
             self.unpriced += 1
         else:
             fresh = max(prompt - cached, 0)
@@ -392,6 +418,16 @@ def _initial_params(model: str) -> _ModelParams:
     — иначе лишний запрос с ошибкой на старте и медленные дорогие ответы."""
     params = _ModelParams(structured=LLM_STRUCTURED_OUTPUT)
     effort = LLM_REASONING_EFFORT
+    if OPENROUTER:
+        # у OpenRouter уровень «обдумывания» задаётся одинаково для всех моделей (reasoning.effort);
+        # без него Gemini Flash и gpt-5 «думают» по умолчанию — это оплачивается как ответ
+        if _model_name(model).startswith(("gpt-5", "o1", "o3", "o4")):
+            params.tokens_param = "max_completion_tokens"
+        if effort in ("", "auto"):
+            params.reasoning = ["none", "minimal", "low"]
+        elif effort not in ("off", "default"):
+            params.reasoning = [effort]
+        return params
     if _model_name(model).startswith(("gpt-5", "o1", "o3", "o4")):
         params.tokens_param = "max_completion_tokens"
         if effort in ("", "auto"):
@@ -440,6 +476,10 @@ class LLMConnector:
         )
         self._vision_enabled = True
         self._dead_transcribers: set[str] = set()
+        self._dead_models: set[str] = set()          # недоступные модели из «Заметок»
+        # лестница моделей; модели, которых нет у прокси, проверка на старте убирает
+        self.models: list[str] = list(LLM_MODELS)
+        self._unpaid_warned = -1e9
         self.usage = UsageStats(currency=LLM_PRICE_CURRENCY)
         # параметры запроса по моделям: reasoning-модели (o-серия, gpt-5) требуют
         # max_completion_tokens, не все принимают temperature — подстраиваются по ошибкам 400
@@ -447,8 +487,9 @@ class LLMConnector:
         self._last_error: Optional[Exception] = None
         self._last_usage: Any = None
         logger.info(
-            "LLM инициализирован: model=%s base=%s%s",
-            LLM_MODEL, OPENAI_BASE_URL, f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
+            "LLM инициализирован: %s base=%s%s",
+            f"model={LLM_MODEL}" if len(LLM_MODELS) == 1 else "лестница моделей " + " → ".join(LLM_MODELS),
+            OPENAI_BASE_URL, f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
         )
 
     # ------------------------------------------------------------------
@@ -458,8 +499,16 @@ class LLMConnector:
     async def check_model(self) -> None:
         """Модель доступна у прокси, и сколько токенов стоит фото. Модели нет — ModelUnavailable
         (агент не открывает браузер зря); проверка не прошла по другой причине — предупреждение."""
-        for model in dict.fromkeys(m for m in (LLM_MODEL, LLM_CHECK_MODEL) if m):
-            await self._check_one(model, photo=model == LLM_MODEL and LLM_VISION != "off")
+        await self._load_live_prices()
+        for model in dict.fromkeys(m for m in (*LLM_MODELS, LLM_CHECK_MODEL) if m):
+            try:
+                await self._check_one(model, photo=model in LLM_MODELS and LLM_VISION != "off")
+            except ModelUnavailable as exc:
+                # модель лестницы сняли с прокси (Google отключает старые Gemini) — работать остальными
+                if model not in self.models or len(self.models) < 2 or not self._model_missing(self._last_error):
+                    raise
+                self.models.remove(model)
+                logger.warning("⚠ %s\n   Убираю её из лестницы — работаю моделями: %s", exc, ", ".join(self.models))
 
     async def _check_one(self, model: str, *, photo: bool) -> None:
         ask = ("Проверка связи перед работой. Верни JSON по схеме: observation, plan и reasoning — "
@@ -486,15 +535,39 @@ class LLMConnector:
                         "⚠ Модель %s считает фото очень дорого: %d токенов за картинку 512×512 (обычно "
                         "250–650). Задания с фото обойдутся в разы дороже — выберите другую модель "
                         "(LLM_MODEL в .env) или поставьте LLM_VISION_DETAIL=low", model, tokens)
+        price = model_price(model)
+        if price and self.usage.currency in ("$", "USD", "usd"):
+            line += f"; цена за 1 млн токенов: вход ${price[0]:g}, выход ${price[2]:g}"
         logger.info(line)
+
+    async def _load_live_prices(self) -> None:
+        """Цены моделей со списка моделей OpenRouter (pricing для каждой модели)."""
+        if LLM_PRICE or not OPENROUTER:
+            return
+        try:
+            page = await self._client.with_options(timeout=20, max_retries=1).models.list()
+        except Exception as exc:  # noqa: BLE001 — без цен агент работает, стоимость — по прайсу OpenAI
+            logger.debug("Список моделей не получен: %s", exc)
+            return
+        for item in getattr(page, "data", []) or []:
+            extra = getattr(item, "model_extra", None) or {}
+            price = _live_price(extra.get("pricing") if isinstance(extra, dict) else None)
+            if price and getattr(item, "id", None):
+                LIVE_PRICES[item.id] = price
+
+    @staticmethod
+    def _model_missing(exc: Optional[Exception]) -> bool:
+        """Ошибка значит «такой модели нет у прокси / нет к ней доступа»."""
+        message = str(exc).lower()
+        return isinstance(exc, (openai.NotFoundError, openai.PermissionDeniedError)) or (
+            isinstance(exc, openai.BadRequestError) and "model" in message
+            and any(w in message for w in ("not found", "does not exist", "unknown", "invalid", "not a valid",
+                                            "not supported", "no endpoints", "deprecated", "не найден",
+                                            "не поддерж", "недоступ")))
 
     def _raise_if_unavailable(self, model: str) -> None:
         exc = self._last_error
-        message = str(exc).lower()
-        missing = isinstance(exc, (openai.NotFoundError, openai.PermissionDeniedError)) or (
-            isinstance(exc, openai.BadRequestError) and "model" in message
-            and any(w in message for w in ("not found", "does not exist", "unknown", "invalid", "not supported",
-                                            "не найден", "не поддерж", "недоступ")))
+        missing = self._model_missing(exc)
         if isinstance(exc, openai.AuthenticationError):
             raise ModelUnavailable(f"Ключ OPENAI_API_KEY не подходит к {OPENAI_BASE_URL}: {str(exc)[:200]}")
         if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
@@ -527,10 +600,22 @@ class LLMConnector:
         ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
 
-        decision = await self._ask(LLM_MODEL, messages, temperature)
+        main_model = self.models[0] if self.models else LLM_MODEL
+        model = context.model or main_model
+        if model in self._dead_models:
+            model = main_model
+        decision = await self._ask(model, messages, temperature)
+        if decision is None and model != main_model and self._model_missing(self._last_error):
+            # модель, закреплённая в заметках, с опечаткой или снята с прокси — не пропускать задания
+            self._dead_models.add(model)
+            logger.error("⚠ Модель %s недоступна (%s) — решаю моделью %s. Проверьте название модели в "
+                         "«Заметках» базы знаний", model, str(self._last_error)[:160], main_model)
+            model = main_model
+            decision = await self._ask(model, messages, temperature)
         if decision is None:
+            self._warn_if_unpaid()
             return LLMDecision.skip("ошибка API LLM или невалидный ответ")
-        if self._needs_check(decision):
+        if self._needs_check(decision, model):
             logger.info("Модель не уверена в отправляемом ответе (%.2f < %.2f) — перепроверяю моделью %s",
                         decision.confidence, LLM_CHECK_BELOW, LLM_CHECK_MODEL)
             checked = await self._ask(LLM_CHECK_MODEL, messages, temperature)
@@ -538,9 +623,22 @@ class LLMConnector:
                 decision = checked
         return decision
 
+    def _warn_if_unpaid(self) -> None:
+        """402 — на балансе прокси кончились деньги: сказать прямо (не чаще раза в 10 минут).
+        Агент не останавливается: после пополнения баланса продолжит сам."""
+        exc = self._last_error
+        if not (isinstance(exc, openai.APIStatusError) and exc.status_code == 402):
+            return
+        now = time.monotonic()
+        if now - self._unpaid_warned < 600:
+            return
+        self._unpaid_warned = now
+        logger.error("💳 Прокси отказал в оплате запроса — похоже, на балансе закончились деньги. Пополните "
+                     "баланс: агент ждёт и продолжит сам (%s)", str(exc)[:160])
+
     @staticmethod
-    def _needs_check(decision: LLMDecision) -> bool:
-        return (bool(LLM_CHECK_MODEL) and LLM_CHECK_MODEL != LLM_MODEL
+    def _needs_check(decision: LLMDecision, model: str = "") -> bool:
+        return (bool(LLM_CHECK_MODEL) and LLM_CHECK_MODEL != (model or LLM_MODEL)
                 and decision.confidence < LLM_CHECK_BELOW
                 and any(step.action == ActionType.SUBMIT for step in decision.steps()))
 
@@ -585,8 +683,14 @@ class LLMConnector:
         }
         if params.temperature:
             kwargs["temperature"] = temperature
+        extra: dict[str, Any] = {"usage": {"include": True}} if OPENROUTER else {}   # точная стоимость в ответе
         if params.reasoning:
-            kwargs["reasoning_effort"] = params.reasoning[0]
+            if OPENROUTER:
+                extra["reasoning"] = {"effort": params.reasoning[0]}
+            else:
+                kwargs["reasoning_effort"] = params.reasoning[0]
+        if extra:
+            kwargs["extra_body"] = extra
         self._last_error = None
         try:
             response = await self._client.chat.completions.create(**kwargs)
@@ -613,6 +717,13 @@ class LLMConnector:
                 logger.warning("Модель не принимает изображения (%s) — отправляю без картинки", exc)
                 self._vision_enabled = False
                 return await self._complete(self._strip_images(messages), temperature, model)
+            if params.structured and not _model_name(model).startswith(("gpt-", "o1", "o3", "o4")):
+                # другие модели (Gemini, Qwen…) понимают строгую схему не целиком, а ошибка 400 у
+                # OpenRouter не всегда называет причину — повтор с простым JSON
+                logger.warning("Модель %s не приняла строгую схему ответа (%s) — перехожу на обычный JSON",
+                               model, str(exc)[:160])
+                params.structured = False
+                return await self._complete(messages, temperature, model)
             logger.error("LLM API ошибка запроса: %s", exc)
             self._last_error = exc
             return None
@@ -764,16 +875,30 @@ class LLMConnector:
             kwargs: dict[str, Any] = {"model": model, "file": (filename, data, mime)}
             if TRANSCRIBE_LANGUAGE:
                 kwargs["language"] = TRANSCRIBE_LANGUAGE
-            if "diarize" in model:
+            name = _model_name(model)
+            if "diarize" in name:
                 kwargs["response_format"] = "diarized_json"
                 kwargs["extra_body"] = {"chunking_strategy": "auto"}
-            elif model.startswith("whisper"):
+            elif name.startswith("whisper"):
                 kwargs["response_format"] = "verbose_json"
                 kwargs["timestamp_granularities"] = ["segment"]
             else:
                 kwargs["response_format"] = "json"
             try:
-                result = await self._client.audio.transcriptions.create(**kwargs)
+                try:
+                    result = await self._client.audio.transcriptions.create(**kwargs)
+                except openai.BadRequestError as exc:
+                    message = str(exc).lower()
+                    if kwargs["response_format"] == "json" or not any(
+                            w in message for w in ("response_format", "timestamp", "verbose", "diarized", "chunking")):
+                        raise
+                    # прокси не отдаёт таймкоды/говорящих — простой текст лучше, чем ничего
+                    logger.info("Расшифровка %s: формат %s не принят — прошу простой текст", model,
+                                kwargs["response_format"])
+                    for key in ("timestamp_granularities", "extra_body"):
+                        kwargs.pop(key, None)
+                    kwargs["response_format"] = "json"
+                    result = await self._client.audio.transcriptions.create(**kwargs)
             except (openai.NotFoundError, openai.BadRequestError, openai.PermissionDeniedError) as exc:
                 logger.warning("Расшифровка моделью %s недоступна: %s", model, str(exc)[:200])
                 self._dead_transcribers.add(model)
@@ -840,7 +965,8 @@ class LLMConnector:
             + (f" «{(d.type_text or d.query or '')[:40]}»" if (d.type_text or d.query) else "")
             for d in steps
         )
-        logger.info("LLM решение%s (%d действ.): %s conf=%.2f", "" if model == LLM_MODEL else f" [{model}]",
+        logger.info("LLM решение%s (%d действ.): %s conf=%.2f",
+                    "" if model == LLM_MODEL and len(LLM_MODELS) == 1 else f" [{model}]",
                     len(steps), chain, decision.confidence)
         if decision.observation:
             logger.info("  наблюдение: %s", decision.observation[:400])

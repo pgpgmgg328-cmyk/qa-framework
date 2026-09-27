@@ -42,6 +42,8 @@ from config import (
     CLOSE_BROWSER_WHEN_DONE,
     EXAM_MIN_ACCURACY,
     EXAM_MIN_TASKS,
+    LADDER_MIN_ACCURACY,
+    LADDER_MIN_TASKS,
     DIALOG_CLOSE_TEXTS,
     EXIT_CANCEL_TEXTS,
     FINISH_BUTTON_TEXTS,
@@ -49,6 +51,7 @@ from config import (
     FRAME_LOAD_WAIT,
     INSTRUCTION_WAIT,
     LLM_HISTORY_SIZE,
+    LLM_MODELS,
     LLM_TEMPERATURE,
     LLM_VISION,
     MAX_BATCH_ACTIONS,
@@ -319,7 +322,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.3 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.4 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -479,9 +482,10 @@ class Agent:
 
         # 12. Решение LLM
         logger.info(
-            "%s задание %s · шаг %d/%d · «%s» %s",
+            "%s задание %s · шаг %d/%d · «%s»%s %s",
             "-" * 10, state.task_identifier[:8], self._memory.steps, MAX_STEPS_PER_TASK,
-            state.task_preview[:50], "-" * 10,
+            state.task_preview[:50], f" · {self._model_for(self._pool)}" if len(self._ladder) > 1 else "",
+            "-" * 10,
         )
         context = await self._build_context(frame, state)
         decision = await self._llm.decide(state, context)
@@ -556,27 +560,90 @@ class Agent:
         pool, mem = self._pool, self._memory
         if mode == "exam" or (accepted and mode != "training"):
             return
+        model = self._model_for(pool)
         if accepted:
             if not mem.wrong_answers:
                 self._order_train[0] += 1
                 self._order_train[1] += 1
                 if pool is not None:
                     self._knowledge.training_attempt(pool, True)
+                    self._knowledge.model_attempt(pool, model, True)
+                    self._climb_ladder(pool, model)
             if pool is not None and " = «" not in answer and answer.startswith("«"):
                 self._knowledge.training_answer(pool, answer)
         elif len(mem.wrong_answers) == 1:
             self._order_train[1] += 1
             if pool is not None:
                 self._knowledge.training_attempt(pool, False)
+                self._knowledge.model_attempt(pool, model, False)
+                self._climb_ladder(pool, model)
+
+    # ------------------------------------------------------------------
+    # Лестница моделей: самая дешёвая модель, которая справляется с этим видом заданий
+    # ------------------------------------------------------------------
+
+    @property
+    def _ladder(self) -> tuple[str, ...]:
+        """Лестница моделей: LLM_MODEL из .env без моделей, недоступных при проверке на старте."""
+        models = getattr(getattr(self, "_llm", None), "models", None)
+        return tuple(models) if models else LLM_MODELS
+
+    def _model_for(self, pool: Optional[PoolKnowledge]) -> str:
+        """Модель для вида заданий: закреплённая в «Заметках» → выбранная в тренировке (если она
+        есть в нынешней лестнице) → самая дешёвая, которая не провалила тренировку этого вида."""
+        ladder = self._ladder
+        if pool is None:
+            return ladder[0]
+        if pool.pinned_model:
+            return pool.pinned_model
+        if pool.model in ladder:
+            return pool.model
+        return next((m for m in ladder if not self._ruled_out(pool, m)), ladder[-1])
+
+    @staticmethod
+    def _ruled_out(pool: PoolKnowledge, model: str) -> bool:
+        """Модель не справляется с видом: точность тренировки ниже порога LADDER_MIN_ACCURACY —
+        после LADDER_MIN_TASKS заданий или раньше, если порог уже недостижим (даже если
+        оставшиеся до минимума ответы будут верными)."""
+        ok, total = pool.model_stats.get(model, [0, 0])
+        need = max(LADDER_MIN_TASKS, total)
+        return bool(total) and ok + need - total < LADDER_MIN_ACCURACY * need
+
+    def _climb_ladder(self, pool: PoolKnowledge, model: str, *, reason: str = "") -> None:
+        """Перейти к следующей модели лестницы, если текущая часто ошибается в тренировке
+        (или не сдала экзамен). Закреплённую человеком модель агент не меняет."""
+        ladder = self._ladder
+        if pool.pinned_model or model not in ladder:
+            return
+        position = ladder.index(model)
+        if position + 1 >= len(ladder):
+            return
+        if not reason:
+            if not self._ruled_out(pool, model):
+                return
+            ok, total = pool.model_stats[model]
+            reason = f"в тренировке с первого раза верно {ok} из {total}"
+        following = ladder[position + 1]
+        self._knowledge.set_model(pool, following)
+        logger.warning("📈 Вид «%s»: модель %s не справляется (%s) — дальше этот вид решает %s",
+                       pool.title, model, reason, following)
 
     def _training_accuracy(self) -> Optional[tuple[int, int]]:
-        """Точность тренировки для решения об экзамене: этого заказа, иначе — вида заданий."""
-        ok, total = self._order_train
+        """Точность тренировки для решения об экзамене. С лестницей моделей — точность той
+        модели, которой агент будет решать экзамен; иначе — этого заказа или вида заданий.
+        None — экзамен можно начинать: заданий мало, и ошибок среди них не больше, чем
+        допускает порог (даже с верными ответами в недостающих до EXAM_MIN_TASKS заданиях)."""
+        pool = self._pool
+        if pool is not None and len(self._ladder) > 1:
+            ok, total = pool.model_stats.get(self._model_for(pool), [0, 0])
+        else:
+            ok, total = self._order_train
+            if total < EXAM_MIN_TASKS and pool is not None and pool.train_total >= EXAM_MIN_TASKS:
+                ok, total = pool.train_first_ok, pool.train_total
         if total >= EXAM_MIN_TASKS:
             return ok, total
-        pool = self._pool
-        if pool is not None and pool.train_total >= EXAM_MIN_TASKS:
-            return pool.train_first_ok, pool.train_total
+        if total and ok + EXAM_MIN_TASKS - total < EXAM_MIN_ACCURACY * EXAM_MIN_TASKS:
+            return ok, total
         return None
 
     async def _exam_gate(self, state: PageState) -> bool:
@@ -619,6 +686,8 @@ class Agent:
             line += f"; тренировка: с первого раза верно {ok} из {total}"
         if self._order_exam is not None:
             line += f"; экзамен: {'пройден' if self._order_exam else 'НЕ ПРОЙДЕН'}"
+        if len(self._ladder) > 1:
+            line += f"; модель: {self._model_for(self._pool)}"
         usage = getattr(self._llm, "usage", None)
         if usage is not None and usage0 is not None:
             spent = usage.since(usage0)
@@ -754,6 +823,7 @@ class Agent:
             image_notes=image_notes,
             transcripts=transcripts,
             knowledge=self._knowledge.prompt_text(self._pool),
+            model=self._model_for(self._pool),
             research=research,
             plan=mem.plan,
             feedback=list(mem.feedback),
@@ -803,6 +873,8 @@ class Agent:
                     self._order_exam = outcome
                     if self._pool is not None:
                         self._knowledge.exam_result(self._pool, outcome)
+                        if not outcome:
+                            self._climb_ladder(self._pool, self._model_for(self._pool), reason="экзамен не пройден")
                     if outcome:
                         logger.info("✅ ЭКЗАМЕН ПРОЙДЕН: «%s»", text[:120])
                     else:

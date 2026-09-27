@@ -41,8 +41,10 @@ _MAX_LESSONS = 40
 _HEADER_HELP = (
     "Файл ведёт агент: разделы «Инструкция», «Пояснения к вариантам», «Уроки из тренировки» и "
     "«Статистика тренировки» он обновляет сам. Свои правила для этого вида заданий пишите в раздел «Заметки» — агент "
-    "его не меняет и передаёт модели в каждом таком задании."
+    "его не меняет и передаёт модели в каждом таком задании. Строка «Модель агента: <название>» в «Заметках» "
+    "закрепляет модель для этого вида заданий."
 )
+_PIN_RE = re.compile(r"(?im)^\s*модель агента\s*:\s*([a-z0-9][a-z0-9_.:/@+-]*)[^\n]*\n?")
 
 
 @dataclass
@@ -62,12 +64,21 @@ class PoolKnowledge:
     train_first_ok: int = 0
     train_answers: dict[str, int] = field(default_factory=dict)
     exams: list[str] = field(default_factory=list)
+    # лестница моделей: какой моделью агент решает этот вид и её точность в тренировке
+    model: str = ""
+    model_stats: dict[str, list[int]] = field(default_factory=dict)   # модель → [верно, всего]
     instruction_attempted: bool = False     # в этом запуске уже пытались открыть инструкцию
     tooltips_attempted: bool = False
 
     @property
     def has_instruction(self) -> bool:
         return len(self.instruction.strip()) >= 80
+
+    @property
+    def pinned_model(self) -> str:
+        """Модель, закреплённая человеком в «Заметках»: строка «Модель агента: <название>»."""
+        m = _PIN_RE.search(self.notes)
+        return m.group(1) if m else ""
 
     def training_line(self) -> str:
         if not self.train_total:
@@ -175,6 +186,17 @@ class KnowledgeBase:
             pool.train_answers[answer] = pool.train_answers.get(answer, 0) + 1
             self._write(pool)
 
+    def model_attempt(self, pool: PoolKnowledge, model: str, first_ok: bool) -> None:
+        """Первый ответ тренировки, данный моделью model."""
+        stats = pool.model_stats.setdefault(model, [0, 0])
+        stats[0] += int(first_ok)
+        stats[1] += 1
+        self._write(pool)
+
+    def set_model(self, pool: PoolKnowledge, model: str) -> None:
+        pool.model = model
+        self._write(pool)
+
     def exam_result(self, pool: PoolKnowledge, passed: bool) -> None:
         pool.exams.append(f"{'пройден' if passed else 'не пройден'} ({datetime.now():%Y-%m-%d %H:%M})")
         pool.exams = pool.exams[-10:]
@@ -199,8 +221,9 @@ class KnowledgeBase:
         if self._general:
             parts.append("Общие правила (knowledge/_general.md):\n" + self._general)
         if pool is not None:
-            if pool.notes.strip():
-                parts.append("Заметки пользователя для этого вида заданий:\n" + pool.notes.strip())
+            notes = _PIN_RE.sub("", pool.notes).strip()          # выбор модели — не для модели
+            if notes:
+                parts.append("Заметки пользователя для этого вида заданий:\n" + notes)
             if pool.lessons:
                 parts.append("Уроки из прошлых ошибок (платформа сообщила правильный ответ/подсказку):\n"
                              + "\n".join(f"- {x}" for x in pool.lessons[-20:]))
@@ -280,6 +303,9 @@ def _render(pool: PoolKnowledge) -> str:
         lines.append(f"- с первого раза верно: {pool.train_first_ok} из {pool.train_total}")
     lines += [f"- правильный ответ {a}: {n}" for a, n in sorted(pool.train_answers.items(), key=lambda kv: -kv[1])]
     lines += [f"- экзамен: {x}" for x in pool.exams]
+    if pool.model:
+        lines.append(f"- текущая модель: {pool.model}")
+    lines += [f"- модель {m}: с первого раза верно {ok} из {total}" for m, (ok, total) in pool.model_stats.items()]
     lines += ["", "## Заметки", pool.notes.strip(), ""]
     return "\n".join(lines)
 
@@ -324,5 +350,9 @@ def _parse(path: Path) -> PoolKnowledge:
             pool.train_answers[m.group(1).strip()] = int(m.group(2))
         elif m := re.match(r"^-\s*экзамен:\s*(.+)$", line):
             pool.exams.append(m.group(1).strip())
+        elif m := re.match(r"^-\s*текущая модель:\s*(\S+)", line):
+            pool.model = m.group(1).strip()
+        elif m := re.match(r"^-\s*модель\s+(\S+):\s*с первого раза верно\s*(\d+)\s+из\s+(\d+)", line):
+            pool.model_stats[m.group(1)] = [int(m.group(2)), int(m.group(3))]
     pool.notes = _clean_block("\n".join(sections.get("notes", [])))
     return pool

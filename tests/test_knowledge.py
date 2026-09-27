@@ -102,3 +102,27 @@ def test_training_stats_and_exam_results_survive_restart(tmp_path):
     text = KnowledgeBase(str(tmp_path)).prompt_text(again)
     assert "«Выполнен некачественно» — 2; «Выполнен качественно» — 1" in text
     assert "с первого раза верно 1 из 2 (50%)" in text
+
+
+def test_model_choice_survives_restart_and_notes_pin_a_model(tmp_path):
+    kb = KnowledgeBase(str(tmp_path))
+    pool = kb.for_state(pool_state())
+    kb.model_attempt(pool, "google/gemini-2.5-flash-lite", False)
+    kb.model_attempt(pool, "google/gemini-2.5-flash-lite", True)
+    kb.set_model(pool, "openai/gpt-5.4-mini")
+
+    fresh = KnowledgeBase(str(tmp_path))
+    again = fresh.for_state(pool_state())
+    assert again.model == "openai/gpt-5.4-mini" and again.pinned_model == ""
+    assert again.model_stats == {"google/gemini-2.5-flash-lite": [1, 2]}
+    path = next(tmp_path.glob("*.md"))
+    path.write_text(path.read_text(encoding="utf-8").replace(
+        "## Заметки\n", "## Заметки\nМодель: писать без цвета.\nМодель агента: openai/gpt-5.4 (сложные фото)\n"),
+        encoding="utf-8")
+    pinned = KnowledgeBase(str(tmp_path))
+    pool = pinned.for_state(pool_state())
+    assert pool.pinned_model == "openai/gpt-5.4"
+    text = pinned.prompt_text(pool)
+    assert "Модель: писать без цвета." in text and "Модель агента" not in text
+    pool.notes = "Модель агента: сильная"                      # не название модели — не закрепляет
+    assert pool.pinned_model == ""

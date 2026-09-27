@@ -105,9 +105,20 @@ def enable_file_log(kind: str) -> Optional[Path]:
 # ---------------------------------------------------------------------------
 OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
 OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-# gpt-5.4-mini: в ~3 раза дешевле gpt-4o на входе, повторяющаяся часть запроса — за 10% цены.
-# При запуске агент проверяет модель и пишет, сколько токенов стоит фото (см. README, «Выбор модели»)
-LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-5.4-mini")
+# OpenRouter: цены моделей агент берёт с него при запуске, «обдумывание» отключает его параметром
+OPENROUTER: bool = "openrouter" in OPENAI_BASE_URL.lower()
+# Модель или «лестница» моделей через запятую — от дешёвой к сильной, например
+# google/gemini-2.5-flash-lite,google/gemini-2.5-flash,openai/gpt-5.4-mini. Каждый вид заданий агент
+# начинает первой (самой дешёвой) моделью; если в тренировке она часто ошибается с первого раза,
+# переводит этот вид на следующую. При запуске агент проверяет модели и пишет цену фото.
+LLM_MODELS: tuple[str, ...] = tuple(
+    m.strip() for m in os.getenv("LLM_MODEL", "gpt-5.4-mini").split(",") if m.strip()
+) or ("gpt-5.4-mini",)
+LLM_MODEL: str = LLM_MODELS[0]
+# Лестница: переход к следующей модели, когда в тренировке у текущей верно с первого раза меньше
+# этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели)
+LADDER_MIN_ACCURACY: float = float(os.getenv("LADDER_MIN_ACCURACY", "0.8"))
+LADDER_MIN_TASKS: int = int(os.getenv("LADDER_MIN_TASKS", "3"))
 # Reasoning-модели (gpt-5.x, o-серия): сколько «думать» перед ответом. auto — минимум, который
 # принимает модель (none → minimal → low): быстрее и дешевле; low / medium — точнее, но дороже
 LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "auto").strip().lower()
@@ -150,11 +161,14 @@ VISION_IMAGE_SIDE: int = int(os.getenv("VISION_IMAGE_SIDE", "1024"))  # длин
 VISION_CELL: int = int(os.getenv("VISION_CELL", "384"))
 LLM_HISTORY_SIZE: int = int(os.getenv("LLM_HISTORY_SIZE", "14"))  # строк истории в промпте
 
-# Аудио: расшифровка через audio.transcriptions того же API (ProxyAPI/OpenAI).
-# Модели пробуются по порядку; «…-diarize» дополнительно размечает говорящих.
+# Аудио: расшифровка через audio.transcriptions того же API (ProxyAPI/OpenAI/OpenRouter).
+# Модели пробуются по порядку; «…-diarize» дополнительно размечает говорящих. У OpenRouter
+# названия моделей с префиксом «openai/» — агент добавляет его сам.
 AUDIO_TRANSCRIBE: bool = _env_bool("AUDIO_TRANSCRIBE", True)
 TRANSCRIBE_MODELS: tuple[str, ...] = tuple(
-    m.strip() for m in os.getenv("TRANSCRIBE_MODELS", "gpt-4o-transcribe,whisper-1").split(",") if m.strip()
+    (f"openai/{m}" if OPENROUTER and "/" not in m else m)
+    for m in (m.strip() for m in os.getenv("TRANSCRIBE_MODELS", "gpt-4o-transcribe,whisper-1").split(","))
+    if m
 )
 TRANSCRIBE_LANGUAGE: str = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
 # «Прослушайте звонок до конца»: перед отправкой ответа запись доигрывается до конца
