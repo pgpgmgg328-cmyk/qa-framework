@@ -37,16 +37,22 @@ def bad_request(message: str) -> tuple[int, dict]:
 
 
 @contextmanager
-def fake_openai(responses: list[tuple[int, dict]], models: Optional[list[dict]] = None):
-    """POST — ответы по очереди из responses; GET /models — список моделей (у OpenRouter — с ценами)."""
+def fake_openai(responses: list[tuple[int, dict]], models: Optional[list[dict]] = None,
+                key: Optional[dict] = None):
+    """Фейковый OpenRouter. POST — ответы по очереди из responses; GET /models — список моделей
+    с ценами; GET /key — расход и лимит ключа."""
     requests: list[dict] = []
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):  # noqa: N802
-            if models is None or not self.path.endswith("/models"):
+            if models is not None and self.path.endswith("/models"):
+                payload = {"object": "list", "data": models}
+            elif key is not None and self.path.endswith("/key"):
+                payload = {"data": key}
+            else:
                 self.send_error(404)
                 return
-            data = json.dumps({"object": "list", "data": models}).encode()
+            data = json.dumps(payload).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
@@ -94,7 +100,7 @@ def use_model(monkeypatch, *models: str) -> None:
 
 
 def make_connector(monkeypatch, base_url: str) -> oc.LLMConnector:
-    monkeypatch.setattr(oc, "OPENAI_BASE_URL", base_url)
+    monkeypatch.setattr(oc, "OPENROUTER_BASE_URL", base_url)
     monkeypatch.setattr(oc, "LLM_MAX_RETRIES", 0)
     return oc.LLMConnector()
 
@@ -128,15 +134,15 @@ def test_reasoning_model_parameters_are_adapted(monkeypatch):
     assert decision.action == ActionType.OPEN
     assert "max_tokens" in requests[0] and "max_completion_tokens" in requests[1]
     assert "temperature" in requests[1] and "temperature" not in requests[2]
-    assert all("reasoning_effort" not in r for r in requests)
+    assert all("reasoning_effort" not in r and r["reasoning"] == {"effort": "none"} for r in requests)
 
 
 def test_gpt5_models_get_their_parameters_at_once(monkeypatch):
-    """gpt-5.x: сразу max_completion_tokens и минимальное «обдумывание»; значение, которое модель
-    не принимает, заменяется следующим (none → minimal)."""
-    use_model(monkeypatch, "gpt-5-mini")
+    """gpt-5.x: сразу max_completion_tokens и минимальное «обдумывание» (reasoning.effort у
+    OpenRouter); значение, которое модель не принимает, заменяется следующим (none → minimal)."""
+    use_model(monkeypatch, "openai/gpt-5-mini")
     responses = [
-        bad_request("Unsupported value: 'reasoning_effort' does not support 'none' with this model. "
+        bad_request("Reasoning effort 'none' is not supported for this model. "
                     "Supported values are: 'minimal', 'low', 'medium', and 'high'."),
         completion(json.dumps(VALID)),
         completion(json.dumps(VALID)),
@@ -146,7 +152,8 @@ def test_gpt5_models_get_their_parameters_at_once(monkeypatch):
         run(connector.decide(state(), DecisionContext()))
         run(connector.decide(state(), DecisionContext()))
     assert "max_completion_tokens" in requests[0] and "max_tokens" not in requests[0]
-    assert [r["reasoning_effort"] for r in requests] == ["none", "minimal", "minimal"]
+    assert [r["reasoning"]["effort"] for r in requests] == ["none", "minimal", "minimal"]
+    assert all(r["usage"] == {"include": True} for r in requests)
 
 
 def test_invalid_json_gets_one_repair_round(monkeypatch):
@@ -181,7 +188,8 @@ def test_images_are_sent_with_captions_before_the_page(monkeypatch):
 
 
 def test_token_usage_is_counted(monkeypatch):
-    use_model(monkeypatch, "gpt-4o")
+    use_model(monkeypatch, "openai/gpt-4o")
+    monkeypatch.setattr(oc, "LIVE_PRICES", {"openai/gpt-4o": (2.50, 1.25, 10.00)})   # цены со списка моделей
     body = completion(json.dumps(VALID))
     body[1]["usage"] = {"prompt_tokens": 4000, "completion_tokens": 150, "total_tokens": 4150,
                         "prompt_tokens_details": {"cached_tokens": 2048}}
@@ -196,22 +204,17 @@ def test_token_usage_is_counted(monkeypatch):
         "вызовов модели 1, токенов: вход 4000 (из кэша 2048), выход 150, ≈ $0.0089"
 
 
-def test_cost_in_your_currency(monkeypatch):
-    """Цены из личного кабинета прокси (LLM_PRICE) — стоимость в логе в рублях."""
-    monkeypatch.setattr(oc, "LLM_PRICE", "225, 22.5, 1350")
-    monkeypatch.setattr(oc, "LLM_PRICE_CURRENCY", "₽")
-    body = completion(json.dumps(VALID))
-    body[1]["usage"] = {"prompt_tokens": 4000, "completion_tokens": 150, "total_tokens": 4150,
-                        "prompt_tokens_details": {"cached_tokens": 2048}}
-    with fake_openai([body]) as (url, _):
-        connector = make_connector(monkeypatch, url)
-        run(connector.decide(state(), DecisionContext()))
-    assert connector.usage.render().endswith(", ≈ 0.69 ₽")
-    assert oc.parse_price("0,75; 0,075; 4,5") == (0.75, 0.075, 4.5) and oc.parse_price("1,2") == (1.0, 1.0, 2.0)
-    assert oc.model_price("openai/gpt-4o-2024-08-06") is None               # свои цены — только для LLM_MODEL
-    monkeypatch.setattr(oc, "LLM_PRICE", "")
-    assert oc.model_price("openai/gpt-4o-2024-08-06") == (2.50, 1.25, 10.00)
-    assert oc.model_price("gpt-5.4-mini") == (0.75, 0.075, 4.50) and oc.model_price("gpt-9") is None
+def test_model_names_and_tiny_costs():
+    """Названия моделей без поставщика дополняются (у OpenRouter — «поставщик/модель»); доли
+    цента у дешёвых моделей видны в логе."""
+    import config
+
+    assert config.parse_models("gpt-5.4-mini, gemini-3.1-flash-lite,openai/gpt-5.4-mini,o4-mini") == (
+        "openai/gpt-5.4-mini", "google/gemini-3.1-flash-lite", "openai/o4-mini")
+    assert config.openrouter_model("qwen/qwen3-vl-32b-instruct") == "qwen/qwen3-vl-32b-instruct"
+    assert config.parse_models(config.DEFAULT_MODELS) == ("google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    assert oc._money(0.0000258) == "$0.000026" and oc._money(0.0089) == "$0.0089" and oc._money(12.5) == "$12.50"
+    assert oc.model_price("openai/gpt-9") is None
 
 
 def usage_body(prompt: int, completion_tokens: int = 20) -> tuple[int, dict]:
@@ -222,14 +225,14 @@ def usage_body(prompt: int, completion_tokens: int = 20) -> tuple[int, dict]:
 
 
 def test_model_check_reports_photo_cost(monkeypatch, caplog):
-    use_model(monkeypatch, "gpt-4o")
+    use_model(monkeypatch, "openai/gpt-4o")
     monkeypatch.setattr(oc, "LLM_VISION", "auto")
     with fake_openai([usage_body(120), usage_body(375)]) as (url, requests):
         connector = make_connector(monkeypatch, url)
         with caplog.at_level("INFO", logger="twork.llm"):
             run(connector.check_model())
     assert requests[1]["messages"][0]["content"][1]["image_url"]["url"].startswith("data:image/png;base64,")
-    assert "Модель gpt-4o: доступна" in caplog.text and "фото 512×512 — 255 токенов на вход" in caplog.text
+    assert "Модель openai/gpt-4o: доступна" in caplog.text and "фото 512×512 — 255 токенов на вход" in caplog.text
     assert "очень дорого" not in caplog.text
 
 
@@ -259,7 +262,7 @@ def test_model_check_stops_on_unknown_model(monkeypatch):
 
 
 def test_retired_ladder_model_is_dropped_at_start(monkeypatch, caplog):
-    """Модель лестницы сняли с прокси — агент не останавливается, а работает остальными."""
+    """Модель лестницы сняли с OpenRouter — агент не останавливается, а работает остальными."""
     use_model(monkeypatch, "google/gemini-2.5-flash-lite", "google/gemini-3.1-flash-lite")
     monkeypatch.setattr(oc, "LLM_VISION", "off")
     retired = (404, {"error": {"message": "No endpoints found for google/gemini-2.5-flash-lite.", "code": 404}})
@@ -316,7 +319,7 @@ def test_empty_balance_is_reported_plainly_and_agent_waits(monkeypatch, caplog):
             first = run(connector.decide(state(), DecisionContext()))
             second = run(connector.decide(state(), DecisionContext()))
     assert first.action == second.action == ActionType.SKIP
-    assert caplog.text.count("💳 Прокси отказал в оплате") == 1          # не чаще раза в 10 минут
+    assert caplog.text.count("💳 OpenRouter отказал в оплате") == 1          # не чаще раза в 10 минут
 
 
 def test_transcription_falls_back_to_next_model(monkeypatch):
@@ -337,7 +340,7 @@ def test_transcription_falls_back_to_next_model(monkeypatch):
 
 
 def test_transcription_without_timestamps_falls_back_to_plain_text(monkeypatch):
-    """Прокси (OpenRouter) не отдаёт таймкоды — расшифровка простым текстом той же моделью."""
+    """OpenRouter не отдаёт таймкоды — расшифровка простым текстом той же моделью."""
     monkeypatch.setattr(oc, "TRANSCRIBE_MODELS", ("openai/whisper-1",))
     responses = [bad_request("response_format 'verbose_json' is not supported"), (200, {"text": "Алло. Слушаю."})]
     with fake_openai(responses) as (url, requests):
@@ -370,7 +373,6 @@ def test_unknown_bad_request_retries_with_plain_json_then_skips(monkeypatch):
 
 def test_gemini_schema_error_falls_back_to_plain_json(monkeypatch):
     use_model(monkeypatch, "google/gemini-2.5-flash-lite")
-    monkeypatch.setattr(oc, "OPENROUTER", True)
     responses = [bad_request("Provider returned error: Invalid JSON payload received. Unknown name "
                              "\"additionalProperties\" at 'generation_config.response_schema'"),
                  completion(json.dumps(VALID)), completion(json.dumps(VALID))]
@@ -385,7 +387,6 @@ def test_gemini_schema_error_falls_back_to_plain_json(monkeypatch):
 def test_openrouter_prices_reasoning_and_model_per_task_type(monkeypatch, caplog):
     """OpenRouter: цены — с его списка моделей, «обдумывание» выключено его параметром reasoning,
     стоимость — точная из ответа, решение — моделью, которую агент выбрал для вида заданий."""
-    monkeypatch.setattr(oc, "OPENROUTER", True)
     monkeypatch.setattr(oc, "LIVE_PRICES", {})
     monkeypatch.setattr(oc, "LLM_VISION", "auto")
     use_model(monkeypatch, "google/gemini-2.5-flash-lite", "openai/gpt-5.4-mini")
@@ -399,7 +400,8 @@ def test_openrouter_prices_reasoning_and_model_per_task_type(monkeypatch, caplog
     reported[1]["usage"]["cost"] = 0.0021
     responses = [usage_body(120), usage_body(378), usage_body(120), usage_body(427),
                  usage_body(4000, 150), reported]
-    with fake_openai(responses, models=models) as (url, requests):
+    key = {"label": "agent", "usage": 1.25, "usage_daily": 0.3, "limit": 14, "limit_remaining": 12.75}
+    with fake_openai(responses, models=models, key=key) as (url, requests):
         connector = make_connector(monkeypatch, url)
         with caplog.at_level("INFO", logger="twork.llm"):
             run(connector.check_model())
@@ -420,3 +422,16 @@ def test_openrouter_prices_reasoning_and_model_per_task_type(monkeypatch, caplog
     assert "max_tokens" in requests[0] and "max_completion_tokens" in requests[-1]
     assert estimated.render() == "вызовов модели 1, токенов: вход 4000, выход 150, ≈ $0.0037"
     assert abs(connector.usage.since(before).cost - estimated.cost - 0.0021) < 1e-9   # из ответа OpenRouter
+    assert "Ключ OpenRouter: потрачено всего $1.25, сегодня $0.30; лимит ключа $14.00, осталось $12.75" in caplog.text
+    assert abs(connector.budget_left() - (12.75 - connector.usage.cost)) < 1e-9
+
+
+def test_key_without_limit_suggests_one(monkeypatch, caplog):
+    """У ключа нет лимита расходов — агент советует его задать; остаток неизвестен."""
+    monkeypatch.setattr(oc, "LLM_VISION", "off")
+    with fake_openai([usage_body(120)], key={"usage": 0.5, "limit": None, "limit_remaining": None}) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        with caplog.at_level("INFO", logger="twork.llm"):
+            run(connector.check_model())
+    assert "Ключ OpenRouter: потрачено всего $0.50; лимит расходов у ключа не задан" in caplog.text
+    assert connector.budget_left() is None

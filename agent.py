@@ -318,11 +318,11 @@ class Agent:
         started = time.monotonic()
         check = getattr(self._llm, "check_model", None)
         if check is not None:
-            await check()          # модели нет у прокси — ModelUnavailable, браузер не открываем
+            await check()          # модели нет у OpenRouter — ModelUnavailable, браузер не открываем
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.4 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.5 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -384,7 +384,7 @@ class Agent:
                 if self._tasks_done:
                     per_task = (f"; в среднем на задание: вход {usage.prompt // self._tasks_done}, "
                                 f"выход {usage.completion // self._tasks_done}")
-                logger.info("ТОКЕНЫ за запуск: %s%s", usage.render(), per_task)
+                logger.info("ТОКЕНЫ за запуск: %s%s%s", usage.render(), per_task, self._budget_note())
             if stuck and not CLOSE_BROWSER_WHEN_DONE and not self._browser.is_closed():
                 logger.warning("Агент остановлен (%s). Окно браузера оставлено открытым, чтобы было видно, "
                                "на чём он остановился. Закройте окно браузера (или нажмите Ctrl+C), когда "
@@ -693,7 +693,19 @@ class Agent:
             spent = usage.since(usage0)
             if spent.calls:
                 line += f"; {spent.render()}"
+            line += self._budget_note(spent.cost if spent.calls else 0.0)
         logger.info(line)
+
+    def _budget_note(self, order_cost: float = 0.0) -> str:
+        """Остаток лимита ключа OpenRouter и на сколько таких заказов его хватит."""
+        budget = getattr(self._llm, "budget_left", None)
+        left = budget() if callable(budget) else None
+        if left is None:
+            return ""
+        note = f"; на ключе OpenRouter осталось ≈ ${left:.2f}"
+        if order_cost > 0:
+            note += f" — примерно на {int(left / order_cost + 1e-9)} таких заказов"
+        return note
 
     async def _dismiss_page_popup(self) -> bool:
         """Новости/объявления сайта (например, «Одноразовые пароли для TWork») открываются

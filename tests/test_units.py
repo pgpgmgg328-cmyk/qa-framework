@@ -385,19 +385,21 @@ def test_missing_key_message_names_the_file_problem(tmp_path, monkeypatch):
     import config
 
     monkeypatch.setattr(config, "PROJECT_DIR", tmp_path)
-    monkeypatch.setattr(config, "OPENAI_API_KEY", "")
+    monkeypatch.setattr(config, "OPENROUTER_API_KEY", "")
     monkeypatch.setattr(sys, "platform", "win32")
     example = tmp_path / ".env.example"
-    example.write_text("# образец\nOPENAI_API_KEY=\nLLM_MODEL=gpt-4o\n", encoding="utf-8")
+    example.write_text("# образец\nOPENROUTER_API_KEY=\nLLM_MODEL=gpt-4o\n", encoding="utf-8")
     assert "copy .env.example .env" in config._missing_key_hint()
-    example.write_text("# образец\nOPENAI_API_KEY=sk-test\n", encoding="utf-8")   # ключ вписан в образец
+    example.write_text("# образец\nOPENROUTER_API_KEY=sk-test\n", encoding="utf-8")   # ключ вписан в образец
     with pytest.raises(ValueError, match=r"ren \.env\.example \.env"):
         config.validate_config()
     (tmp_path / ".env.txt").write_text("OPENAI_API_KEY=sk-test\n", encoding="utf-8")  # Блокнот добавил .txt
     assert "ren .env.txt .env" in config._missing_key_hint()
-    (tmp_path / ".env").write_text("OPENAI_API_KEY=\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("OPENROUTER_API_KEY=\n", encoding="utf-8")
     hint = config._missing_key_hint()
-    assert "впишите ключ в файл" in hint and ".env.example" in hint
+    assert "впишите ключ OpenRouter в файл" in hint and ".env.example" in hint
+    example.write_text("# старый образец\nOPENAI_API_KEY=sk-test\n", encoding="utf-8")   # прежнее имя ключа
+    assert "ключ вписан в .env.example" in config._missing_key_hint()
     config.validate_config(require_llm=False)                                    # режим записи — без ключа
 
 
@@ -485,3 +487,14 @@ def test_exam_gate_and_ladder_decide_early_on_few_training_tasks(tmp_path, monke
     assert agent._model_for(pool) == "strong"
     monkeypatch.setattr(agent_module, "LLM_MODELS", ("other-cheap", "other-strong"))
     assert agent._model_for(pool) == "other-cheap"                  # лестницу в .env поменяли
+
+
+def test_order_summary_tells_how_long_the_key_limit_lasts():
+    class KeyLLM:
+        def budget_left(self):
+            return 10.0
+
+    agent = Agent(llm=KeyLLM())
+    assert agent._budget_note(0.2) == "; на ключе OpenRouter осталось ≈ $10.00 — примерно на 50 таких заказов"
+    assert agent._budget_note() == "; на ключе OpenRouter осталось ≈ $10.00"
+    assert Agent(llm=_NoLLM())._budget_note(0.2) == ""                  # лимит ключа не задан

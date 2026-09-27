@@ -101,36 +101,46 @@ def enable_file_log(kind: str) -> Optional[Path]:
     return path
 
 # ---------------------------------------------------------------------------
-# LLM / ProxyAPI / OpenRouter
+# LLM: OpenRouter (openrouter.ai) — единственный поставщик моделей
 # ---------------------------------------------------------------------------
-OPENAI_BASE_URL: str = os.getenv("OPENAI_BASE_URL", "https://api.proxyapi.ru/openai/v1")
-OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-# OpenRouter: цены моделей агент берёт с него при запуске, «обдумывание» отключает его параметром
-OPENROUTER: bool = "openrouter" in OPENAI_BASE_URL.lower()
-# Модель или «лестница» моделей через запятую — от дешёвой к сильной, например
-# google/gemini-2.5-flash-lite,google/gemini-2.5-flash,openai/gpt-5.4-mini. Каждый вид заданий агент
-# начинает первой (самой дешёвой) моделью; если в тренировке она часто ошибается с первого раза,
-# переводит этот вид на следующую. При запуске агент проверяет модели и пишет цену фото.
-LLM_MODELS: tuple[str, ...] = tuple(
-    m.strip() for m in os.getenv("LLM_MODEL", "gpt-5.4-mini").split(",") if m.strip()
-) or ("gpt-5.4-mini",)
+OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+# ключ со страницы openrouter.ai/keys; OPENAI_API_KEY — прежнее имя (старый .env продолжает работать)
+OPENROUTER_API_KEY: str = (os.getenv("OPENROUTER_API_KEY") or os.getenv("OPENAI_API_KEY") or "").strip()
+_PROVIDERS = (("gpt-", "openai"), ("chatgpt-", "openai"), ("o1", "openai"), ("o3", "openai"),
+              ("o4", "openai"), ("whisper", "openai"), ("gemini-", "google"), ("claude-", "anthropic"))
+
+
+def openrouter_model(name: str) -> str:
+    """У OpenRouter модели называются «поставщик/модель»: «gpt-5.4-mini» → «openai/gpt-5.4-mini»."""
+    name = name.strip()
+    if not name or "/" in name:
+        return name
+    return next((f"{provider}/{name}" for prefix, provider in _PROVIDERS if name.lower().startswith(prefix)), name)
+
+
+def parse_models(text: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(openrouter_model(m) for m in text.split(",") if m.strip()))
+
+
+# Модель или «лестница» моделей через запятую — от дешёвой к сильной. Каждый вид заданий агент
+# начинает первой (самой дешёвой) моделью; если в тренировке она ошибается с первого раза чаще,
+# чем допускает порог, этот вид переходит к следующей модели. Gemini 3.1 Flash-Lite — в 3 раза
+# дешевле gpt-5.4-mini и хорошо понимает фото; gpt-5.4-mini — для того, с чем она не справится
+DEFAULT_MODELS = "google/gemini-3.1-flash-lite,openai/gpt-5.4-mini"
+LLM_MODELS: tuple[str, ...] = parse_models(os.getenv("LLM_MODEL", "")) or parse_models(DEFAULT_MODELS)
 LLM_MODEL: str = LLM_MODELS[0]
 # Лестница: переход к следующей модели, когда в тренировке у текущей верно с первого раза меньше
-# этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели)
+# этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели или раньше, если
+# порог уже недостижим)
 LADDER_MIN_ACCURACY: float = float(os.getenv("LADDER_MIN_ACCURACY", "0.8"))
 LADDER_MIN_TASKS: int = int(os.getenv("LADDER_MIN_TASKS", "3"))
-# Reasoning-модели (gpt-5.x, o-серия): сколько «думать» перед ответом. auto — минимум, который
-# принимает модель (none → minimal → low): быстрее и дешевле; low / medium — точнее, но дороже
+# «Обдумывание» перед ответом (reasoning у OpenRouter): auto — выключено (none → minimal → low,
+# что примет модель): быстрее и дешевле; low / medium — точнее, но оплачивается как ответ
 LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "auto").strip().lower()
 # Перепроверка: основная модель не уверена (confidence ниже LLM_CHECK_BELOW) в ответе, который
 # отправляется, — решение перепроверяет более сильная модель LLM_CHECK_MODEL. Пусто — выключено
-LLM_CHECK_MODEL: str = os.getenv("LLM_CHECK_MODEL", "").strip()
+LLM_CHECK_MODEL: str = openrouter_model(os.getenv("LLM_CHECK_MODEL", ""))
 LLM_CHECK_BELOW: float = float(os.getenv("LLM_CHECK_BELOW", "0.7"))
-# Цена за 1 млн токенов «вход,вход из кэша,выход» — для стоимости в логе (например, цены ProxyAPI
-# в рублях из личного кабинета). Пусто — прайс OpenAI для известных моделей, в долларах
-LLM_PRICE: str = os.getenv("LLM_PRICE", "").strip()
-LLM_CHECK_PRICE: str = os.getenv("LLM_CHECK_PRICE", "").strip()
-LLM_PRICE_CURRENCY: str = os.getenv("LLM_PRICE_CURRENCY", "₽" if LLM_PRICE else "$").strip()
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 # план + рассуждения + ответ: 1024 токенов иногда не хватало на задания с несколькими полями
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2000"))
@@ -138,8 +148,8 @@ LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2000"))
 # «замораживал» агента на 10 минут.
 LLM_TIMEOUT: float = float(os.getenv("LLM_TIMEOUT", "60"))
 LLM_MAX_RETRIES: int = int(os.getenv("LLM_MAX_RETRIES", "3"))   # 429/5xx/обрывы — ретраи SDK
-# Structured Outputs (json_schema strict). Если прокси/модель не поддерживает —
-# коннектор сам откатится на json_object.
+# Structured Outputs (json_schema strict). Если модель не поддерживает — коннектор сам откатится
+# на json_object.
 LLM_STRUCTURED_OUTPUT: bool = _env_bool("LLM_STRUCTURED_OUTPUT", True)
 # Vision:
 #   auto  — все фото задания (скачиваются в исходном качестве, по одному или коллажами
@@ -161,15 +171,11 @@ VISION_IMAGE_SIDE: int = int(os.getenv("VISION_IMAGE_SIDE", "1024"))  # длин
 VISION_CELL: int = int(os.getenv("VISION_CELL", "384"))
 LLM_HISTORY_SIZE: int = int(os.getenv("LLM_HISTORY_SIZE", "14"))  # строк истории в промпте
 
-# Аудио: расшифровка через audio.transcriptions того же API (ProxyAPI/OpenAI/OpenRouter).
-# Модели пробуются по порядку; «…-diarize» дополнительно размечает говорящих. У OpenRouter
-# названия моделей с префиксом «openai/» — агент добавляет его сам.
+# Аудио: расшифровка через audio.transcriptions OpenRouter. Модели пробуются по порядку;
+# «…-diarize» дополнительно размечает говорящих. Префикс «openai/» агент добавляет сам.
 AUDIO_TRANSCRIBE: bool = _env_bool("AUDIO_TRANSCRIBE", True)
-TRANSCRIBE_MODELS: tuple[str, ...] = tuple(
-    (f"openai/{m}" if OPENROUTER and "/" not in m else m)
-    for m in (m.strip() for m in os.getenv("TRANSCRIBE_MODELS", "gpt-4o-transcribe,whisper-1").split(","))
-    if m
-)
+TRANSCRIBE_MODELS: tuple[str, ...] = parse_models(
+    os.getenv("TRANSCRIBE_MODELS", "openai/gpt-4o-transcribe,openai/whisper-1"))
 TRANSCRIBE_LANGUAGE: str = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
 # «Прослушайте звонок до конца»: перед отправкой ответа запись доигрывается до конца
 AUDIO_PLAY_TO_END: bool = _env_bool("AUDIO_PLAY_TO_END", True)
@@ -324,12 +330,13 @@ def _missing_key_hint() -> str:
     win = sys.platform == "win32"
     env, example = PROJECT_DIR / ".env", PROJECT_DIR / ".env.example"
     try:
-        key_in_example = example.is_file() and bool((dotenv_values(example).get("OPENAI_API_KEY") or "").strip())
+        values = dotenv_values(example) if example.is_file() else {}
+        key_in_example = bool((values.get("OPENROUTER_API_KEY") or values.get("OPENAI_API_KEY") or "").strip())
     except (OSError, UnicodeDecodeError):
         key_in_example = False
     if env.is_file():
         where = " (сейчас ключ вписан в .env.example — этот файл агент не читает)" if key_in_example else ""
-        return f"впишите ключ в файл {env} после OPENAI_API_KEY={where}"
+        return f"впишите ключ OpenRouter в файл {env} после OPENROUTER_API_KEY={where}"
     for name in (".env.txt", "env", "env.txt"):
         if (PROJECT_DIR / name).is_file():
             return (f"файла .env нет, но есть «{name}» — Блокнот сохранил его под другим именем. "
@@ -346,8 +353,9 @@ def validate_config(*, require_llm: bool = True) -> None:
 
     require_llm=False — для режима записи: там LLM не вызывается и ключ не нужен."""
     problems: list[str] = []
-    if require_llm and not OPENAI_API_KEY:
-        problems.append("OPENAI_API_KEY пуст — все запросы к LLM завершатся 401; " + _missing_key_hint())
+    if require_llm and not OPENROUTER_API_KEY:
+        problems.append("ключ OpenRouter не задан (OPENROUTER_API_KEY) — ключ создаётся на openrouter.ai/keys; "
+                        + _missing_key_hint())
     if LLM_VISION not in ("off", "auto", "image", "frame"):
         problems.append(f"LLM_VISION={LLM_VISION!r}: допустимо auto | frame | off")
     if "{query}" not in SEARCH_URL:
@@ -358,6 +366,14 @@ def validate_config(*, require_llm: bool = True) -> None:
     if require_llm and MAX_STEPS < 300:
         logger.warning("MAX_STEPS=%d: агент остановится после %d действий, даже если задания не кончились. "
                        "Для v4 уберите строку MAX_STEPS из .env (по умолчанию 2000)", MAX_STEPS, MAX_STEPS)
+    # настройки ProxyAPI из старого .env: агент работает только через OpenRouter
+    base = os.getenv("OPENAI_BASE_URL", "")
+    if require_llm and base and "openrouter.ai" not in base:
+        logger.warning("OPENAI_BASE_URL=%s больше не используется: агент работает только через OpenRouter. "
+                       "Удалите эту строку из .env и впишите ключ OpenRouter в OPENROUTER_API_KEY", base)
+    if require_llm and any(os.getenv(k) for k in ("LLM_PRICE", "LLM_CHECK_PRICE", "LLM_PRICE_CURRENCY")):
+        logger.warning("LLM_PRICE / LLM_PRICE_CURRENCY больше не нужны: точную стоимость в долларах агент "
+                       "получает от OpenRouter. Удалите эти строки из .env")
     if require_llm and LLM_VISION != "off" and LLM_VISION_DETAIL == "low":
         logger.warning("LLM_VISION_DETAIL=low: фото уходят модели уменьшенными до 512 px — мелкие детали "
                        "(грязь, надписи, номера на коллажах) теряются. Рекомендуется high")

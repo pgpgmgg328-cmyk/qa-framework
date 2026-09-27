@@ -1,4 +1,7 @@
-"""openrouter_connector.py v4 — LLM-клиент (ProxyAPI / OpenRouter, OpenAI-совместимый API).
+"""openrouter_connector.py v4 — LLM-клиент OpenRouter (OpenAI-совместимый API).
+
+v4.5: только OpenRouter — цены моделей из его /models, точная стоимость вызова из usage.cost,
+«обдумывание» — его параметром reasoning; расход и остаток лимита ключа (/key) — в логе.
 
 v4 (экономия токенов без потери точности):
 - пакет действий: за один ответ модель выбирает ответы на все видимые вопросы и отправляет —
@@ -33,22 +36,18 @@ from pydantic import ValidationError
 from config import (
     LLM_CHECK_BELOW,
     LLM_CHECK_MODEL,
-    LLM_CHECK_PRICE,
     LLM_MAX_RETRIES,
     LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_MODELS,
-    LLM_PRICE,
-    LLM_PRICE_CURRENCY,
     LLM_REASONING_EFFORT,
     LLM_STRUCTURED_OUTPUT,
     LLM_TEMPERATURE,
     LLM_TIMEOUT,
     LLM_VISION,
     LLM_VISION_DETAIL,
-    OPENAI_API_KEY,
-    OPENAI_BASE_URL,
-    OPENROUTER,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
     OPENROUTER_REFERER,
     TRANSCRIBE_LANGUAGE,
     TRANSCRIBE_MODELS,
@@ -283,54 +282,18 @@ DECISION_JSON_SCHEMA: dict[str, Any] = {
 }
 
 
-# Прайс OpenAI, $ за 1 млн токенов: вход, вход из кэша, выход. У прокси (ProxyAPI) цена своя: её
-# можно вписать в .env (LLM_PRICE) — тогда стоимость в логе будет по вашему тарифу, в рублях.
-OPENAI_PRICES: dict[str, tuple[float, float, float]] = {
-    "gpt-4o": (2.50, 1.25, 10.00),
-    "gpt-4o-mini": (0.15, 0.075, 0.60),
-    "gpt-4.1": (2.00, 0.50, 8.00),
-    "gpt-4.1-mini": (0.40, 0.10, 1.60),
-    "gpt-4.1-nano": (0.10, 0.025, 0.40),
-    "gpt-5": (1.25, 0.125, 10.00),
-    "gpt-5-mini": (0.25, 0.025, 2.00),
-    "gpt-5-nano": (0.05, 0.005, 0.40),
-    "gpt-5.1": (1.25, 0.125, 10.00),
-    "gpt-5.4": (2.50, 0.25, 15.00),
-    "gpt-5.4-mini": (0.75, 0.075, 4.50),
-    "gpt-5.4-nano": (0.20, 0.02, 1.25),
-    "gpt-5.5": (5.00, 0.50, 30.00),
-}
-
-
 def _model_name(model: str) -> str:
     """«openai/gpt-4o-2024-08-06» → «gpt-4o»."""
     return re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model.split("/")[-1].strip().lower())
 
 
-def parse_price(text: str) -> Optional[tuple[float, float, float]]:
-    """«вход,кэш,выход» за 1 млн токенов: «225,22.5,1350» или «0,75; 0,075; 4,5»."""
-    parts = text.split(";") if ";" in text else text.split(",")
-    try:
-        values = [float(x.strip().replace(" ", "").replace(",", ".")) for x in parts]
-    except ValueError:
-        return None
-    if len(values) == 2:                  # без цены кэша — как обычный вход
-        values = [values[0], values[0], values[1]]
-    return tuple(values) if len(values) == 3 else None  # type: ignore[return-value]
-
-
-# Цены, загруженные при запуске со списка моделей прокси (OpenRouter отдаёт их в /models)
+# Цены моделей, $ за 1 млн токенов: вход, вход из кэша, выход — со списка моделей OpenRouter (/models),
+# загружаются при запуске. Стоимость вызовов OpenRouter сообщает сам (usage.cost) — по ней и лог.
 LIVE_PRICES: dict[str, tuple[float, float, float]] = {}
 
 
 def model_price(model: str) -> Optional[tuple[float, float, float]]:
-    """Цена модели для оценки стоимости. Свои цены (LLM_PRICE) — для основной модели и
-    модели перепроверки (LLM_CHECK_PRICE); иначе цены OpenRouter, иначе прайс OpenAI."""
-    if LLM_PRICE:
-        if model == LLM_MODEL:
-            return parse_price(LLM_PRICE)
-        return parse_price(LLM_CHECK_PRICE) if LLM_CHECK_PRICE and model == LLM_CHECK_MODEL else None
-    return LIVE_PRICES.get(model) or OPENAI_PRICES.get(_model_name(model))
+    return LIVE_PRICES.get(model)
 
 
 def _live_price(pricing: Any) -> Optional[tuple[float, float, float]]:
@@ -346,26 +309,30 @@ def _live_price(pricing: Any) -> Optional[tuple[float, float, float]]:
     return (prompt, cached, completion) if prompt or completion else None
 
 
-def _money(value: float, currency: str) -> str:
-    if currency in ("$", "USD", "usd"):
-        if value >= 1:
-            return f"${value:.2f}"
-        if value >= 0.001 or value <= 0:
-            return f"${value:.4f}"
-        return "$" + f"{value:.6f}".rstrip("0")        # доли цента у дешёвых моделей
-    return f"{value:.2f} {currency}"
+def _money(value: float) -> str:
+    if value >= 1:
+        return f"${value:.2f}"
+    if value >= 0.001 or value <= 0:
+        return f"${value:.4f}"
+    return "$" + f"{value:.6f}".rstrip("0")        # доли цента у дешёвых моделей
+
+
+def _number(value: Any) -> Optional[float]:
+    try:
+        return None if value is None or isinstance(value, bool) else float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
 class UsageStats:
-    """Расход: вызовы модели, токены (вход, из них из кэша OpenAI, выход) и стоимость."""
+    """Расход: вызовы модели, токены (вход, из них из кэша, выход) и стоимость в долларах."""
     calls: int = 0
     prompt: int = 0
     cached: int = 0
     completion: int = 0
     cost: float = 0.0
     unpriced: int = 0                     # вызовы моделей, цена которых неизвестна
-    currency: str = "$"
 
     def add(self, usage: Any, price: Optional[tuple[float, float, float]] = None) -> None:
         prompt = int(getattr(usage, "prompt_tokens", 0) or 0)
@@ -376,9 +343,9 @@ class UsageStats:
         self.prompt += prompt
         self.completion += completion
         self.cached += cached
-        reported = getattr(usage, "cost", None)             # OpenRouter сообщает точную стоимость, $
-        if isinstance(reported, (int, float)) and self.currency in ("$", "USD", "usd"):
-            self.cost += float(reported)
+        reported = _number(getattr(usage, "cost", None))    # OpenRouter сообщает точную стоимость, $
+        if reported is not None:
+            self.cost += reported
         elif price is None:
             self.unpriced += 1
         else:
@@ -386,19 +353,18 @@ class UsageStats:
             self.cost += (fresh * price[0] + cached * price[1] + completion * price[2]) / 1_000_000
 
     def snapshot(self) -> "UsageStats":
-        return UsageStats(self.calls, self.prompt, self.cached, self.completion, self.cost,
-                          self.unpriced, self.currency)
+        return UsageStats(self.calls, self.prompt, self.cached, self.completion, self.cost, self.unpriced)
 
     def since(self, before: "UsageStats") -> "UsageStats":
         return UsageStats(self.calls - before.calls, self.prompt - before.prompt,
                           self.cached - before.cached, self.completion - before.completion,
-                          self.cost - before.cost, self.unpriced - before.unpriced, self.currency)
+                          self.cost - before.cost, self.unpriced - before.unpriced)
 
     def render(self) -> str:
         cached = f" (из кэша {self.cached})" if self.cached else ""
         text = f"вызовов модели {self.calls}, токенов: вход {self.prompt}{cached}, выход {self.completion}"
         if self.calls > self.unpriced:
-            text += f", ≈ {_money(self.cost, self.currency)}"
+            text += f", ≈ {_money(self.cost)}"
             if self.unpriced:
                 text += " (без вызовов моделей с неизвестной ценой)"
         return text
@@ -410,31 +376,21 @@ class _ModelParams:
     tokens_param: str = "max_tokens"
     temperature: bool = True
     structured: bool = True
-    reasoning: list[str] = field(default_factory=list)   # очередь значений reasoning_effort
+    reasoning: list[str] = field(default_factory=list)   # очередь значений reasoning.effort
 
 
 def _initial_params(model: str) -> _ModelParams:
-    """reasoning-модели (gpt-5.x, o-серия): max_completion_tokens и минимальное «обдумывание»
-    — иначе лишний запрос с ошибкой на старте и медленные дорогие ответы."""
+    """Уровень «обдумывания» у OpenRouter задаётся одинаково для всех моделей (reasoning.effort):
+    без него Gemini и gpt-5 «думают» по умолчанию — это оплачивается как ответ. Значение, которое
+    модель не принимает, заменяется следующим (none → minimal → low). gpt-5 и o-серия —
+    max_completion_tokens."""
     params = _ModelParams(structured=LLM_STRUCTURED_OUTPUT)
     effort = LLM_REASONING_EFFORT
-    if OPENROUTER:
-        # у OpenRouter уровень «обдумывания» задаётся одинаково для всех моделей (reasoning.effort);
-        # без него Gemini Flash и gpt-5 «думают» по умолчанию — это оплачивается как ответ
-        if _model_name(model).startswith(("gpt-5", "o1", "o3", "o4")):
-            params.tokens_param = "max_completion_tokens"
-        if effort in ("", "auto"):
-            params.reasoning = ["none", "minimal", "low"]
-        elif effort not in ("off", "default"):
-            params.reasoning = [effort]
-        return params
     if _model_name(model).startswith(("gpt-5", "o1", "o3", "o4")):
         params.tokens_param = "max_completion_tokens"
-        if effort in ("", "auto"):
-            params.reasoning = ["none", "minimal", "low"]
-        elif effort not in ("off", "default"):
-            params.reasoning = [effort]
-    elif effort not in ("", "auto", "off", "default"):
+    if effort in ("", "auto"):
+        params.reasoning = ["none", "minimal", "low"]
+    elif effort not in ("off", "default"):
         params.reasoning = [effort]
     return params
 
@@ -452,7 +408,7 @@ def _probe_png(size: int = 512) -> str:
 
 
 class ModelUnavailable(RuntimeError):
-    """Модели нет у прокси (или ключ не даёт к ней доступа) — работать дальше бессмысленно."""
+    """Модели нет у OpenRouter (или ключ не подходит, кончились деньги) — работать бессмысленно."""
 
 
 class DecisionParseError(ValueError):
@@ -460,36 +416,34 @@ class DecisionParseError(ValueError):
 
 
 class LLMConnector:
-    """Клиент для взаимодействия с LLM через ProxyAPI / OpenRouter (OpenAI-совместимый)."""
+    """Клиент OpenRouter (OpenAI-совместимый API)."""
 
     def __init__(self) -> None:
-        headers: Optional[dict[str, str]] = None
-        if "openrouter.ai" in OPENAI_BASE_URL:
-            # необязательные заголовки OpenRouter (атрибуция приложения)
-            headers = {"HTTP-Referer": OPENROUTER_REFERER, "X-Title": "T-Work Agent"}
         self._client = openai.AsyncOpenAI(
-            api_key=OPENAI_API_KEY,
-            base_url=OPENAI_BASE_URL,
+            api_key=OPENROUTER_API_KEY,
+            base_url=OPENROUTER_BASE_URL,
             timeout=LLM_TIMEOUT,          # v2: дефолт SDK 600 с — зависший запрос блокировал агента
             max_retries=LLM_MAX_RETRIES,  # 429/5xx/обрывы соединения — с экспоненциальной паузой
-            default_headers=headers,
+            # необязательные заголовки OpenRouter (атрибуция приложения)
+            default_headers={"HTTP-Referer": OPENROUTER_REFERER, "X-Title": "T-Work Agent"},
         )
         self._vision_enabled = True
         self._dead_transcribers: set[str] = set()
         self._dead_models: set[str] = set()          # недоступные модели из «Заметок»
-        # лестница моделей; модели, которых нет у прокси, проверка на старте убирает
+        # лестница моделей; модели, которых нет у OpenRouter, проверка на старте убирает
         self.models: list[str] = list(LLM_MODELS)
         self._unpaid_warned = -1e9
-        self.usage = UsageStats(currency=LLM_PRICE_CURRENCY)
+        self.usage = UsageStats()
+        self._key_left: Optional[float] = None       # остаток лимита ключа на старте, $
         # параметры запроса по моделям: reasoning-модели (o-серия, gpt-5) требуют
         # max_completion_tokens, не все принимают temperature — подстраиваются по ошибкам 400
         self._params: dict[str, _ModelParams] = {}
         self._last_error: Optional[Exception] = None
         self._last_usage: Any = None
         logger.info(
-            "LLM инициализирован: %s base=%s%s",
-            f"model={LLM_MODEL}" if len(LLM_MODELS) == 1 else "лестница моделей " + " → ".join(LLM_MODELS),
-            OPENAI_BASE_URL, f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
+            "LLM (OpenRouter): %s%s",
+            f"модель {LLM_MODEL}" if len(LLM_MODELS) == 1 else "лестница моделей " + " → ".join(LLM_MODELS),
+            f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
         )
 
     # ------------------------------------------------------------------
@@ -497,14 +451,16 @@ class LLMConnector:
     # ------------------------------------------------------------------
 
     async def check_model(self) -> None:
-        """Модель доступна у прокси, и сколько токенов стоит фото. Модели нет — ModelUnavailable
-        (агент не открывает браузер зря); проверка не прошла по другой причине — предупреждение."""
+        """Модели доступны у OpenRouter, и сколько токенов стоит фото; расход и лимит ключа.
+        Модели нет — ModelUnavailable (агент не открывает браузер зря); проверка не прошла по
+        другой причине — предупреждение."""
+        await self._load_key_info()
         await self._load_live_prices()
         for model in dict.fromkeys(m for m in (*LLM_MODELS, LLM_CHECK_MODEL) if m):
             try:
                 await self._check_one(model, photo=model in LLM_MODELS and LLM_VISION != "off")
             except ModelUnavailable as exc:
-                # модель лестницы сняли с прокси (Google отключает старые Gemini) — работать остальными
+                # модель лестницы сняли с OpenRouter (Google отключает старые Gemini) — работать остальными
                 if model not in self.models or len(self.models) < 2 or not self._model_missing(self._last_error):
                     raise
                 self.models.remove(model)
@@ -522,13 +478,13 @@ class LLMConnector:
             return
         base = int(getattr(self._last_usage, "prompt_tokens", 0) or 0)
         line = f"Модель {model}: доступна, ответ за {time.monotonic() - started:.1f} с"
-        if photo and base:                   # прокси сообщает расход — можно узнать цену фото
+        if photo and base:                   # OpenRouter сообщает расход — можно узнать цену фото
             image = [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {
                 "url": f"data:image/png;base64,{_probe_png()}", "detail": LLM_VISION_DETAIL}}]
             if await self._complete([{"role": "user", "content": image}], LLM_TEMPERATURE, model) is not None:
                 tokens = int(getattr(self._last_usage, "prompt_tokens", 0) or 0) - base
                 price = model_price(model)
-                cost = f" (≈ {_money(tokens * price[0] / 1_000_000, self.usage.currency)})" if price else ""
+                cost = f" (≈ {_money(tokens * price[0] / 1_000_000)})" if price else ""
                 line += f"; фото 512×512 — {tokens} токенов на вход{cost}"
                 if tokens > 1500:        # у gpt-4o — 255, у новых моделей — 400–650
                     logger.warning(
@@ -536,17 +492,42 @@ class LLMConnector:
                         "250–650). Задания с фото обойдутся в разы дороже — выберите другую модель "
                         "(LLM_MODEL в .env) или поставьте LLM_VISION_DETAIL=low", model, tokens)
         price = model_price(model)
-        if price and self.usage.currency in ("$", "USD", "usd"):
+        if price:
             line += f"; цена за 1 млн токенов: вход ${price[0]:g}, выход ${price[2]:g}"
         logger.info(line)
 
+    async def _load_key_info(self) -> None:
+        """Расход и лимит ключа OpenRouter (GET /key): сколько потрачено и сколько осталось."""
+        try:
+            info = await self._client.with_options(timeout=20, max_retries=1).get("/key", cast_to=object)
+        except Exception as exc:  # noqa: BLE001 — без этих сведений агент работает
+            logger.debug("Сведения о ключе OpenRouter не получены: %s", exc)
+            return
+        data = info.get("data") if isinstance(info, dict) else None
+        if not isinstance(data, dict):
+            return
+        spent, today = _number(data.get("usage")), _number(data.get("usage_daily"))
+        limit, left = _number(data.get("limit")), _number(data.get("limit_remaining"))
+        parts = []
+        if spent is not None:
+            parts.append(f"потрачено всего ${spent:.2f}" + (f", сегодня ${today:.2f}" if today is not None else ""))
+        if limit and left is not None:
+            self._key_left = left
+            parts.append(f"лимит ключа ${limit:.2f}, осталось ${left:.2f}")
+        else:
+            parts.append("лимит расходов у ключа не задан — задайте его на openrouter.ai/keys: OpenRouter не даст "
+                         "потратить больше, а агент будет показывать остаток")
+        logger.info("Ключ OpenRouter: %s", "; ".join(parts))
+
+    def budget_left(self) -> Optional[float]:
+        """Остаток лимита ключа сейчас, $: на старте минус потраченное за запуск (None — лимита нет)."""
+        return None if self._key_left is None else max(self._key_left - self.usage.cost, 0.0)
+
     async def _load_live_prices(self) -> None:
         """Цены моделей со списка моделей OpenRouter (pricing для каждой модели)."""
-        if LLM_PRICE or not OPENROUTER:
-            return
         try:
             page = await self._client.with_options(timeout=20, max_retries=1).models.list()
-        except Exception as exc:  # noqa: BLE001 — без цен агент работает, стоимость — по прайсу OpenAI
+        except Exception as exc:  # noqa: BLE001 — без цен агент работает, стоимость сообщает OpenRouter
             logger.debug("Список моделей не получен: %s", exc)
             return
         for item in getattr(page, "data", []) or []:
@@ -557,7 +538,7 @@ class LLMConnector:
 
     @staticmethod
     def _model_missing(exc: Optional[Exception]) -> bool:
-        """Ошибка значит «такой модели нет у прокси / нет к ней доступа»."""
+        """Ошибка значит «такой модели нет у OpenRouter / нет к ней доступа»."""
         message = str(exc).lower()
         return isinstance(exc, (openai.NotFoundError, openai.PermissionDeniedError)) or (
             isinstance(exc, openai.BadRequestError) and "model" in message
@@ -569,14 +550,17 @@ class LLMConnector:
         exc = self._last_error
         missing = self._model_missing(exc)
         if isinstance(exc, openai.AuthenticationError):
-            raise ModelUnavailable(f"Ключ OPENAI_API_KEY не подходит к {OPENAI_BASE_URL}: {str(exc)[:200]}")
+            raise ModelUnavailable(
+                f"Ключ OpenRouter не подходит: {str(exc)[:200]}. Впишите в .env после OPENROUTER_API_KEY= ключ "
+                "со страницы openrouter.ai/keys")
         if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
-            raise ModelUnavailable(f"Прокси отказал в оплате запроса (недостаточно средств на балансе?): "
-                                   f"{str(exc)[:200]}")
+            raise ModelUnavailable(
+                f"OpenRouter отказал в оплате запроса — на балансе нет денег или исчерпан лимит ключа: "
+                f"{str(exc)[:200]}. Пополните баланс (openrouter.ai/settings/credits) или поднимите лимит ключа")
         if missing:
             raise ModelUnavailable(
-                f"Модель {model} недоступна у {OPENAI_BASE_URL}: {str(exc)[:200]}. Впишите в .env другую "
-                "модель (LLM_MODEL=…) из списка моделей в личном кабинете прокси")
+                f"Модель {model} недоступна у OpenRouter: {str(exc)[:200]}. Впишите в .env другую модель "
+                "(LLM_MODEL=…); названия — на openrouter.ai/models, вида «google/gemini-3.1-flash-lite»")
 
     # ------------------------------------------------------------------
     # Решение
@@ -606,7 +590,7 @@ class LLMConnector:
             model = main_model
         decision = await self._ask(model, messages, temperature)
         if decision is None and model != main_model and self._model_missing(self._last_error):
-            # модель, закреплённая в заметках, с опечаткой или снята с прокси — не пропускать задания
+            # модель, закреплённая в заметках, с опечаткой или снята с OpenRouter — не пропускать задания
             self._dead_models.add(model)
             logger.error("⚠ Модель %s недоступна (%s) — решаю моделью %s. Проверьте название модели в "
                          "«Заметках» базы знаний", model, str(self._last_error)[:160], main_model)
@@ -624,8 +608,8 @@ class LLMConnector:
         return decision
 
     def _warn_if_unpaid(self) -> None:
-        """402 — на балансе прокси кончились деньги: сказать прямо (не чаще раза в 10 минут).
-        Агент не останавливается: после пополнения баланса продолжит сам."""
+        """402 — на балансе OpenRouter кончились деньги или исчерпан лимит ключа: сказать прямо
+        (не чаще раза в 10 минут). Агент не останавливается: после пополнения продолжит сам."""
         exc = self._last_error
         if not (isinstance(exc, openai.APIStatusError) and exc.status_code == 402):
             return
@@ -633,8 +617,8 @@ class LLMConnector:
         if now - self._unpaid_warned < 600:
             return
         self._unpaid_warned = now
-        logger.error("💳 Прокси отказал в оплате запроса — похоже, на балансе закончились деньги. Пополните "
-                     "баланс: агент ждёт и продолжит сам (%s)", str(exc)[:160])
+        logger.error("💳 OpenRouter отказал в оплате запроса — на балансе закончились деньги или исчерпан лимит "
+                     "ключа. Пополните баланс или поднимите лимит: агент ждёт и продолжит сам (%s)", str(exc)[:160])
 
     @staticmethod
     def _needs_check(decision: LLMDecision, model: str = "") -> bool:
@@ -683,14 +667,10 @@ class LLMConnector:
         }
         if params.temperature:
             kwargs["temperature"] = temperature
-        extra: dict[str, Any] = {"usage": {"include": True}} if OPENROUTER else {}   # точная стоимость в ответе
+        extra: dict[str, Any] = {"usage": {"include": True}}          # точная стоимость вызова в ответе
         if params.reasoning:
-            if OPENROUTER:
-                extra["reasoning"] = {"effort": params.reasoning[0]}
-            else:
-                kwargs["reasoning_effort"] = params.reasoning[0]
-        if extra:
-            kwargs["extra_body"] = extra
+            extra["reasoning"] = {"effort": params.reasoning[0]}
+        kwargs["extra_body"] = extra
         self._last_error = None
         try:
             response = await self._client.chat.completions.create(**kwargs)
@@ -892,7 +872,7 @@ class LLMConnector:
                     if kwargs["response_format"] == "json" or not any(
                             w in message for w in ("response_format", "timestamp", "verbose", "diarized", "chunking")):
                         raise
-                    # прокси не отдаёт таймкоды/говорящих — простой текст лучше, чем ничего
+                    # OpenRouter не отдаёт таймкоды/говорящих — простой текст лучше, чем ничего
                     logger.info("Расшифровка %s: формат %s не принят — прошу простой текст", model,
                                 kwargs["response_format"])
                     for key in ("timestamp_granularities", "extra_body"):
@@ -992,7 +972,7 @@ def _format_transcript(result: Any) -> str:
     if hasattr(result, "model_dump"):
         try:
             data = result.model_dump()
-        except Exception:  # noqa: BLE001 — формат ответа прокси может отличаться
+        except Exception:  # noqa: BLE001 — формат ответа может отличаться
             data = {}
     elif isinstance(result, dict):
         data = result
