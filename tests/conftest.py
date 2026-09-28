@@ -11,6 +11,7 @@ os.environ.update({
     "HEADLESS": "true",
     "OPENROUTER_API_KEY": "test-key",
     "LLM_MODEL": "openai/gpt-5.4-mini",     # одна модель; лестницу задают тесты лестницы
+    "LLM_OUTAGE_WAIT": "0",                 # недоступность OpenRouter — без ожидания (тесты ожидания сами)
     "TARGET_URL": "https://t-work.test/index.html?task=task_tree",
     "LLM_VISION": "off",
     "PAGE_ZOOM": "75%",            # проверяем клики именно с масштабированием

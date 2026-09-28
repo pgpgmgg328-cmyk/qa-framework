@@ -407,14 +407,20 @@ window.openExitDialog = () => {
     h('button', { type: 'button', onclick: () => { window.__log.push('exit:LEFT'); d.remove(); } }, 'Да, выйти'));
 };
 $('#exit').addEventListener('click', () => window.openExitDialog());
+// ?instr=late|pdf|json — инструкция не текстом в диалоге (как на T-Work): в диалоге пусто, кнопка
+// «Открыть в новой вкладке» открывает страницу инструкции; там текст догружается скриптом (late),
+// показывается PDF (pdf) или приходит JSON с HTML и рисуется не текстом (json)
+const INSTR = params.get('instr') || '';
 const openInstruction = () => {
   const body = h('div', { class: 'custom-instruction-viewer__instruction-block' });
   const loader = h('tui-loader', { class: 'custom-instruction-viewer__loader _loading' }, h('div', { class: 't-loader' }));
   const d = dialog(h('div', { class: 'custom-instruction-viewer__container' }, h('span', {}, 'Инструкция к заданию'),
-      h('button', { type: 'button', class: 'custom-instruction-viewer__button-link', 'aria-label': 'Открыть в новой вкладке' }),
+      h('button', { type: 'button', class: 'custom-instruction-viewer__button-link', 'aria-label': 'Открыть в новой вкладке',
+                    onclick: () => { if (INSTR) window.open('https://klecks-operator.test/klecks/instruction/3a1e?kind=' + INSTR); } }),
       h('button', { type: 'button', onclick: () => { window.__log.push('instruction:closed'); d.remove(); } }, 'Закрыть')),
     loader, body);
   window.__log.push('instruction:opened');
+  if (INSTR) { setTimeout(() => loader.classList.remove('_loading'), 300); return; }
   setTimeout(() => {
     loader.classList.remove('_loading');
     body.innerHTML = '<h2>Проверка наличия фото</h2><p>Для каждой поверхности банкомата должны быть фото: лицевая часть, ' +

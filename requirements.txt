@@ -2,3 +2,5 @@ playwright>=1.44
 pydantic>=2.5
 openai>=1.40
 python-dotenv>=1.0
+# LLM_PROXY=socks5://… (запросы к OpenRouter через VPN-клиент)
+socksio>=1.0

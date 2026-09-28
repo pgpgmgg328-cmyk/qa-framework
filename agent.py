@@ -68,6 +68,7 @@ from config import (
     TASK_URL_KEYWORDS,
     WEB_RESEARCH,
 )
+from documents import DocumentCatcher, describe_documents, describe_page, meaningful, page_text
 from dom_parser import DomParser, _plain_text, is_denied_button
 from knowledge import KnowledgeBase, PoolKnowledge
 from media import MediaManager
@@ -98,6 +99,7 @@ logger = logging.getLogger("twork.agent")
 # Модель ответила «skip» (ждать): следующий вызов — после изменения страницы, но не позже чем через
 # столько секунд (первое ожидание подряд / следующие)
 SKIP_WAIT_FIRST, SKIP_WAIT_NEXT = 8.0, 20.0
+OUTAGE_PAUSE = 5.0          # OpenRouter недоступен: пауза перед следующей попыткой шага, с
 
 
 class StepResult(str, Enum):
@@ -139,6 +141,7 @@ def _exam_outcome(text: str) -> Optional[bool]:
         return True
     return None
 _INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
+_NEW_TAB_RE = re.compile(r"нов(ой|ую|ом) (вкладк|окн)", re.IGNORECASE)     # «Открыть в новой вкладке»
 
 # Всплывающее окно на ГЛАВНОЙ странице сайта (новости, объявления) поверх фрейма задания
 _JS_PAGE_POPUP = r"""
@@ -305,6 +308,8 @@ class Agent:
         self._pool: Optional[PoolKnowledge] = None
         self._frame_shot: Optional[str] = None
         self._frame_shot_task = ""
+        self._doc_catcher: Optional[DocumentCatcher] = None   # документы, пока открыта инструкция
+        self._instruction_seen = ""                           # что было на вкладке инструкции (для лога)
         # учёт токенов: у LLMConnector есть usage (сценарные «LLM» тестов — без него)
         usage = getattr(self._llm, "usage", None)
         self._task_usage_start = usage.snapshot() if usage is not None else None
@@ -322,7 +327,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.5 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.6 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -487,8 +492,19 @@ class Agent:
             state.task_preview[:50], f" · {self._model_for(self._pool)}" if len(self._ladder) > 1 else "",
             "-" * 10,
         )
-        context = await self._build_context(frame, state)
+        context = await self._build_context(frame, state)       # ждёт и расшифровку записей
+        if state.audios and self._media.transcripts_failed(state):
+            # без расшифровки ответ на задание со звонком — угадывание
+            return await self._wait_for_human(
+                "запись не удалось расшифровать ни одной моделью — ответ без неё был бы угадыванием")
         decision = await self._llm.decide(state, context)
+        if getattr(self._llm, "unavailable", False):
+            # OpenRouter недоступен (блокировка, нет связи, нет денег) — агент ждал и не решал: шаг
+            # не расходует бюджет задания (иначе по его исчерпании ушёл бы случайный ответ) и не
+            # считается пропуском модели
+            self._memory.steps -= 1
+            await asyncio.sleep(OUTAGE_PAUSE)
+            return StepResult.ACTED
         if decision.plan:
             self._memory.plan = decision.plan
 
@@ -765,6 +781,7 @@ class Agent:
             )
             self._memory.reset(state.task_identifier)
             self._media.forget_task()
+            self._stop_catching_documents()
             self._frame_shot = None
             pool = self._knowledge.for_state(state)
             if pool is not None and pool is not self._pool:
@@ -924,6 +941,8 @@ class Agent:
         body = text
         if len(re.sub(r"\s+", "", body)) < 200 and not failed:
             extra = await self._read_instruction_tab(frame, state)
+            if not meaningful(extra):
+                extra = await self._instruction_from_documents() or extra
             if extra:
                 body = f"{text}\n{extra}"
         if self._pool is not None:
@@ -938,7 +957,10 @@ class Agent:
         if failed:
             logger.warning("Инструкция не загрузилась (сообщение платформы) — продолжаю без неё")
         elif len(re.sub(r"\s+", "", body)) < 200:
-            logger.warning("Инструкция открыта, но текста в ней не найдено (%d симв.)", len(body))
+            logger.warning("Инструкция открыта, но текста в ней не найдено (%d симв.). Вкладка: %s. Скачано: %s",
+                           len(body), self._instruction_seen or "не открывалась",
+                           describe_documents(self._doc_catcher))
+        self._stop_catching_documents()
         await self._close_dialog(frame, state)
         return StepResult.ACTED
 
@@ -965,30 +987,77 @@ class Agent:
         candidates = [
             e for e in state.visible_elements
             if e.container == "dialog" and e.kind in (ElementKind.BUTTON, ElementKind.OTHER)
-            and not _label_matches(e.text, close_like) and _INSTRUCTION_RE.search(e.text or "")
+            and not _label_matches(e.text, close_like)
+            and (_INSTRUCTION_RE.search(e.text or "") or _NEW_TAB_RE.search(e.text or ""))
         ]
         if not candidates:
             return ""
         context = self._browser.context
+        if self._doc_catcher is None:
+            self._start_catching_documents()
         before = set(context.pages)
         await self._browser.click_element(frame, candidates[0])
         await asyncio.sleep(2.0)
         new_pages = [p for p in context.pages if p not in before]
         text = ""
         for page in new_pages:
-            try:
-                await page.wait_for_load_state("load", timeout=15_000)
-                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
-                logger.info("Инструкция прочитана из вкладки %s (%d симв.)", page.url[:80], len(text))
-            except PlaywrightError as exc:
-                logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
-            finally:
-                try:
-                    await page.close()
-                except PlaywrightError:
-                    pass
+            text = await self._read_tab(page) or text
         await self._browser.ensure_front()
         return text.strip()
+
+    async def _read_tab(self, page) -> str:
+        """Текст вкладки с инструкцией: страница догружает его скриптом — ждём до INSTRUCTION_WAIT
+        секунд, читаем все фреймы. Вкладку закрываем."""
+        text = ""
+        try:
+            await page.wait_for_load_state("load", timeout=15_000)
+            catcher = self._doc_catcher
+            text = await page_text(page, INSTRUCTION_WAIT,
+                                   give_up=(lambda: bool(catcher.documents)) if catcher is not None else None)
+            logger.info("Инструкция прочитана из вкладки %s (%d симв.)", page.url[:80], len(text))
+            if not meaningful(text):
+                self._instruction_seen = f"{page.url[:80]}: {await describe_page(page)}"
+        except PlaywrightError as exc:
+            logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
+        finally:
+            try:
+                await page.close()
+            except PlaywrightError:
+                pass
+        return text
+
+    def _start_catching_documents(self) -> None:
+        self._stop_catching_documents()
+        self._instruction_seen = ""
+        try:
+            self._doc_catcher = DocumentCatcher(self._browser.context)
+        except PlaywrightError as exc:
+            logger.debug("Документы инструкции не отслеживаются: %s", _short(exc))
+
+    def _stop_catching_documents(self) -> None:
+        if self._doc_catcher is not None:
+            self._doc_catcher.close()
+            self._doc_catcher = None
+
+    async def _instruction_from_documents(self) -> str:
+        """Инструкция не текстом страницы: JSON с текстом от сервера или PDF (его переписывает
+        модель — один раз для вида заданий, дальше текст в knowledge/)."""
+        catcher = self._doc_catcher
+        if catcher is None:
+            return ""
+        await catcher.settle()
+        text = catcher.json_text()
+        if meaningful(text):
+            logger.info("📘 Инструкция взята из ответа сервера (%d симв.)", len(text))
+            return text
+        reader = getattr(self._llm, "read_document", None)
+        for doc in catcher.pdfs()[:2] if reader is not None else []:
+            logger.info("📘 Инструкция — PDF (%d КБ): переписываю её текст моделью (один раз для вида заданий)",
+                        max(len(doc.data) // 1024, 1))
+            text = await reader(doc.data, "instruction.pdf", "application/pdf") or ""
+            if meaningful(text):
+                return text
+        return ""
 
     async def _close_dialog(self, frame: Frame, state: PageState) -> None:
         fresh = await DomParser(frame).parse(quiet=True)
@@ -1028,26 +1097,28 @@ class Agent:
             return False
         logger.info("📘 Открываю «%s», чтобы прочитать правила задания", link.label())
         context = self._browser.context
+        self._start_catching_documents()
         before = set(context.pages)
         outcome = await self._browser.click_element(frame, link)
         if not outcome.ok:
+            self._stop_catching_documents()
             return False
         await self._browser.wait_settle(frame)
         await asyncio.sleep(0.5)
         # инструкция открылась в новой вкладке, а не диалогом
-        for page in [p for p in context.pages if p not in before]:
-            try:
-                await page.wait_for_load_state("load", timeout=15_000)
-                text = await page.evaluate("() => document.body ? document.body.innerText : ''")
+        new_pages = [p for p in context.pages if p not in before]
+        for page in new_pages:
+            text = await self._read_tab(page)
+            if not meaningful(text):
+                text = await self._instruction_from_documents()
+            if meaningful(text):
                 self._knowledge.save_instruction(pool, text, f"вкладка {page.url[:80]}")
-            except PlaywrightError as exc:
-                logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
-            finally:
-                try:
-                    await page.close()
-                except PlaywrightError:
-                    pass
+            else:
+                logger.warning("Инструкция во вкладке без текста — %s; %s", self._instruction_seen,
+                               describe_documents(self._doc_catcher))
             await self._browser.ensure_front()
+        if new_pages:
+            self._stop_catching_documents()
         return True
 
     async def _maybe_read_tooltips(self, frame: Frame, state: PageState) -> None:
@@ -1679,10 +1750,12 @@ class Agent:
             )
             await self._do_submit(frame, state, None)
             return StepResult.ACTED
-        logger.error(
-            "Бюджет задания (%d шагов) исчерпан, ответ не найден. Нужна помощь человека: "
-            "жду смены задания до %.0f с", MAX_STEPS_PER_TASK, MAX_IDLE_SECONDS,
-        )
+        return await self._wait_for_human(f"бюджет задания ({MAX_STEPS_PER_TASK} шагов) исчерпан, ответ не найден")
+
+    async def _wait_for_human(self, reason: str) -> StepResult:
+        """Агент сам не справится: сказать почему и ждать, пока человек не сменит задание."""
+        logger.error("%s. Нужна помощь человека: решите задание сами — жду смены задания до %.0f с",
+                     reason[:1].upper() + reason[1:], MAX_IDLE_SECONDS)
         identity = self._identity
         deadline = time.monotonic() + MAX_IDLE_SECONDS
         while time.monotonic() < deadline:

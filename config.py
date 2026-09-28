@@ -4,6 +4,7 @@
 """
 
 import logging
+import importlib.util
 import os
 import sys
 import time
@@ -141,6 +142,14 @@ LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "auto").strip().lo
 # отправляется, — решение перепроверяет более сильная модель LLM_CHECK_MODEL. Пусто — выключено
 LLM_CHECK_MODEL: str = openrouter_model(os.getenv("LLM_CHECK_MODEL", ""))
 LLM_CHECK_BELOW: float = float(os.getenv("LLM_CHECK_BELOW", "0.7"))
+# Прокси только для запросов к OpenRouter (браузер с T-Work работает напрямую). Нужен, если
+# OpenRouter отвечает 403 «Access denied by security policy»: из России OpenRouter без VPN не
+# пускает, а T-Work через VPN может не работать. Пример: socks5://127.0.0.1:10808 — локальный порт
+# вашего VPN-клиента (v2rayN, Hiddify, Nekoray…), или http://логин:пароль@адрес:порт
+LLM_PROXY: str = os.getenv("LLM_PROXY", "").strip()
+# OpenRouter временно недоступен (блокировка, нет связи, нет денег): сколько секунд ждать и
+# повторять запрос внутри одного шага; дальше агент возвращается к странице и пробует снова
+LLM_OUTAGE_WAIT: float = float(os.getenv("LLM_OUTAGE_WAIT", "300"))
 LLM_TEMPERATURE: float = float(os.getenv("LLM_TEMPERATURE", "0.0"))
 # план + рассуждения + ответ: 1024 токенов иногда не хватало на задания с несколькими полями
 LLM_MAX_TOKENS: int = int(os.getenv("LLM_MAX_TOKENS", "2000"))
@@ -171,11 +180,15 @@ VISION_IMAGE_SIDE: int = int(os.getenv("VISION_IMAGE_SIDE", "1024"))  # длин
 VISION_CELL: int = int(os.getenv("VISION_CELL", "384"))
 LLM_HISTORY_SIZE: int = int(os.getenv("LLM_HISTORY_SIZE", "14"))  # строк истории в промпте
 
-# Аудио: расшифровка через audio.transcriptions OpenRouter. Модели пробуются по порядку;
-# «…-diarize» дополнительно размечает говорящих. Префикс «openai/» агент добавляет сам.
+# Аудио: модели расшифровки по порядку. Gemini слушает запись сама (в обычном запросе) и отмечает
+# ещё и гудки, автоответчик, голос робота; модели …transcribe и whisper — через audio.transcriptions
+# (запасные). «…-diarize» дополнительно размечает говорящих.
 AUDIO_TRANSCRIBE: bool = _env_bool("AUDIO_TRANSCRIBE", True)
-TRANSCRIBE_MODELS: tuple[str, ...] = parse_models(
-    os.getenv("TRANSCRIBE_MODELS", "openai/gpt-4o-transcribe,openai/whisper-1"))
+DEFAULT_TRANSCRIBE = "google/gemini-3.1-flash-lite,openai/gpt-4o-transcribe,openai/whisper-1"
+TRANSCRIBE_MODELS: tuple[str, ...] = parse_models(os.getenv("TRANSCRIBE_MODELS", ""))
+if TRANSCRIBE_MODELS in ((), ("openai/gpt-4o-transcribe", "openai/whisper-1")):
+    # пусто или значение из прежнего .env.example — как по умолчанию: сначала запись слушает Gemini
+    TRANSCRIBE_MODELS = parse_models(DEFAULT_TRANSCRIBE)
 TRANSCRIBE_LANGUAGE: str = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
 # «Прослушайте звонок до конца»: перед отправкой ответа запись доигрывается до конца
 AUDIO_PLAY_TO_END: bool = _env_bool("AUDIO_PLAY_TO_END", True)
@@ -358,6 +371,15 @@ def validate_config(*, require_llm: bool = True) -> None:
                         + _missing_key_hint())
     if LLM_VISION not in ("off", "auto", "image", "frame"):
         problems.append(f"LLM_VISION={LLM_VISION!r}: допустимо auto | frame | off")
+    if LLM_PROXY:
+        scheme = LLM_PROXY.split("://", 1)[0].lower() if "://" in LLM_PROXY else ""
+        if scheme not in ("http", "https", "socks5", "socks5h"):
+            problems.append(f"LLM_PROXY={LLM_PROXY!r}: нужен адрес вида socks5://127.0.0.1:10808 или "
+                            "http://адрес:порт")
+        elif scheme.startswith("socks") and importlib.util.find_spec("socksio") is None:
+            python = r".venv\Scripts\python" if sys.platform == "win32" else ".venv/bin/python"
+            problems.append(f"LLM_PROXY с socks5 требует пакет socksio: выполните в папке агента "
+                            f"{python} -m pip install -r requirements.txt")
     if "{query}" not in SEARCH_URL:
         problems.append(f"SEARCH_URL={SEARCH_URL!r}: в адресе нужен шаблон {{query}}")
     if PAGE_ZOOM_FACTOR == 1.0 and PAGE_ZOOM.strip() not in ("100%", "1", "1.0"):

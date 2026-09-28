@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import io
+import json
 import math
 import struct
 import wave
@@ -53,10 +54,31 @@ def fixture_url(task: str) -> str:
 
 
 def workspace_url(scenario: str, *, popup: bool = False, autoinstruction: bool = False,
-                  start: bool = False) -> str:
-    """start=True — задание открывается заставкой «Тренировка … [Начать]» (под ней идёт загрузка)."""
+                  start: bool = False, instr: str = "") -> str:
+    """start=True — задание открывается заставкой «Тренировка … [Начать]» (под ней идёт загрузка).
+    instr=late|pdf|json — инструкция во вкладке: текст догружается скриптом / PDF / JSON с HTML."""
     extra = ("&popup=1" if popup else "") + ("&autoinstruction=1" if autoinstruction else "") + ("&start=1" if start else "")
+    extra += f"&instr={instr}" if instr else ""
     return f"https://t-work.test/workspace.html?scenario={scenario}{extra}"
+
+
+INSTRUCTION_HTML = (
+    "<h2>Проверка наличия фото</h2><p>Для каждой поверхности банкомата должны быть фото: лицевая часть, "
+    "обе боковые стороны, верхняя панель.</p><p>Если хотя бы одной стороны нет — выбирайте «Фото присутствуют "
+    "частично» и отмечайте поверхность, по которой недостаточно фото.</p><ul><li>Чёрные фото считаются "
+    "отсутствующими.</li><li>Размытое фото, на котором нельзя различить поверхность, считается отсутствующим.</li></ul>")
+
+# страница инструкции во вкладке (klecks/instruction/<id>): как её показывает T-Work — неизвестно,
+# поэтому три варианта, при которых текста на странице сразу (или вообще) нет
+INSTRUCTION_PAGES = {
+    "late": ("<!doctype html><html><body><div id='root'>Загрузка…</div><script>setTimeout(() => "
+             "{ document.getElementById('root').innerHTML = " + repr(INSTRUCTION_HTML) + "; }, 3000)</script></body></html>"),
+    "pdf": ("<!doctype html><html><body><canvas width='600' height='800'></canvas><script>"
+            "fetch('/klecks/api/instruction-file/3a1e.pdf').then(r => r.arrayBuffer())</script></body></html>"),
+    "json": ("<!doctype html><html><body><canvas width='600' height='800'></canvas><script>"
+             "fetch('/klecks/api/instruction/3a1e').then(r => r.json())</script></body></html>"),
+}
+PDF_BYTES = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n"
 
 
 def png_bytes(seed: str, width: int = 320, height: int = 240) -> bytes:
@@ -108,6 +130,8 @@ async def install_routes(context: BrowserContext) -> None:
                     src += "&autoinstruction=1"
                 if query.get("start"):
                     src += "&start=1"
+                if query.get("instr"):
+                    src += f"&instr={query['instr'][0]}"
                 await html(route, WRAPPER.format(src=src, popup=NEWS_POPUP if query.get("popup") else ""))
             else:
                 task = query.get("task", ["task_tree"])[0]
@@ -117,6 +141,13 @@ async def install_routes(context: BrowserContext) -> None:
                 await html(route, (FIXTURES / "flex_task.html").read_text(encoding="utf-8"))
             elif path == "/klecks/orders.html":
                 await html(route, (FIXTURES / "orders.html").read_text(encoding="utf-8"))
+            elif path.startswith("/klecks/instruction/"):
+                await html(route, INSTRUCTION_PAGES[query.get("kind", ["late"])[0]])
+            elif path.startswith("/klecks/api/instruction-file/"):
+                await route.fulfill(status=200, content_type="application/pdf", body=PDF_BYTES)
+            elif path.startswith("/klecks/api/instruction/"):
+                await route.fulfill(status=200, content_type="application/json",
+                                    body=json.dumps({"id": "3a1e", "title": "Инструкция", "content": INSTRUCTION_HTML}))
             elif path.startswith("/klecks/api/task/get-attachment/"):
                 headers = await route.request.all_headers()       # headers без cookie, all_headers — с ней
                 if "session=ok" not in (headers.get("cookie") or ""):

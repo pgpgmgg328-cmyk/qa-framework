@@ -36,6 +36,10 @@ def bad_request(message: str) -> tuple[int, dict]:
     return 400, {"error": {"message": message, "type": "invalid_request_error", "param": None, "code": None}}
 
 
+# так отвечает защита Cloudflare перед OpenRouter (скриншот пользователя): запрос не дошёл до OpenRouter
+BLOCKED = (403, {"success": False, "error": "Access denied by security policy."})
+
+
 @contextmanager
 def fake_openai(responses: list[tuple[int, dict]], models: Optional[list[dict]] = None,
                 key: Optional[dict] = None):
@@ -435,3 +439,177 @@ def test_key_without_limit_suggests_one(monkeypatch, caplog):
             run(connector.check_model())
     assert "Ключ OpenRouter: потрачено всего $0.50; лимит расходов у ключа не задан" in caplog.text
     assert connector.budget_left() is None
+
+
+def no_pause(monkeypatch) -> list[float]:
+    pauses: list[float] = []
+
+    async def pause(seconds: float) -> None:
+        pauses.append(seconds)
+
+    monkeypatch.setattr(oc, "_pause", pause)
+    return pauses
+
+
+def test_security_policy_block_is_waited_out_not_treated_as_missing_model(monkeypatch, caplog):
+    """403 «Access denied by security policy» — защита Cloudflare, а не модель и не ключ: агент
+    говорит, что делать, ждёт и повторяет запрос; связь вернулась — решение получено."""
+    pauses = no_pause(monkeypatch)
+    monkeypatch.setattr(oc, "LLM_OUTAGE_WAIT", 300)
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    responses = [BLOCKED, BLOCKED, completion(json.dumps(VALID))]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        with caplog.at_level("INFO", logger="twork.llm"):
+            decision = run(connector.decide(state(), DecisionContext(model="google/gemini-3.1-flash-lite")))
+    assert decision.action == ActionType.OPEN and not connector.unavailable
+    assert len(requests) == 3 and pauses == [5.0, 10.0]
+    assert caplog.text.count("🚫 OpenRouter не пускает запросы") == 1 and "LLM_PROXY" in caplog.text
+    assert "✅ OpenRouter снова отвечает" in caplog.text
+    assert connector.models == ["google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini"]
+
+
+def test_long_block_skips_the_step_without_marking_models_dead(monkeypatch):
+    """Блокировка дольше LLM_OUTAGE_WAIT — шаг пропускается с пометкой «OpenRouter недоступен»
+    (агент не тратит на него бюджет задания); модель из «Заметок» не считается несуществующей."""
+    no_pause(monkeypatch)
+    monkeypatch.setattr(oc, "LLM_OUTAGE_WAIT", 12)
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite")
+    with fake_openai([BLOCKED] * 3) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        decision = run(connector.decide(state(), DecisionContext(model="openai/gpt-5.4-mini")))
+    assert decision.action == ActionType.SKIP and connector.unavailable
+    assert decision.reasoning == "OpenRouter недоступен" and len(requests) == 2
+    assert not connector._dead_models
+
+
+def test_block_at_start_explains_what_to_do(monkeypatch):
+    no_pause(monkeypatch)
+    monkeypatch.setattr(oc, "LLM_VISION", "off")
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    with fake_openai([BLOCKED] * 4) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        try:
+            run(connector.check_model())
+        except oc.ModelUnavailable as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("блокировка не остановила запуск")
+    assert "Access denied by security policy" in message and "VPN" in message and "запустите агента снова" in message
+    assert connector.models == ["google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini"]      # лестница цела
+
+
+def test_requests_go_through_llm_proxy(monkeypatch):
+    """LLM_PROXY — запросы к OpenRouter идут через прокси (браузер с T-Work — напрямую)."""
+    import socket
+    import socketserver
+
+    seen: list[str] = []
+
+    class Proxy(socketserver.StreamRequestHandler):
+        def handle(self):  # простой HTTP-прокси: запрос с полным адресом → пересылка серверу
+            head = b""
+            while not head.endswith(b"\r\n\r\n"):
+                chunk = self.rfile.read(1)
+                if not chunk:
+                    return
+                head += chunk
+            lines = head.decode("latin-1").split("\r\n")
+            seen.append(lines[0])
+            method, target, version = lines[0].split(" ")
+            length = next((int(v) for k, _, v in (h.partition(":") for h in lines[1:]) if k.lower() == "content-length"), 0)
+            body = self.rfile.read(length) if length else b""
+            host_port = target.split("/")[2]
+            host, port = host_port.split(":")
+            path = "/" + target.split("/", 3)[3]
+            headers = [h for h in lines[1:] if h and not h.lower().startswith(("proxy-", "connection"))]
+            upstream = socket.create_connection((host, int(port)))
+            upstream.sendall((f"{method} {path} {version}\r\n" + "\r\n".join(headers)
+                              + "\r\nConnection: close\r\n\r\n").encode("latin-1") + body)
+            while True:
+                data = upstream.recv(65536)
+                if not data:
+                    break
+                self.wfile.write(data)
+            upstream.close()
+
+    server = socketserver.ThreadingTCPServer(("127.0.0.1", 0), Proxy)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        monkeypatch.setattr(oc, "LLM_PROXY", f"http://127.0.0.1:{server.server_address[1]}")
+        with fake_openai([completion(json.dumps(VALID))]) as (url, requests):
+            connector = make_connector(monkeypatch, url)
+            decision = run(connector.decide(state(), DecisionContext()))
+    finally:
+        server.shutdown()
+    assert decision.action == ActionType.OPEN and len(requests) == 1
+    assert seen and seen[0].startswith("POST http://127.0.0.1:") and seen[0].endswith("/v1/chat/completions HTTP/1.1")
+
+
+def test_gemini_listens_to_the_recording(monkeypatch):
+    """Расшифровка моделью, которая слушает запись: запись уходит в обычном запросе (input_audio);
+    модель, не принявшая звук, больше не запрашивается — дальше модель расшифровки."""
+    monkeypatch.setattr(oc, "TRANSCRIBE_MODELS", ("google/gemini-3.1-flash-lite", "openai/whisper-1"))
+    heard = "[0:00] Робот: Здравствуйте. [гудки]\n[0:04] Автоответчик: Оставьте сообщение после сигнала."
+    with fake_openai([completion(heard)]) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        text = run(connector.transcribe(b"ID3fake-mp3", "audio.mp3", "audio/mpeg"))
+    assert text == heard and requests[0]["_path"] == "/v1/chat/completions"
+    audio = requests[0]["messages"][0]["content"][1]
+    assert audio == {"type": "input_audio", "input_audio": {"data": "SUQzZmFrZS1tcDM=", "format": "mp3"}}
+    assert requests[0]["model"] == "google/gemini-3.1-flash-lite" and requests[0]["usage"] == {"include": True}
+
+    responses = [bad_request("This model does not support audio input"), (200, {"text": "Алло."})]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        assert run(connector.transcribe(b"ID3fake-mp3", "audio.mp3", "audio/mpeg")) == "Алло."
+    assert "google/gemini-3.1-flash-lite" in connector._dead_transcribers
+    assert [r["_path"] for r in requests] == ["/v1/chat/completions", "/v1/audio/transcriptions"]
+
+
+def test_transcription_during_block_is_postponed_not_failed(monkeypatch):
+    """OpenRouter недоступен — расшифровка не «недоступна навсегда»: LLMUnavailable, модели не
+    вычёркиваются, запись расшифруют, когда связь вернётся."""
+    from models import LLMUnavailable
+
+    no_pause(monkeypatch)
+    monkeypatch.setattr(oc, "TRANSCRIBE_MODELS", ("google/gemini-3.1-flash-lite", "openai/whisper-1"))
+    with fake_openai([BLOCKED]) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        try:
+            run(connector.transcribe(b"ID3fake", "audio.mp3", "audio/mpeg"))
+        except LLMUnavailable as exc:
+            assert str(exc) == "blocked"
+        else:
+            raise AssertionError("блокировка не отложила расшифровку")
+    assert not connector._dead_transcribers
+
+
+def test_pdf_instruction_is_rewritten_by_the_model(monkeypatch):
+    """Инструкция в PDF: файл уходит модели (file), текст — из её ответа, расход учитывается."""
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    body = completion("Инструкция. Для каждой поверхности банкомата должны быть фото.")
+    body[1]["usage"] = {"prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940, "cost": 0.0003}
+    with fake_openai([body]) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        text = run(connector.read_document(b"%PDF-1.4 fake", "instruction.pdf", "application/pdf"))
+    assert text == "Инструкция. Для каждой поверхности банкомата должны быть фото."
+    part = requests[0]["messages"][0]["content"][1]
+    assert part == {"type": "file", "file": {"filename": "instruction.pdf",
+                                             "file_data": "data:application/pdf;base64,JVBERi0xLjQgZmFrZQ=="}}
+    assert requests[0]["model"] == "google/gemini-3.1-flash-lite" and abs(connector.usage.cost - 0.0003) < 1e-12
+
+
+def test_provider_errors_are_waited_out(monkeypatch, caplog):
+    """5xx от OpenRouter (модель у поставщика не отвечает) после повторов SDK — тоже временно:
+    агент ждёт и повторяет, а не пропускает шаг."""
+    no_pause(monkeypatch)
+    monkeypatch.setattr(oc, "LLM_OUTAGE_WAIT", 300)
+    down = (503, {"error": {"message": "Provider returned error", "code": 503}})
+    with fake_openai([down, completion(json.dumps(VALID))]) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        with caplog.at_level("INFO", logger="twork.llm"):
+            decision = run(connector.decide(state(), DecisionContext()))
+    assert decision.action == ActionType.OPEN and len(requests) == 2
+    assert "⏳ OpenRouter или модель временно не отвечает" in caplog.text

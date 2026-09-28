@@ -30,6 +30,12 @@ from pydantic import BaseModel, Field, field_validator
 # Тип действия
 # ---------------------------------------------------------------------------
 
+
+class LLMUnavailable(RuntimeError):
+    """OpenRouter временно недоступен: защита Cloudflare не пускает запросы (403 «Access denied by
+    security policy»), нет связи, нет денег на балансе или сбой на стороне OpenRouter. Str — вид:
+    blocked | offline | unpaid | busy."""
+
 class ActionType(str, Enum):
     """Все доступные действия агента."""
     CLICK  = "click"   # выбрать вариант (OPTION) / нажать кнопку (BUTTON)

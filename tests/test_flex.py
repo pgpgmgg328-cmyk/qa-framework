@@ -9,6 +9,7 @@ import time
 from contextlib import asynccontextmanager
 from typing import Callable, Optional
 
+import pytest
 from playwright.async_api import Frame, async_playwright
 
 import agent as agent_module
@@ -238,6 +239,73 @@ def test_audio_is_transcribed_and_played_to_the_end(tmp_path, monkeypatch):
     assert agent._memory.submit_failures == 0
 
 
+def test_openrouter_outage_does_not_burn_the_task_and_transcription_is_retried(tmp_path, monkeypatch):
+    """OpenRouter недоступен (403 «Access denied by security policy»): шаги задания не тратятся —
+    по исчерпании бюджета агент отправил бы ответ наугад; расшифровка записи не «недоступна
+    навсегда», а повторяется, и задание решается, когда связь вернулась."""
+    import media as media_module
+    from models import LLMUnavailable
+
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("robot"))
+    monkeypatch.setattr(agent_module, "MAX_STEPS_PER_TASK", 3)
+    monkeypatch.setattr(agent_module, "OUTAGE_PAUSE", 0.3)
+    monkeypatch.setattr(media_module, "TRANSCRIBE_RETRY", 0.5)
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        llm.unavailable = len(llm.calls) <= 4                   # первые 4 вызова — OpenRouter недоступен
+        if llm.unavailable:
+            return LLMDecision.skip("OpenRouter недоступен")
+        assert ctx.transcripts and "Оставьте сообщение" in ctx.transcripts[0]
+        machine = find(state, "Результат неправильный. Был автоответчик")
+        return submit(state) if machine.is_selected else click(machine)
+
+    class FlakyLLM(ScriptedLLM):
+        async def transcribe(self, data: bytes, filename: str, mime: str) -> Optional[str]:
+            if not self.transcribed:
+                self.transcribed.append((0, "blocked", mime))
+                raise LLMUnavailable("blocked")
+            return await super().transcribe(data, filename, mime)
+
+    async def scenario():
+        llm = FlakyLLM(policy)
+        agent = Agent(browser=BrowserController(on_context=install_routes), llm=llm,
+                      knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 1 and agent._wrong_total == 0      # решено после восстановления связи
+    assert [t[1] for t in llm.transcribed] == ["blocked", "audio.wav"]
+    first_real = llm.calls[4][1]                                     # недоступность — не «пропуски модели»
+    assert not any("пропустил" in note for note in first_real.notes)
+
+
+def test_audio_task_without_transcript_waits_for_a_human(tmp_path, monkeypatch, caplog):
+    """Запись не расшифровала ни одна модель — агент не зовёт модель угадывать ответ, а просит
+    человека решить задание."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("robot"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        raise AssertionError("модель вызвана без расшифровки записи")
+
+    class DeafLLM(ScriptedLLM):
+        async def transcribe(self, data: bytes, filename: str, mime: str) -> Optional[str]:
+            self.transcribed.append((len(data), filename, mime))
+            return None
+
+    async def scenario():
+        llm = DeafLLM(policy)
+        agent = Agent(browser=BrowserController(on_context=install_routes), llm=llm,
+                      knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        with caplog.at_level("INFO", logger="twork.agent"):
+            await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert len(llm.transcribed) == 1 and not llm.calls and agent._tasks_done == 0
+    assert "ответ без неё был бы угадыванием. Нужна помощь человека" in caplog.text
+
+
 def test_web_research_fills_org_form(tmp_path, monkeypatch):
     monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("org"))
 
@@ -304,6 +372,51 @@ def test_instruction_and_tooltips_are_read_once_and_used(tmp_path, monkeypatch):
     assert "## Инструкция" in content and "обе боковые стороны" in content
     assert "«Все фото в наличии»: Есть фото лицевой части" in content
     assert "## Заметки" in content
+
+
+@pytest.mark.parametrize("kind", ["late", "pdf", "json"])
+def test_instruction_in_a_tab_without_page_text_is_read(tmp_path, monkeypatch, kind):
+    """Инструкция во вкладке, где текста сразу (или вообще) нет: текст догружается скриптом (late),
+    это PDF (pdf — его переписывает модель) или JSON с HTML (json). Агент дожидается текста или берёт
+    документ, который скачала страница."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("atm", instr=kind))
+    monkeypatch.setattr(agent_module, "INSTRUCTION_WAIT", 8)
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        assert "обе боковые стороны" in ctx.knowledge                 # инструкция
+        partial = find(state, "Фото присутствуют частично")
+        side = find(state, "Боковые поверхности - недостаточно фото")
+        if not partial.is_selected:
+            return click(partial)
+        if not side.is_selected:
+            return click(side)
+        return submit(state)
+
+    class ReaderLLM(ScriptedLLM):
+        documents: list = []
+
+        async def read_document(self, data: bytes, filename: str, mime: str) -> Optional[str]:
+            self.documents.append((data[:8], filename, mime))
+            return ("Проверка наличия фото. Для каждой поверхности банкомата должны быть фото: лицевая часть, "
+                    "обе боковые стороны, верхняя панель. Если хотя бы одной стороны нет — выбирайте «Фото "
+                    "присутствуют частично». Чёрные и размытые фото считаются отсутствующими.")
+
+    async def scenario():
+        llm = ReaderLLM(policy)
+        llm.documents = []
+        agent = Agent(browser=BrowserController(on_context=install_routes), llm=llm,
+                      knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 1
+    content = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
+    assert "## Инструкция" in content and "обе боковые стороны" in content
+    if kind == "pdf":
+        assert llm.documents == [(b"%PDF-1.4", "instruction.pdf", "application/pdf")]
+    else:
+        assert not llm.documents                                       # модель не понадобилась
 
 
 def test_exit_dialog_is_answered_with_stay(tmp_path, monkeypatch):

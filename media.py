@@ -36,7 +36,7 @@ from config import (
     VISION_SINGLE_MAX,
 )
 from dom_parser import inspection_task, photo_groups
-from models import MediaAudio, MediaImage, PageState, VisionImage
+from models import LLMUnavailable, MediaAudio, MediaImage, PageState, VisionImage
 
 logger = logging.getLogger("twork.media")
 
@@ -174,6 +174,9 @@ _EXT_BY_MIME = {"mpeg": "mp3", "mp3": "mp3", "webm": "webm", "ogg": "ogg", "wav"
                 "x-wav": "wav", "mp4": "m4a", "aac": "aac", "x-m4a": "m4a", "flac": "flac"}
 
 
+TRANSCRIBE_RETRY = 30.0        # OpenRouter был недоступен: повтор расшифровки не раньше, с
+
+
 @dataclass
 class _Transcript:
     text: Optional[str]
@@ -190,6 +193,9 @@ class MediaManager:
         self._transcripts: dict[str, _Transcript] = {}
         self._pending: dict[str, asyncio.Task] = {}
         self._play_attempts: dict[str, int] = {}
+        # OpenRouter был недоступен: запись уже скачана, расшифровка — повторить не раньше срока
+        self._audio_data: dict[str, tuple[bytes, str]] = {}
+        self._retry_at: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Фото
@@ -336,12 +342,15 @@ class MediaManager:
         for audio in state.audios:
             if not audio.src or audio.src in self._transcripts or audio.src in self._pending:
                 continue
-            logger.info("АУДИО %d: скачиваю и расшифровываю (%s)", audio.n, audio.src[-40:])
+            if time.monotonic() < self._retry_at.get(audio.src, 0.0):
+                continue
+            logger.info("АУДИО %d: %s (%s)", audio.n, "повторяю расшифровку" if audio.src in self._audio_data
+                        else "скачиваю и расшифровываю", audio.src[-40:])
             self._pending[audio.src] = asyncio.create_task(self._transcribe(frame, audio))
 
     async def _transcribe(self, frame: Frame, audio: MediaAudio) -> None:
         started = time.monotonic()
-        data, mime = await self.fetch_bytes(frame, audio.src)
+        data, mime = self._audio_data.get(audio.src) or await self.fetch_bytes(frame, audio.src)
         if not data:
             self._transcripts[audio.src] = _Transcript(None, "запись не удалось скачать")
             return
@@ -349,14 +358,33 @@ class MediaManager:
         filename = f"audio.{_EXT_BY_MIME.get(subtype, 'mp3')}"
         try:
             text = await self._transcriber(data, filename, mime or "audio/mpeg")  # type: ignore[misc]
+        except LLMUnavailable:
+            # OpenRouter временно недоступен — не «расшифровка недоступна»: повторить позже
+            logger.info("Расшифровка АУДИО %d отложена: OpenRouter недоступен", audio.n)
+            self._audio_data[audio.src] = (data, mime)
+            self._retry_at[audio.src] = time.monotonic() + TRANSCRIBE_RETRY
+            return
         except Exception as exc:  # noqa: BLE001 — сбой расшифровки не должен ронять агента
             logger.warning("Расшифровка АУДИО %d не удалась: %s", audio.n, exc)
             text = None
+        self._audio_data.pop(audio.src, None)
+        self._retry_at.pop(audio.src, None)
         if text:
             logger.info("АУДИО %d расшифровано за %.1f с (%d симв.)", audio.n, time.monotonic() - started, len(text))
             self._transcripts[audio.src] = _Transcript(text)
         else:
             self._transcripts[audio.src] = _Transcript(None, "расшифровка недоступна")
+
+    def transcripts_failed(self, state: PageState) -> bool:
+        """Ни одну запись задания не расшифровать: не удалось окончательно (не «ещё готовится»)
+        или расшифровка выключена (AUDIO_TRANSCRIBE=false)."""
+        sources = [a.src for a in state.audios if a.src]
+        if not sources:
+            return False
+        if not AUDIO_TRANSCRIBE or self._transcriber is None:
+            return True
+        found = [self._transcripts.get(src) for src in sources]
+        return all(t is not None and not t.text for t in found)
 
     async def transcripts(self, state: PageState, *, wait: float = 45.0) -> list[str]:
         """Расшифровки [АУДИО n] для промпта. Ждёт незавершённые не дольше wait секунд."""
@@ -463,6 +491,8 @@ class MediaManager:
         """Кэш фото — только на текущее задание; расшифровки живут дольше (повтор записи)."""
         self._vision_cache.clear()
         self._play_attempts.clear()
+        self._audio_data.clear()             # отложенные расшифровки прошлого задания не нужны
+        self._retry_at.clear()
         if len(self._transcripts) > 50:
             for src in list(self._transcripts)[:-20]:
                 self._transcripts.pop(src, None)

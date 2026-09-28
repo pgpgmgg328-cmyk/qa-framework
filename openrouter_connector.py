@@ -20,6 +20,7 @@ v3: Structured Outputs с откатом на json_object, адаптация п
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import logging
@@ -28,7 +29,7 @@ import struct
 import time
 import zlib
 from dataclasses import dataclass, field
-from typing import Any, Optional, Union
+from typing import Any, Awaitable, Callable, Optional, Union
 
 import openai
 from pydantic import ValidationError
@@ -40,6 +41,8 @@ from config import (
     LLM_MAX_TOKENS,
     LLM_MODEL,
     LLM_MODELS,
+    LLM_OUTAGE_WAIT,
+    LLM_PROXY,
     LLM_REASONING_EFFORT,
     LLM_STRUCTURED_OUTPUT,
     LLM_TEMPERATURE,
@@ -54,6 +57,7 @@ from config import (
 )
 from dom_parser import _plain_text, geo_facts, inspection_task, media_facts, render_page
 from models import (
+    LLMUnavailable,
     FLAG_DISABLED,
     FLAG_SELECTED,
     PROMPT_FLAGS,
@@ -173,7 +177,8 @@ HINTS: dict[str, str] = {
     ),
     "audio": (
         "Аудио: по расшифровке определи, кто говорит (робот, живой человек, автоответчик или голосовой "
-        "помощник), чем закончился разговор и совпадает ли итог с заявленным результатом."
+        "помощник), чем закончился разговор и совпадает ли итог с заявленным результатом. Расшифровки ещё "
+        "нет — не угадывай ответ: верни skip, агент дождётся расшифровки."
     ),
     "dropdown": (
         "Списки значений: сначала open, затем click по пункту с пометкой «во всплывающем списке». Значение "
@@ -407,6 +412,45 @@ def _probe_png(size: int = 512) -> str:
     return base64.b64encode(png).decode("ascii")
 
 
+# 403 от защиты Cloudflare перед OpenRouter — не от самого OpenRouter: тело {"success": false,
+# "error": "Access denied by security policy."}; запрос отклонён до проверки ключа и модели
+_BLOCK_WORDS = ("security policy", "cloudflare", "attention required")
+_pause = asyncio.sleep             # пауза перед повтором запроса (в тестах — без ожидания)
+_STARTUP_PATIENCE = 30.0          # проверка при запуске: сколько ждать, если OpenRouter недоступен
+                                  # (не дольше LLM_OUTAGE_WAIT)
+
+_OUTAGE_TEXT = {
+    "blocked": (
+        "🚫 OpenRouter не пускает запросы с этого компьютера: 403 «Access denied by security policy». "
+        "Это защита Cloudflare перед OpenRouter — ключ, баланс и модели ни при чём. Так бывает, когда "
+        "запрос уходит из России без VPN (или VPN работает только в браузере), либо адрес VPN-сервера "
+        "попал в «подозрительные». Что сделать: включите VPN для всех программ (режим TUN / «весь "
+        "трафик») или смените сервер VPN; если T-Work через VPN не открывается — впишите в .env LLM_PROXY "
+        "(прокси только для запросов к OpenRouter, см. README)"),
+    "offline": "🌐 Нет связи с OpenRouter ({error}). Проверьте интернет и VPN",
+    "busy": "⏳ OpenRouter или модель временно не отвечает ({error})",
+    "unpaid": (
+        "💳 OpenRouter отказал в оплате запроса — на балансе закончились деньги или исчерпан лимит ключа. "
+        "Пополните баланс (openrouter.ai/settings/credits) или поднимите лимит ключа"),
+}
+
+
+def outage_kind(exc: Optional[BaseException]) -> str:
+    """Временная недоступность OpenRouter: blocked (защита Cloudflare), offline (нет связи),
+    unpaid (нет денег или исчерпан лимит ключа), busy (5xx, 429); '' — другая ошибка."""
+    if isinstance(exc, LLMUnavailable):
+        return str(exc)
+    if isinstance(exc, openai.PermissionDeniedError) and any(w in str(exc).lower() for w in _BLOCK_WORDS):
+        return "blocked"
+    if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
+        return "unpaid"
+    if isinstance(exc, openai.APIConnectionError):
+        return "offline"
+    if isinstance(exc, openai.APIStatusError) and (exc.status_code >= 500 or exc.status_code == 429):
+        return "busy"            # SDK уже повторил запрос LLM_MAX_RETRIES раз
+    return ""
+
+
 class ModelUnavailable(RuntimeError):
     """Модели нет у OpenRouter (или ключ не подходит, кончились деньги) — работать бессмысленно."""
 
@@ -426,13 +470,16 @@ class LLMConnector:
             max_retries=LLM_MAX_RETRIES,  # 429/5xx/обрывы соединения — с экспоненциальной паузой
             # необязательные заголовки OpenRouter (атрибуция приложения)
             default_headers={"HTTP-Referer": OPENROUTER_REFERER, "X-Title": "T-Work Agent"},
+            http_client=_proxy_client(LLM_PROXY) if LLM_PROXY else None,
         )
         self._vision_enabled = True
         self._dead_transcribers: set[str] = set()
         self._dead_models: set[str] = set()          # недоступные модели из «Заметок»
         # лестница моделей; модели, которых нет у OpenRouter, проверка на старте убирает
         self.models: list[str] = list(LLM_MODELS)
-        self._unpaid_warned = -1e9
+        self._outage: Optional[tuple[str, float]] = None    # (вид, с какого момента) — OpenRouter недоступен
+        self._outage_logged = 0.0
+        self.unavailable = False           # последнее решение не получено: OpenRouter недоступен
         self.usage = UsageStats()
         self._key_left: Optional[float] = None       # остаток лимита ключа на старте, $
         # параметры запроса по моделям: reasoning-модели (o-серия, gpt-5) требуют
@@ -441,10 +488,52 @@ class LLMConnector:
         self._last_error: Optional[Exception] = None
         self._last_usage: Any = None
         logger.info(
-            "LLM (OpenRouter): %s%s",
+            "LLM (OpenRouter): %s%s%s",
             f"модель {LLM_MODEL}" if len(LLM_MODELS) == 1 else "лестница моделей " + " → ".join(LLM_MODELS),
             f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
+            f", через прокси {_hide_password(LLM_PROXY)}" if LLM_PROXY else "",
         )
+
+    # ------------------------------------------------------------------
+    # Временная недоступность OpenRouter: ждать и повторять, а не пропускать задания
+    # ------------------------------------------------------------------
+
+    async def _call(self, make: Callable[[], Awaitable[Any]], patience: Optional[float] = None) -> Any:
+        """Запрос к OpenRouter. OpenRouter временно недоступен (защита Cloudflare, нет связи, нет
+        денег) — ждать и повторять не дольше patience секунд, затем LLMUnavailable."""
+        limit = LLM_OUTAGE_WAIT if patience is None else patience
+        waited, delay = 0.0, 5.0
+        while True:
+            try:
+                result = await make()
+            except openai.OpenAIError as exc:
+                kind = outage_kind(exc)
+                if not kind:
+                    raise
+                self._note_outage(kind, exc)
+                if waited + delay > limit:
+                    raise LLMUnavailable(kind) from exc
+                await _pause(delay)
+                waited += delay
+                delay = min(delay * 2, 60.0)
+                continue
+            if self._outage is not None:
+                logger.info("✅ OpenRouter снова отвечает (перерыв %.0f мин) — продолжаю",
+                            (time.monotonic() - self._outage[1]) / 60)
+                self._outage = None
+            return result
+
+    def _note_outage(self, kind: str, exc: Exception) -> None:
+        """Сказать о недоступности один раз подробно, дальше — не чаще раза в 5 минут."""
+        now = time.monotonic()
+        if self._outage is None or self._outage[0] != kind:
+            self._outage, self._outage_logged = (kind, now), now
+            logger.error("%s. Агент ждёт и повторяет запрос. (%s)",
+                         _OUTAGE_TEXT[kind].format(error=_short_error(exc)), _short_error(exc))
+        elif now - self._outage_logged >= 300:
+            self._outage_logged = now
+            logger.warning("OpenRouter всё ещё недоступен (%s) — жду %.0f мин", _short_error(exc),
+                           (now - self._outage[1]) / 60)
 
     # ------------------------------------------------------------------
     # Проверка модели перед работой
@@ -471,7 +560,8 @@ class LLMConnector:
                "пустые строки, actions — [{\"action\": \"skip\", \"target_index\": null, "
                "\"target_text\": null, \"value\": null}], confidence — 1.")
         started = time.monotonic()
-        if await self._complete([{"role": "user", "content": ask}], LLM_TEMPERATURE, model) is None:
+        if await self._complete([{"role": "user", "content": ask}], LLM_TEMPERATURE, model,
+                                patience=min(_STARTUP_PATIENCE, LLM_OUTAGE_WAIT)) is None:
             self._raise_if_unavailable(model)
             logger.warning("Проверка модели %s не прошла (%s) — продолжаю, но вызовы могут не работать",
                            model, str(self._last_error)[:200])
@@ -481,7 +571,8 @@ class LLMConnector:
         if photo and base:                   # OpenRouter сообщает расход — можно узнать цену фото
             image = [{"type": "text", "text": ask}, {"type": "image_url", "image_url": {
                 "url": f"data:image/png;base64,{_probe_png()}", "detail": LLM_VISION_DETAIL}}]
-            if await self._complete([{"role": "user", "content": image}], LLM_TEMPERATURE, model) is not None:
+            if await self._complete([{"role": "user", "content": image}], LLM_TEMPERATURE, model,
+                                    patience=min(_STARTUP_PATIENCE, LLM_OUTAGE_WAIT)) is not None:
                 tokens = int(getattr(self._last_usage, "prompt_tokens", 0) or 0) - base
                 price = model_price(model)
                 cost = f" (≈ {_money(tokens * price[0] / 1_000_000)})" if price else ""
@@ -538,7 +629,9 @@ class LLMConnector:
 
     @staticmethod
     def _model_missing(exc: Optional[Exception]) -> bool:
-        """Ошибка значит «такой модели нет у OpenRouter / нет к ней доступа»."""
+        """Ошибка значит «такой модели нет у OpenRouter / нет к ней доступа» (не блокировка связи)."""
+        if outage_kind(exc):
+            return False
         message = str(exc).lower()
         return isinstance(exc, (openai.NotFoundError, openai.PermissionDeniedError)) or (
             isinstance(exc, openai.BadRequestError) and "model" in message
@@ -548,15 +641,15 @@ class LLMConnector:
 
     def _raise_if_unavailable(self, model: str) -> None:
         exc = self._last_error
+        kind = outage_kind(exc)
+        if kind:
+            raise ModelUnavailable(_OUTAGE_TEXT[kind].format(error=_short_error(exc.__cause__ or exc))
+                                   + ". Когда исправите — запустите агента снова")
         missing = self._model_missing(exc)
         if isinstance(exc, openai.AuthenticationError):
             raise ModelUnavailable(
                 f"Ключ OpenRouter не подходит: {str(exc)[:200]}. Впишите в .env после OPENROUTER_API_KEY= ключ "
                 "со страницы openrouter.ai/keys")
-        if isinstance(exc, openai.APIStatusError) and exc.status_code == 402:
-            raise ModelUnavailable(
-                f"OpenRouter отказал в оплате запроса — на балансе нет денег или исчерпан лимит ключа: "
-                f"{str(exc)[:200]}. Пополните баланс (openrouter.ai/settings/credits) или поднимите лимит ключа")
         if missing:
             raise ModelUnavailable(
                 f"Модель {model} недоступна у OpenRouter: {str(exc)[:200]}. Впишите в .env другую модель "
@@ -584,6 +677,7 @@ class LLMConnector:
         ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
 
+        self.unavailable = False
         main_model = self.models[0] if self.models else LLM_MODEL
         model = context.model or main_model
         if model in self._dead_models:
@@ -597,8 +691,8 @@ class LLMConnector:
             model = main_model
             decision = await self._ask(model, messages, temperature)
         if decision is None:
-            self._warn_if_unpaid()
-            return LLMDecision.skip("ошибка API LLM или невалидный ответ")
+            self.unavailable = isinstance(self._last_error, LLMUnavailable)
+            return LLMDecision.skip("OpenRouter недоступен" if self.unavailable else "ошибка API LLM или невалидный ответ")
         if self._needs_check(decision, model):
             logger.info("Модель не уверена в отправляемом ответе (%.2f < %.2f) — перепроверяю моделью %s",
                         decision.confidence, LLM_CHECK_BELOW, LLM_CHECK_MODEL)
@@ -606,19 +700,6 @@ class LLMConnector:
             if checked is not None:
                 decision = checked
         return decision
-
-    def _warn_if_unpaid(self) -> None:
-        """402 — на балансе OpenRouter кончились деньги или исчерпан лимит ключа: сказать прямо
-        (не чаще раза в 10 минут). Агент не останавливается: после пополнения продолжит сам."""
-        exc = self._last_error
-        if not (isinstance(exc, openai.APIStatusError) and exc.status_code == 402):
-            return
-        now = time.monotonic()
-        if now - self._unpaid_warned < 600:
-            return
-        self._unpaid_warned = now
-        logger.error("💳 OpenRouter отказал в оплате запроса — на балансе закончились деньги или исчерпан лимит "
-                     "ключа. Пополните баланс или поднимите лимит: агент ждёт и продолжит сам (%s)", str(exc)[:160])
 
     @staticmethod
     def _needs_check(decision: LLMDecision, model: str = "") -> bool:
@@ -654,6 +735,7 @@ class LLMConnector:
 
     async def _complete(
         self, messages: list[dict[str, Any]], temperature: float, model: str = LLM_MODEL,
+        patience: Optional[float] = None,
     ) -> Optional[str]:
         params = self._params.setdefault(model, _initial_params(model))
         kwargs: dict[str, Any] = {
@@ -673,38 +755,41 @@ class LLMConnector:
         kwargs["extra_body"] = extra
         self._last_error = None
         try:
-            response = await self._client.chat.completions.create(**kwargs)
+            response = await self._call(lambda: self._client.chat.completions.create(**kwargs), patience)
         except openai.BadRequestError as exc:
             message = str(exc).lower()
             if params.reasoning and "reasoning" in message:
                 dropped = params.reasoning.pop(0)
                 logger.info("Модель %s не принимает reasoning_effort=%s%s", model, dropped,
                             f" — пробую {params.reasoning[0]}" if params.reasoning else " — отправляю без него")
-                return await self._complete(messages, temperature, model)
+                return await self._complete(messages, temperature, model, patience)
             if "max_tokens" in message and params.tokens_param == "max_tokens":
                 logger.warning("Модель %s требует max_completion_tokens — переключаюсь", model)
                 params.tokens_param = "max_completion_tokens"
-                return await self._complete(messages, temperature, model)
+                return await self._complete(messages, temperature, model, patience)
             if "temperature" in message and params.temperature:
                 logger.warning("Модель %s не принимает temperature — отправляю без него", model)
                 params.temperature = False
-                return await self._complete(messages, temperature, model)
+                return await self._complete(messages, temperature, model, patience)
             if params.structured and ("response_format" in message or "json_schema" in message or "schema" in message):
                 logger.warning("Structured Outputs не поддерживаются (%s) — переключаюсь на json_object", exc)
                 params.structured = False
-                return await self._complete(messages, temperature, model)
+                return await self._complete(messages, temperature, model, patience)
             if self._vision_enabled and "image" in message and self._has_image(messages):
                 logger.warning("Модель не принимает изображения (%s) — отправляю без картинки", exc)
                 self._vision_enabled = False
-                return await self._complete(self._strip_images(messages), temperature, model)
+                return await self._complete(self._strip_images(messages), temperature, model, patience)
             if params.structured and not _model_name(model).startswith(("gpt-", "o1", "o3", "o4")):
                 # другие модели (Gemini, Qwen…) понимают строгую схему не целиком, а ошибка 400 у
                 # OpenRouter не всегда называет причину — повтор с простым JSON
                 logger.warning("Модель %s не приняла строгую схему ответа (%s) — перехожу на обычный JSON",
                                model, str(exc)[:160])
                 params.structured = False
-                return await self._complete(messages, temperature, model)
+                return await self._complete(messages, temperature, model, patience)
             logger.error("LLM API ошибка запроса: %s", exc)
+            self._last_error = exc
+            return None
+        except LLMUnavailable as exc:            # о недоступности уже сказано в логе
             self._last_error = exc
             return None
         except openai.OpenAIError as exc:
@@ -847,15 +932,30 @@ class LLMConnector:
     # ------------------------------------------------------------------
 
     async def transcribe(self, data: bytes, filename: str, mime: str) -> Optional[str]:
-        """Расшифровать запись (audio.transcriptions). Модели TRANSCRIBE_MODELS пробуются
-        по порядку; недоступная модель запоминается и больше не запрашивается."""
+        """Расшифровать запись. Модели TRANSCRIBE_MODELS пробуются по порядку: модели расшифровки
+        (…transcribe, whisper) — через audio.transcriptions, остальные (Gemini) слушают запись сами,
+        в обычном запросе. Недоступная модель запоминается и больше не запрашивается; OpenRouter
+        временно недоступен — LLMUnavailable (расшифровку повторят позже)."""
         for model in TRANSCRIBE_MODELS:
             if model in self._dead_transcribers:
+                continue
+            name = _model_name(model)
+            if "transcribe" not in name and not name.startswith("whisper"):
+                try:
+                    text = await self._transcribe_by_listening(model, data, filename)
+                except (openai.NotFoundError, openai.BadRequestError, openai.PermissionDeniedError) as exc:
+                    logger.warning("Расшифровка моделью %s недоступна: %s", model, str(exc)[:200])
+                    self._dead_transcribers.add(model)
+                    continue
+                except openai.OpenAIError as exc:
+                    logger.warning("Расшифровка моделью %s не удалась: %s", model, str(exc)[:200])
+                    continue
+                if text:
+                    return text
                 continue
             kwargs: dict[str, Any] = {"model": model, "file": (filename, data, mime)}
             if TRANSCRIBE_LANGUAGE:
                 kwargs["language"] = TRANSCRIBE_LANGUAGE
-            name = _model_name(model)
             if "diarize" in name:
                 kwargs["response_format"] = "diarized_json"
                 kwargs["extra_body"] = {"chunking_strategy": "auto"}
@@ -866,7 +966,7 @@ class LLMConnector:
                 kwargs["response_format"] = "json"
             try:
                 try:
-                    result = await self._client.audio.transcriptions.create(**kwargs)
+                    result = await self._call(lambda: self._client.audio.transcriptions.create(**kwargs))
                 except openai.BadRequestError as exc:
                     message = str(exc).lower()
                     if kwargs["response_format"] == "json" or not any(
@@ -878,7 +978,7 @@ class LLMConnector:
                     for key in ("timestamp_granularities", "extra_body"):
                         kwargs.pop(key, None)
                     kwargs["response_format"] = "json"
-                    result = await self._client.audio.transcriptions.create(**kwargs)
+                    result = await self._call(lambda: self._client.audio.transcriptions.create(**kwargs))
             except (openai.NotFoundError, openai.BadRequestError, openai.PermissionDeniedError) as exc:
                 logger.warning("Расшифровка моделью %s недоступна: %s", model, str(exc)[:200])
                 self._dead_transcribers.add(model)
@@ -890,6 +990,55 @@ class LLMConnector:
             if text:
                 return text
         return None
+
+    async def read_document(self, data: bytes, filename: str = "instruction.pdf",
+                            mime: str = "application/pdf") -> Optional[str]:
+        """Текст документа (инструкция в PDF): модель переписывает его дословно. Один раз на вид
+        заданий — дальше текст хранится в knowledge/."""
+        model = self.models[0] if self.models else LLM_MODEL
+        content = [{"type": "text", "text": _READ_DOC_PROMPT},
+                   {"type": "file", "file": {"filename": filename, "file_data":
+                                             f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}}]
+        kwargs: dict[str, Any] = {
+            "model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 8000,
+            "temperature": 0.0, "extra_body": {"usage": {"include": True}},
+        }
+        try:
+            response = await self._call(lambda: self._client.chat.completions.create(**kwargs))
+        except (openai.OpenAIError, LLMUnavailable) as exc:
+            logger.warning("Документ %s не прочитан моделью %s: %s", filename, model, _short_error(exc))
+            return None
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.usage.add(usage, model_price(model))
+        return ((response.choices[0].message.content or "").strip() if response.choices else "") or None
+
+    async def _transcribe_by_listening(self, model: str, data: bytes, filename: str) -> Optional[str]:
+        """Расшифровка моделью, которая слушает запись (Gemini): кроме слов, она отмечает гудки,
+        автоответчик и синтезированный голос — для заданий «прослушайте звонок» это важно."""
+        fmt = filename.rsplit(".", 1)[-1].lower()
+        if fmt not in _LISTEN_FORMATS:
+            logger.info("Расшифровка моделью %s: формат записи %s она не принимает", model, fmt)
+            return None
+        content = [{"type": "text", "text": _LISTEN_PROMPT},
+                   {"type": "input_audio", "input_audio": {"data": base64.b64encode(data).decode("ascii"),
+                                                           "format": fmt}}]
+        kwargs: dict[str, Any] = {
+            "model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 4000,
+            "temperature": 0.0, "extra_body": {"usage": {"include": True}, "reasoning": {"effort": "none"}},
+        }
+        try:
+            response = await self._call(lambda: self._client.chat.completions.create(**kwargs))
+        except openai.BadRequestError as exc:
+            if "reasoning" not in str(exc).lower():
+                raise
+            kwargs["extra_body"] = {"usage": {"include": True}}
+            response = await self._call(lambda: self._client.chat.completions.create(**kwargs))
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.usage.add(usage, model_price(model))
+        text = (response.choices[0].message.content or "").strip() if response.choices else ""
+        return text or None
 
     # ------------------------------------------------------------------
     # Парсинг ответа
@@ -954,6 +1103,39 @@ class LLMConnector:
             logger.info("  план: %s", decision.plan[:400])
         if decision.reasoning:
             logger.info("  рассуждение: %s", decision.reasoning[:300])
+
+
+# Расшифровка моделью, которая слушает запись (Gemini): форматы, которые она принимает
+_LISTEN_FORMATS = {"mp3", "wav", "aiff", "aac", "ogg", "flac", "m4a"}
+_LISTEN_PROMPT = (
+    "Расшифруй запись телефонного звонка дословно, на языке записи. Каждая реплика — отдельной строкой "
+    "вида «[м:сс] Говорящий: текст». Говорящих называй по роли, если она понятна (Оператор, Абонент, "
+    "Автоответчик, Робот, Голосовой помощник), иначе Говорящий 1, Говорящий 2. Синтезированный голос "
+    "отмечай как Робот. Звуки без речи — в квадратных скобках: [гудки], [музыка], [тишина], [сигнал], "
+    "[обрыв связи]. Ничего не добавляй от себя и не пересказывай.")
+
+
+_READ_DOC_PROMPT = (
+    "Это инструкция к заданиям разметки. Перепиши её текст полностью и дословно, по порядку: заголовки, "
+    "абзацы, списки (каждый пункт с новой строки), таблицы — строками «| … |». Картинки и схемы опиши одной "
+    "строкой в квадратных скобках: что на них показано. Ничего не сокращай, не пересказывай и не добавляй "
+    "от себя.")
+
+
+def _short_error(exc: Optional[BaseException]) -> str:
+    return re.sub(r"\s+", " ", str(exc))[:160] if exc is not None else ""
+
+
+def _hide_password(url: str) -> str:
+    return re.sub(r"//[^/@]*@", "//***@", url)
+
+
+def _proxy_client(proxy: str) -> Any:
+    """HTTP-клиент для запросов к OpenRouter через прокси (браузер с T-Work — напрямую)."""
+    try:
+        return openai.DefaultAsyncHttpxClient(proxy=proxy)
+    except TypeError:                                 # старый httpx: параметр proxies
+        return openai.DefaultAsyncHttpxClient(proxies=proxy)
 
 
 def _fmt_ts(seconds: Any) -> str:
