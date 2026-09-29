@@ -403,6 +403,24 @@ def test_missing_key_message_names_the_file_problem(tmp_path, monkeypatch):
     config.validate_config(require_llm=False)                                    # режим записи — без ключа
 
 
+def test_values_copied_from_the_old_env_example_mean_new_defaults(monkeypatch):
+    """В .env пользователя — копия прежнего образца: EXAM_MIN_ACCURACY=0.8 и LADDER_MIN_TASKS=3.
+    Это не выбор человека, а старое умолчание — агент берёт новое (70% и 5 заданий); другое
+    значение остаётся как есть."""
+    import config
+
+    monkeypatch.setenv("EXAM_MIN_ACCURACY", "0.8")
+    assert float(config._env_default("EXAM_MIN_ACCURACY", "0.7", ("0.8",))) == 0.7
+    monkeypatch.setenv("EXAM_MIN_ACCURACY", "0.75")
+    assert float(config._env_default("EXAM_MIN_ACCURACY", "0.7", ("0.8",))) == 0.75
+    monkeypatch.setenv("LADDER_MIN_TASKS", "3")
+    assert int(config._env_default("LADDER_MIN_TASKS", "5", ("3",))) == 5
+    monkeypatch.delenv("LADDER_MIN_TASKS")
+    assert int(config._env_default("LADDER_MIN_TASKS", "5", ("3",))) == 5
+    example = (config.PROJECT_DIR / ".env.example").read_text(encoding="utf-8")
+    assert "EXAM_MIN_ACCURACY=0.7" in example and "LADDER_MIN_TASKS=5" in example
+
+
 def test_exam_mode_and_outcome_are_recognized():
     from agent import _exam_outcome
 
@@ -432,6 +450,34 @@ def test_inspection_tasks_get_single_photos_and_checklist_hint():
     assert "ФОТО n" in hint and "у основания" in hint
 
 
+def test_photo_coverage_tasks_get_single_photos_and_their_own_hint():
+    """«Проверка наличия фото поверхностей банкомата»: обрезанную панель или неверный ракурс на
+    коллаже в ~390 px не видно — фото идут по одному; подсказка — о полноте съёмки, а не о грязи."""
+    from media import MediaManager
+
+    photos = [MediaImage(n=i, src=f"https://x/{i}.jpg") for i in range(1, 8)]
+    atm = PageState(pool_title="Проверка наличия фото поверхностей банкомата", images=photos,
+                    reader=["Проверь, есть ли фото всех поверхностей."])
+    jobs, _ = MediaManager._plan_jobs(atm, photos)
+    assert len(jobs) == 7 and all(j["kind"] == "single" for j in jobs)
+    hints = oc.page_hints(atm, DecisionContext())
+    assert oc.HINTS["coverage"] in hints and oc.HINTS["inspection"] not in hints
+
+
+def test_type_with_empty_value_clears_the_field():
+    """Текст к снятому варианту «Другое» остаётся в поле (лог «Фраза из диалога:») — модель
+    стирает его действием type с пустым value."""
+    decision = oc.LLMConnector.parse_response(
+        '{"observation": "", "plan": "", "reasoning": "", "confidence": 0.9, "actions": ['
+        '{"action": "type", "target_index": 18, "target_text": "Введите тематику", "value": ""}]}')
+    assert decision.action == ActionType.TYPE and decision.type_text == ""
+    click = oc.LLMConnector.parse_response(
+        '{"observation": "", "plan": "", "reasoning": "", "confidence": 0.9, "actions": ['
+        '{"action": "click", "target_index": 3, "target_text": "Да", "value": null}]}')
+    assert click.type_text is None
+    assert 'type с value ""' in oc.SYSTEM_PROMPT
+
+
 def test_only_last_web_page_is_shown_in_full(tmp_path):
     """В запрос к модели полностью идёт только последняя открытая страница поиска."""
     from knowledge import KnowledgeBase
@@ -457,31 +503,96 @@ class _NoLLM:
     """Заглушка модели: для правил лестницы и экзамена вызовы модели не нужны."""
 
 
-def test_exam_gate_and_ladder_decide_early_on_few_training_tasks(tmp_path, monkeypatch):
-    """Порог 80% из 3 заданий: одна ошибка в первых заданиях — порог уже недостижим (экзамен
-    не начинать / перейти к следующей модели); без ошибок — ждать данных."""
+def _ladder_agent(tmp_path, monkeypatch, models=("gemini", "gpt"), title="Звонок"):
+    """Агент с базой знаний во временной папке; пороги — как по умолчанию в v4.8 (не из .env)."""
     import agent as agent_module
     from knowledge import KnowledgeBase
 
+    monkeypatch.setattr(agent_module, "LLM_MODELS", tuple(models))
+    monkeypatch.setattr(agent_module, "LADDER_MIN_ACCURACY", 0.8)
+    monkeypatch.setattr(agent_module, "LADDER_MIN_TASKS", 5)
+    monkeypatch.setattr(agent_module, "EXAM_MIN_ACCURACY", 0.7)
+    monkeypatch.setattr(agent_module, "EXAM_MIN_TASKS", 3)
     kb = KnowledgeBase(str(tmp_path))
     agent = Agent(llm=_NoLLM(), knowledge=kb)
-    agent._pool = kb.for_state(PageState(pool_key="k1", pool_title="Клининг", pool_signature=["h:клининг"]))
+    agent._pool = kb.for_state(PageState(pool_key="k1", pool_title=title, pool_signature=[f"h:{title}"]))
+    return agent, kb, agent._pool
 
+
+def test_exam_gate_threshold_70_and_early_decision(tmp_path, monkeypatch):
+    """Порог 70% из 3 заданий: 1 из 1 — ждать данных; 1 из 2 — уже не 70% (экзамен не начинать);
+    78% и 77% из лога пользователя — экзамен начинать."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("only",))
     agent._order_train = [1, 1]
-    assert agent._training_accuracy() is None                       # 1 из 1: 3 из 3 ещё возможно
+    assert agent._exam_estimate() is None
     agent._order_train = [1, 2]
-    assert agent._training_accuracy() == (1, 2)                     # максимум 2 из 3 < 80%
-    agent._order_train = [4, 5]
-    assert agent._training_accuracy() == (4, 5)
+    assert agent._exam_estimate() == (0.5, "в тренировке с первого раза верно 1 из 2")
+    agent._order_train = [2, 3]
+    assert agent._exam_estimate()[0] < 0.7
+    for ok, total in ((15, 19), (17, 22), (19, 25)):
+        agent._order_train = [ok, total]
+        assert agent._exam_estimate()[0] >= 0.7
 
-    monkeypatch.setattr(agent_module, "LLM_MODELS", ("cheap", "mid", "strong"))
-    pool = agent._pool
-    kb.model_attempt(pool, "cheap", True)
-    agent._climb_ladder(pool, "cheap")
-    assert agent._model_for(pool) == "cheap"
-    kb.model_attempt(pool, "cheap", False)
-    agent._climb_ladder(pool, "cheap")
-    assert agent._model_for(pool) == "mid" and agent._training_accuracy() is None   # у mid данных нет
+
+def test_exam_estimate_blends_model_accuracy_with_the_whole_training(tmp_path, monkeypatch):
+    """Лог пользователя: «Выберите задание» — в тренировке 17 из 22, но экзамен решала бы
+    gpt-5.4-mini с 2 из 3. Прежде порог сравнивался с 2 из 3 (66%); теперь оценка тянется к
+    точности всей тренировки, пока у модели мало заданий."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch)
+    for ok in (True, True, False):
+        kb.model_attempt(pool, "gpt", ok)
+    kb.set_model(pool, "gpt")
+    agent._order_train = [17, 22]
+    estimate, source = agent._exam_estimate()
+    assert 0.7 <= estimate < 0.77
+    assert "17 из 22" in source and "gpt" in source and "2 из 3" in source
+    for _ in range(12):                                   # много заданий у модели — решают её данные
+        kb.model_attempt(pool, "gpt", False)
+    assert agent._exam_estimate()[0] < 0.3
+
+
+def test_ladder_does_not_switch_on_one_mistake(tmp_path, monkeypatch):
+    """Одна ошибка в первых заданиях — ещё не повод менять модель (в логе «Фраза из диалога:»
+    Gemini ушла на gpt после 3 из 4, а gpt вернулась обратно после 0 из 1)."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch)
+    for ok in (True, True, True, False):
+        kb.model_attempt(pool, "gemini", ok)
+        agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gemini"                         # 3 из 4: 80% ещё достижимы
+    kb.model_attempt(pool, "gemini", False)
+    agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gpt"                            # 3 из 5 — порог недостижим
+
+
+def test_ladder_returns_to_the_more_accurate_cheaper_model(tmp_path, monkeypatch):
+    """Лог пользователя: Gemini — 8 из 11, вид перешёл к gpt-5.4-mini. Та сначала решает не меньше
+    5 заданий (прежде агент вернулся к Gemini после 2 из 3), и только потом агент сравнивает
+    точность и возвращает более точную (и дешёвую) модель; дальше между ними не прыгает."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch)
+    for i in range(11):
+        kb.model_attempt(pool, "gemini", i not in (3, 6, 9))
+    agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gpt"
+    for ok in (False, True, True):
+        kb.model_attempt(pool, "gpt", ok)
+        agent._climb_ladder(pool, "gpt")
+        assert agent._model_for(pool) == "gpt"                        # мало заданий — не сравнивает
+    for ok in (False, True):
+        kb.model_attempt(pool, "gpt", ok)
+        agent._climb_ladder(pool, "gpt")
+    assert agent._model_for(pool) == "gemini"                         # 3 из 5 хуже, чем 8 из 11
+    kb.model_attempt(pool, "gemini", False)
+    agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gemini"                         # не прыгает обратно к gpt
+    assert "- текущая модель: gemini" in pool.path.read_text(encoding="utf-8")
+
+
+def test_failed_exam_climbs_and_ladder_follows_env(tmp_path, monkeypatch):
+    import agent as agent_module
+
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("cheap", "mid", "strong"))
+    agent._climb_ladder(pool, "cheap", reason="экзамен не пройден")
+    assert agent._model_for(pool) == "mid"
     agent._climb_ladder(pool, "mid", reason="экзамен не пройден")
     agent._climb_ladder(pool, "strong", reason="экзамен не пройден")          # выше некуда
     assert agent._model_for(pool) == "strong"
@@ -489,28 +600,84 @@ def test_exam_gate_and_ladder_decide_early_on_few_training_tasks(tmp_path, monke
     assert agent._model_for(pool) == "other-cheap"                  # лестницу в .env поменяли
 
 
-def test_ladder_returns_to_the_more_accurate_cheaper_model(tmp_path, monkeypatch):
-    """Лог пользователя: Gemini ошиблась 1 раз из 4, вид перешёл к gpt-5.4-mini, а та ошибалась
-    чаще. Выше идти некуда — агент возвращает модель, которая была точнее (и дешевле), и дальше
-    между ними не прыгает."""
-    import agent as agent_module
+def test_case_lesson_keeps_the_task_and_the_right_answer(tmp_path, monkeypatch):
+    """Разбор ошибки — с самим заданием и верным ответом (прежде: «ответ «Непонятно» — неверно»
+    без запроса клиента, и модель избегала «Непонятно» во всех заданиях)."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("only",), title="Выберите задание")
+    mem = agent._memory
+    mem.observation = "Клиент ввёл запрос «алиса» — похоже на слишком общий запрос."
+    mem.wrong_answers, mem.case = ["«Непонятно»"], mem.observation
+    agent._record_training("training", accepted=False, answer="«Непонятно»")
+    agent._record_training("training", accepted=True, answer="«Выполнить действие»")
+    lesson = pool.lessons[-1]
+    assert "«алиса»" in lesson and "Неверно: «Непонятно»." in lesson
+    assert lesson.endswith("Верный ответ: «Выполнить действие».")
+    assert pool.train_answers == {"«Выполнить действие»": 1}
+    assert "«алиса»" in kb.prompt_text(pool)
+
+    # третий ответ после двух ошибок платформа принимает любой — он не «правильный»
+    mem.reset("t2")
+    mem.case, mem.wrong_answers, mem.hints = "Клиент: «не понятно» про кэшбэк", ["«A»", "«B»"], ["Подумай ещё"]
+    agent._record_training("training", accepted=True, answer="«C»")
+    assert "«C»" not in pool.train_answers
+    assert "Третий ответ «C» принят" in pool.lessons[-1] and "Подсказка платформы: Подумай ещё" in pool.lessons[-1]
+
+    # задание сменилось без принятого ответа — разбор всё равно сохраняется
+    mem.reset("t3")
+    mem.case, mem.wrong_answers = "Звонок: «вас приветствует авиакомпания»", ["«ПОЛЕЗНЫЙ»"]
+    agent._save_case_lesson()
+    assert pool.lessons[-1].endswith("Верный ответ не известен.")
+
+
+def test_human_correction_is_a_lesson_and_a_model_miss(tmp_path, monkeypatch):
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("only",), title="Прослушайте звонок")
+    mem = agent._memory
+    mem.observation = "Абонент спрашивает «что вы хотите?» и «какой банк?»"
+    mem.human_answer = "«Результат неправильный. Был автоответчик»"
+    agent._record_training("training", accepted=True, answer=mem.human_answer)
+    assert agent._order_train == [0, 1] and pool.model_stats["only"] == [0, 1]
+    assert "Человек" in pool.lessons[-1] and "Был автоответчик»" in pool.lessons[-1]
+    mem.reset("exam")
+    mem.human_answer = "«Результат правильный»"
+    agent._record_training("exam", accepted=True, answer=mem.human_answer)     # в экзамене — тоже урок
+    assert "«Результат правильный»" in pool.lessons[-1] and agent._order_train == [0, 1]
+
+
+def test_knowledge_prompt_keeps_the_whole_instruction_before_lessons(tmp_path):
+    """Лог пользователя: 13 длинных уроков вытеснили инструкцию из запроса (лимит 9000 символов,
+    инструкция шла последней). Теперь инструкция — первой и целиком, уроки — сколько войдёт,
+    свежие важнее; уроки прежних версий без задания и подсказки в запрос не идут."""
     from knowledge import KnowledgeBase
 
     kb = KnowledgeBase(str(tmp_path))
-    agent = Agent(llm=_NoLLM(), knowledge=kb)
-    pool = kb.for_state(PageState(pool_key="k2", pool_title="Звонок", pool_signature=["h:звонок"]))
-    monkeypatch.setattr(agent_module, "LLM_MODELS", ("gemini", "gpt"))
-    for ok in (True, True, True, False):
-        kb.model_attempt(pool, "gemini", ok)
-        agent._climb_ladder(pool, "gemini")
-    assert agent._model_for(pool) == "gpt"
-    kb.model_attempt(pool, "gpt", False)
-    agent._climb_ladder(pool, "gpt")
-    assert agent._model_for(pool) == "gemini"                         # 3 из 4 точнее, чем 0 из 1
-    kb.model_attempt(pool, "gemini", False)
-    agent._climb_ladder(pool, "gemini")
-    assert agent._model_for(pool) == "gemini"                         # не прыгает обратно к gpt
-    assert "- текущая модель: gemini" in pool.path.read_text(encoding="utf-8")
+    pool = kb.for_state(PageState(pool_key="k9", pool_title="Тип звонка", pool_signature=["h:звонок"]))
+    kb.save_instruction(pool, "ДЕРЕВО РЕШЕНИЙ. " + "Правило. " * 700, "диалог «Инструкция»")
+    kb.add_lesson(pool, "Задание «Тип звонка»: ответ «ПОЛЕЗНЫЙ» — неверно.")
+    for i in range(20):
+        kb.add_lesson(pool, f"Задание: звонок №{i}. Неверно: «ПОЛЕЗНЫЙ». Подсказка платформы: " + "x" * 600)
+    text = kb.prompt_text(pool, limit=14000)
+    assert len(text) <= 14000 + 80
+    assert "ДЕРЕВО РЕШЕНИЙ" in text and ("Правило. " * 700).strip() in text   # инструкция целиком
+    assert text.index("Инструкция к заданиям") < text.index("Разборы ошибок")
+    assert "звонок №19" in text and "звонок №0." not in text                 # свежие — важнее
+    assert "ответ «ПОЛЕЗНЫЙ» — неверно." not in text                          # голый урок — нет
+
+
+def test_pdf_instruction_read_the_old_way_is_read_again_once(tmp_path):
+    from knowledge import READ_MARK, KnowledgeBase
+
+    kb = KnowledgeBase(str(tmp_path))
+    pool = kb.for_state(PageState(pool_key="k8", pool_title="Звонки", pool_signature=["h:звонки"]))
+    pool.instruction = "Старый пересказ PDF. " * 10
+    pool.instruction_meta = "Прочитано: 2026-09-29 14:58, источник: вкладка https://x/klecks/instruction/1"
+    assert pool.instruction_outdated and not pool.has_instruction
+    kb.save_instruction(pool, "Новый текст со схемой: Разговорное имя? — ДА → …; НЕТ → … " * 3,
+                        "вкладка https://x/klecks/instruction/1")
+    assert "Новый текст" in pool.instruction and "Старый" not in pool.instruction
+    assert READ_MARK in pool.instruction_meta and pool.has_instruction and not pool.instruction_outdated
+    dialog = kb.for_state(PageState(pool_key="k7", pool_title="Диалог", pool_signature=["h:диалог"]))
+    dialog.instruction, dialog.instruction_meta = "x" * 100, "Прочитано: 2026-09-01, источник: диалог «И»"
+    assert dialog.has_instruction                                     # из диалога — не перечитывается
 
 
 def test_catcher_offers_the_largest_pdf_first():

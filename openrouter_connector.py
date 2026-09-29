@@ -55,8 +55,9 @@ from config import (
     TRANSCRIBE_LANGUAGE,
     TRANSCRIBE_MODELS,
 )
-from dom_parser import _plain_text, geo_facts, inspection_task, media_facts, render_page
+from dom_parser import _plain_text, coverage_task, geo_facts, inspection_task, media_facts, render_page
 from models import (
+    AudioClip,
     LLMUnavailable,
     FLAG_DISABLED,
     FLAG_SELECTED,
@@ -132,8 +133,11 @@ SYSTEM_PROMPT = f"""Ты — опытный и очень внимательны
 ━━━ ПРАВИЛА ТОЧНОСТИ ━━━
 • Сначала найди строку с нужным текстом, затем перепиши её номер. target_index — только из текущей \
 СТРАНИЦЫ; target_text — дословный текст элемента (без номера, [ТИПА], кавычек и флагов).
-• Не кликай [OPTION radio] с {FLAG_SELECTED}. Не выбирай элементы с {FLAG_DISABLED} и действия из \
-НЕ ПОВТОРЯТЬ. Нужного элемента нет — open/scroll, а не click по «похожему»; не выдумывай элементы.
+• Не кликай [OPTION radio] с {FLAG_SELECTED}: выбор в группе radio меняется кликом по другому варианту. Не \
+выбирай элементы с {FLAG_DISABLED} и действия из НЕ ПОВТОРЯТЬ. Нужного элемента нет — open/scroll, а не \
+click по «похожему»; не выдумывай элементы.
+• Меняешь ответ — убери и то, что к нему относилось: текст в поле для варианта «Другое», который больше не \
+выбран, стирай действием type с value "".
 • Открыт диалог поверх страницы — сначала разберись с ним.
 • confidence — честная уверенность, что ответ ПРАВИЛЬНЫЙ.
 
@@ -175,17 +179,29 @@ HINTS: dict[str, str] = {
         "поверхностей: если какой-то нет — ответ по правилу инструкции для этого случая. Не списывай "
         "подозрительное на блики, отражения или царапины, если не уверен."
     ),
+    "coverage": (
+        "Проверка полноты фото: в observation пройди все фото по строке: «ФОТО n: что снято (поверхность, "
+        "деталь), целиком ли она видна, верный ли ракурс». Сверь со списком обязательных фото из инструкции "
+        "и разборов ошибок: отдельные фото деталей, которых требует инструкция, поверхность целиком, а не "
+        "половина. «Все фото в наличии» — только если каждое обязательное фото есть и годится; «частично» — "
+        "отметь именно те блоки, где фото не хватает или они негодные. Если инструкция разрешает снимать "
+        "«по возможности» (мешают посторонние предметы, ограничен доступ), такое фото считается годным."
+    ),
     "audio": (
         "Аудио: ответ почти всегда зависит от того, КТО отвечал на звонок, чем разговор закончился и понимал "
         "ли звонящий робот ответы. Запись уже прослушана: у реплик абонента указано, человек это или "
         "автоответчик, а в конце расшифровки — «ВЫВОД СЛУШАТЕЛЯ» (голос и поведение) и «ПОНИМАНИЕ "
         "ЗВОНЯЩЕГО»; опирайся на них вместе с текстом. Автоответчик — это и голосовой помощник или секретарь, "
         "отвечающий вместо владельца телефона (в том числе сервисы банков и операторов связи): представляется "
-        "помощником, говорит о владельце в третьем лице, просит назвать цель звонка или оставить сообщение, "
-        "отвечает шаблонно или невпопад, не учитывая сказанное. Он может звучать как человек и поддерживать "
-        "разговор, но это НЕ человек и не «оператор» или «представитель банка». Робот хоть раз не понял "
-        "ответ, переспросил или ответил невпопад — это важно для вариантов про понимание роботом. Расшифровки "
-        "ещё нет — не угадывай ответ: верни skip, агент дождётся расшифровки."
+        "помощником, говорит о владельце в третьем лице, вместо ответов задаёт шаблонные вопросы («кто "
+        "звонит?», «что вы хотите?», «по какому вопросу?», «из какого вы банка?», «что передать?»), предлагает "
+        "оставить сообщение, отвечает шаблонно или невпопад, не учитывая сказанное. Он может звучать как "
+        "человек и поддерживать разговор, но это НЕ человек и не «оператор» или «представитель банка». "
+        "Абонент только спрашивает, кто и зачем звонит, и ни разу не ответил роботу по существу (не "
+        "подтвердил, что это он, ничего не сказал о долге или платеже) — почти наверняка голосовой помощник. "
+        "Робот хоть раз не понял ответ, переспросил или ответил невпопад — это важно для вариантов про "
+        "понимание роботом. Сначала реши, кто отвечал (напиши это в observation), затем сверь с результатом "
+        "звонка. Расшифровки ещё нет — не угадывай ответ: верни skip, агент дождётся расшифровки."
     ),
     "dropdown": (
         "Списки значений: сначала open, затем click по пункту с пометкой «во всплывающем списке». Значение "
@@ -237,7 +253,7 @@ def page_hints(state: PageState, context: DecisionContext) -> list[str]:
     if len(geo_facts(state)) or re.search(r"совпада", text, re.IGNORECASE):
         keys.append("compare")
     if state.images:
-        keys.append("inspection" if inspection_task(state) else "photos")
+        keys.append("inspection" if inspection_task(state) else "coverage" if coverage_task(state) else "photos")
     if state.audios:
         keys.append("audio")
     if any(_is_value_list(e) for e in visible):
@@ -302,6 +318,17 @@ def _model_name(model: str) -> str:
 # Цены моделей, $ за 1 млн токенов: вход, вход из кэша, выход — со списка моделей OpenRouter (/models),
 # загружаются при запуске. Стоимость вызовов OpenRouter сообщает сам (usage.cost) — по ней и лог.
 LIVE_PRICES: dict[str, tuple[float, float, float]] = {}
+# Модели, которые принимают звук (architecture.input_modalities со списка моделей OpenRouter).
+# Список не загрузился — слушающими считаются Gemini (кроме генерации речи и картинок)
+AUDIO_MODELS: set[str] = set()
+_MODALITIES_KNOWN: list[bool] = [False]
+
+
+def hears_audio(model: str) -> bool:
+    if _MODALITIES_KNOWN[0]:
+        return model in AUDIO_MODELS
+    name = _model_name(model)
+    return name.startswith("gemini") and not any(w in name for w in ("tts", "image", "embedding"))
 
 
 def model_price(model: str) -> Optional[tuple[float, float, float]]:
@@ -480,6 +507,7 @@ class LLMConnector:
             http_client=_proxy_client(LLM_PROXY) if LLM_PROXY else None,
         )
         self._vision_enabled = True
+        self._deaf_models: set[str] = set()          # не приняли запись в запросе (ошибка 400)
         self._dead_transcribers: set[str] = set()
         self._dead_models: set[str] = set()          # недоступные модели из «Заметок»
         # лестница моделей; модели, которых нет у OpenRouter, проверка на старте убирает
@@ -628,11 +656,20 @@ class LLMConnector:
         except Exception as exc:  # noqa: BLE001 — без цен агент работает, стоимость сообщает OpenRouter
             logger.debug("Список моделей не получен: %s", exc)
             return
+        AUDIO_MODELS.clear()
+        _MODALITIES_KNOWN[0] = False
         for item in getattr(page, "data", []) or []:
             extra = getattr(item, "model_extra", None) or {}
-            price = _live_price(extra.get("pricing") if isinstance(extra, dict) else None)
+            if not isinstance(extra, dict):
+                continue
+            price = _live_price(extra.get("pricing"))
             if price and getattr(item, "id", None):
                 LIVE_PRICES[item.id] = price
+            modalities = (extra.get("architecture") or {}).get("input_modalities")
+            if isinstance(modalities, list) and getattr(item, "id", None):
+                _MODALITIES_KNOWN[0] = True
+                if "audio" in modalities:
+                    AUDIO_MODELS.add(item.id)
 
     @staticmethod
     def _model_missing(exc: Optional[Exception]) -> bool:
@@ -675,38 +712,46 @@ class LLMConnector:
         if not isinstance(context, DecisionContext):
             context = DecisionContext()   # совместимость с v2: decide(state, banned_indices)
 
-        prefix, main = self.build_user_parts(state, context)
-        logger.debug("LLM user msg (%d симв., изображений %d):\n%s\n\n%s",
-                     len(prefix) + len(main), len(context.images) + bool(context.image_b64), prefix, main)
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._user_content(prefix, main, context)},
-        ]
         temperature = context.temperature if context.temperature is not None else LLM_TEMPERATURE
-
         self.unavailable = False
         main_model = self.models[0] if self.models else LLM_MODEL
         model = context.model or main_model
         if model in self._dead_models:
             model = main_model
-        decision = await self._ask(model, messages, temperature)
+        decision = await self._ask(model, self._messages(state, context, model), temperature)
         if decision is None and model != main_model and self._model_missing(self._last_error):
             # модель, закреплённая в заметках, с опечаткой или снята с OpenRouter — не пропускать задания
             self._dead_models.add(model)
             logger.error("⚠ Модель %s недоступна (%s) — решаю моделью %s. Проверьте название модели в "
                          "«Заметках» базы знаний", model, str(self._last_error)[:160], main_model)
             model = main_model
-            decision = await self._ask(model, messages, temperature)
+            decision = await self._ask(model, self._messages(state, context, model), temperature)
         if decision is None:
             self.unavailable = isinstance(self._last_error, LLMUnavailable)
             return LLMDecision.skip("OpenRouter недоступен" if self.unavailable else "ошибка API LLM или невалидный ответ")
         if self._needs_check(decision, model):
             logger.info("Модель не уверена в отправляемом ответе (%.2f < %.2f) — перепроверяю моделью %s",
                         decision.confidence, LLM_CHECK_BELOW, LLM_CHECK_MODEL)
-            checked = await self._ask(LLM_CHECK_MODEL, messages, temperature)
+            checked = await self._ask(LLM_CHECK_MODEL, self._messages(state, context, LLM_CHECK_MODEL), temperature)
             if checked is not None:
                 decision = checked
         return decision
+
+    def hears_audio(self, model: str) -> bool:
+        """Модель принимает запись звонка в запросе (Gemini) и не отказывалась от неё."""
+        return model not in self._deaf_models and hears_audio(model)
+
+    def _messages(self, state: PageState, context: DecisionContext, model: str) -> list[dict[str, Any]]:
+        """Запрос для этой модели: запись звонка — только той, что умеет слушать."""
+        clips = [c for c in context.audio if _audio_format(c.fmt)] if self.hears_audio(model) else []
+        prefix, main = self.build_user_parts(state, context, heard=bool(clips))
+        logger.debug("LLM user msg (%d симв., изображений %d, записей %d):\n%s\n\n%s",
+                     len(prefix) + len(main), len(context.images) + bool(context.image_b64), len(clips),
+                     prefix, main)
+        return [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": self._user_content(prefix, main, context, clips)},
+        ]
 
     @staticmethod
     def _needs_check(decision: LLMDecision, model: str = "") -> bool:
@@ -782,6 +827,11 @@ class LLMConnector:
                 logger.warning("Structured Outputs не поддерживаются (%s) — переключаюсь на json_object", exc)
                 params.structured = False
                 return await self._complete(messages, temperature, model, patience)
+            if "audio" in message and self._has_audio(messages):
+                logger.warning("Модель %s не принимает запись звонка в запросе (%s) — дальше только расшифровка",
+                               model, str(exc)[:160])
+                self._deaf_models.add(model)
+                return await self._complete(self._strip_audio(messages), temperature, model, patience)
             if self._vision_enabled and "image" in message and self._has_image(messages):
                 logger.warning("Модель не принимает изображения (%s) — отправляю без картинки", exc)
                 self._vision_enabled = False
@@ -793,6 +843,12 @@ class LLMConnector:
                                model, str(exc)[:160])
                 params.structured = False
                 return await self._complete(messages, temperature, model, patience)
+            if self._has_audio(messages):
+                # ошибка 400 без объяснения, а в запросе запись — повтор без неё (иначе шаг за шагом та же ошибка)
+                logger.warning("Модель %s не приняла запрос с записью звонка (%s) — повторяю без записи",
+                               model, str(exc)[:160])
+                self._deaf_models.add(model)
+                return await self._complete(self._strip_audio(messages), temperature, model, patience)
             logger.error("LLM API ошибка запроса: %s", exc)
             self._last_error = exc
             return None
@@ -822,23 +878,29 @@ class LLMConnector:
         return choice.message.content or ""
 
     def _user_content(
-        self, prefix: str, main: str, context: DecisionContext,
+        self, prefix: str, main: str, context: DecisionContext, clips: Optional[list[AudioClip]] = None,
     ) -> Union[str, list[dict[str, Any]]]:
-        """Сообщение для модели. Фото стоят ПОСЛЕ неизменной части (знания, подсказки) и ДО
-        меняющейся (страница, история): начало запроса одинаково во всех вызовах по заданию,
-        и OpenAI берёт его из кэша по сниженной цене."""
-        if not self._vision_enabled or not (context.images or context.image_b64):
+        """Сообщение для модели. Фото и записи стоят ПОСЛЕ неизменной части (знания, подсказки)
+        и ДО меняющейся (страница, история): начало запроса одинаково во всех вызовах по заданию,
+        и провайдер берёт его из кэша по сниженной цене."""
+        images = self._vision_enabled and bool(context.images or context.image_b64)
+        if not images and not clips:
             return f"{prefix}\n\n{main}" if prefix else main
         parts: list[dict[str, Any]] = []
         if prefix:
             parts.append({"type": "text", "text": prefix})
-        for image in context.images:
+        for image in context.images if images else []:
             parts.append({"type": "text", "text": f"{image.caption}:"})
             parts.append({"type": "image_url", "image_url": {
                 "url": f"data:image/jpeg;base64,{image.b64}", "detail": image.detail or LLM_VISION_DETAIL,
             }})
+        for clip in clips or []:
+            parts.append({"type": "text", "text": f"Запись [АУДИО {clip.n}] — послушай её сама:"})
+            parts.append({"type": "input_audio", "input_audio": {
+                "data": base64.b64encode(clip.data).decode("ascii"), "format": _audio_format(clip.fmt),
+            }})
         parts.append({"type": "text", "text": main})
-        if context.image_b64:
+        if context.image_b64 and images:
             parts.append({"type": "text", "text": "Скриншот страницы задания:"})
             parts.append({"type": "image_url", "image_url": {
                 "url": f"data:image/jpeg;base64,{context.image_b64}", "detail": LLM_VISION_DETAIL,
@@ -848,6 +910,26 @@ class LLMConnector:
     @staticmethod
     def _has_image(messages: list[dict[str, Any]]) -> bool:
         return any(isinstance(m.get("content"), list) for m in messages)
+
+    @staticmethod
+    def _has_audio(messages: list[dict[str, Any]]) -> bool:
+        return any(p.get("type") == "input_audio" for m in messages
+                   if isinstance(m.get("content"), list) for p in m["content"])
+
+    @staticmethod
+    def _strip_audio(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Запрос без записей звонка (подписи к ним тоже убираются)."""
+        out = []
+        for message in messages:
+            content = message.get("content")
+            if isinstance(content, list):
+                kept = [{**p, "text": p["text"].replace(_HEARD_NOTE + "\n", "")} if p.get("type") == "text" else p
+                        for i, p in enumerate(content) if p.get("type") != "input_audio" and not (
+                            i + 1 < len(content) and content[i + 1].get("type") == "input_audio")]
+                content = kept if any(p.get("type") != "text" for p in kept) else \
+                    "\n\n".join(p.get("text", "") for p in kept)
+            out.append({**message, "content": content})
+        return out
 
     @staticmethod
     def _strip_images(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -864,9 +946,10 @@ class LLMConnector:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def build_user_parts(state: PageState, context: DecisionContext) -> tuple[str, str]:
+    def build_user_parts(state: PageState, context: DecisionContext, *, heard: bool = False) -> tuple[str, str]:
         """(неизменная часть задания, меняющаяся часть). Неизменная — знания, подсказки,
-        сведения о фото и расшифровка аудио — идёт первой (кэш OpenAI)."""
+        сведения о фото и расшифровка аудио — идёт первой (кэш провайдера). heard — запись
+        звонка приложена к сообщению (модель слушает её сама)."""
         head: list[str] = []
         if context.knowledge:
             head += ["═══ ЗНАНИЯ О ВИДЕ ЗАДАНИЙ ═══", context.knowledge, ""]
@@ -880,7 +963,10 @@ class LLMConnector:
                             + "; ".join(i.caption for i in context.images) + ".")
             head += context.image_notes + [""]
         if context.transcripts:
-            head += ["═══ АУДИО ═══"] + context.transcripts + [""]
+            head += ["═══ АУДИО ═══"]
+            if heard:
+                head.append(_HEARD_NOTE)
+            head += context.transcripts + [""]
         prefix = "\n".join(head).rstrip()
 
         parts: list[str] = []
@@ -925,7 +1011,7 @@ class LLMConnector:
         if context.notes:
             parts += ["", "═══ ВНИМАНИЕ ═══"] + [f"⚠ {n}" for n in context.notes]
 
-        parts += ["", "Выбери действия. Ответ — только JSON по схеме."]
+        parts += ["", "Выбери действия. Ответ — только JSON по схеме; все тексты в нём — по-русски."]
         return prefix, "\n".join(parts)
 
     @classmethod
@@ -1007,7 +1093,7 @@ class LLMConnector:
                    {"type": "file", "file": {"filename": filename, "file_data":
                                              f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}}]
         kwargs: dict[str, Any] = {
-            "model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 8000,
+            "model": model, "messages": [{"role": "user", "content": content}], "max_tokens": 16000,
             "temperature": 0.0, "extra_body": {"usage": {"include": True}},
         }
         try:
@@ -1114,26 +1200,48 @@ class LLMConnector:
 
 # Расшифровка моделью, которая слушает запись (Gemini): форматы, которые она принимает
 _LISTEN_FORMATS = {"mp3", "wav", "aiff", "aac", "ogg", "flac", "m4a"}
+_FORMAT_ALIASES = {"mpeg": "mp3", "mpeg3": "mp3", "x-mp3": "mp3", "x-wav": "wav", "wave": "wav", "vnd.wave": "wav",
+                   "x-aiff": "aiff", "aacp": "aac", "x-aac": "aac", "oga": "ogg", "opus": "ogg", "x-flac": "flac",
+                   "mp4": "m4a", "x-m4a": "m4a"}
+
+
+def _audio_format(fmt: str) -> str:
+    """Формат записи для input_audio («mpeg» → «mp3»); «» — модель такой не примет."""
+    fmt = (fmt or "").strip().lower()
+    fmt = _FORMAT_ALIASES.get(fmt, fmt)
+    return fmt if fmt in _LISTEN_FORMATS else ""
+
+
+_HEARD_NOTE = (
+    "Записи звонка приложены к сообщению — послушай их сама, расшифровка ниже — для точных слов и "
+    "времени. Кто ответил на звонок, решай по голосу и поведению на записи: живой человек (естественная "
+    "речь, паузы, реагирует на имя, сумму и вопросы робота) или автоответчик / голосовой помощник "
+    "(синтезированный или слишком ровный голос, шаблонные вопросы «кто звонит», «что вы хотите», «по "
+    "какому вопросу», «что передать», не отвечает роботу по существу). Твой вывод по записи важнее "
+    "пометок в расшифровке.")
 _LISTEN_PROMPT = (
     "Это запись телефонного звонка — обычно робот (или оператор) звонит абоненту. Расшифруй её дословно, "
     "на языке записи: каждая реплика — отдельной строкой «[м:сс] Кто: текст».\n"
     "Кто:\n"
     "• «Звонящий робот» или «Звонящий оператор» — сторона, которая звонит;\n"
     "• на стороне абонента — по тому, кто отвечает на самом деле, а не по его словам:\n"
-    "  «Абонент (человек)» — живой человек: естественный голос с паузами и интонацией, отвечает по смыслу "
-    "сказанного, реагирует на имя, сумму, дату, сам задаёт вопросы по теме;\n"
+    "  «Абонент (человек)» — живой человек: естественный голос с паузами, запинками и интонацией, отвечает по "
+    "смыслу сказанного, реагирует на своё имя, сумму и дату, отвечает на вопросы робота («да, это я», «не "
+    "могу сейчас», «заплачу в пятницу»);\n"
     "  «Абонент (автоответчик)» — автоответчик, голосовая почта, голосовой помощник или секретарь, "
     "отвечающий вместо владельца телефона (в том числе сервисы банков и операторов связи): представляется "
     "помощником или секретарём, говорит о владельце в третьем лице («Анна сейчас не может ответить»), "
-    "просит назвать имя и цель звонка, предлагает оставить сообщение, отвечает шаблонно или невпопад — не "
-    "учитывая то, что сказал звонящий, повторяет одни и те же фразы; голос синтезированный или слишком "
-    "ровный. Такой помощник может звучать как человек и поддерживать разговор — всё равно это "
+    "задаёт шаблонные вопросы вместо ответов — «кто звонит?», «что вы хотите?», «по какому вы вопросу?», "
+    "«из какой вы компании / какого банка?», «что передать?», «представьтесь», предлагает оставить "
+    "сообщение; на вопросы робота по существу (имя, долг, платёж) не отвечает, отвечает шаблонно или "
+    "невпопад, повторяет одни и те же фразы; голос синтезированный или слишком ровный, ответ звучит сразу, "
+    "без раздумий. Такой помощник может звучать как человек и поддерживать разговор — всё равно это "
     "автоответчик;\n"
     "  «Сеть» — сообщения оператора связи: «абонент недоступен», «номер не обслуживается», «занято».\n"
     "Звуки без речи — в квадратных скобках: [гудки], [сигнал], [музыка], [тишина], [обрыв связи].\n"
     "После расшифровки добавь две строки:\n"
     "ВЫВОД СЛУШАТЕЛЯ: на стороне абонента — человек / автоответчик (голосовой помощник) / сеть / сначала "
-    "…, затем …; по каким признакам (голос, ответы невпопад, шаблонные фразы, реакция на сказанное).\n"
+    "…, затем …; по каким признакам (голос, ответы невпопад, шаблонные вопросы, реакция на сказанное).\n"
     "ПОНИМАНИЕ ЗВОНЯЩЕГО: где звонящий не понял ответ, переспросил или ответил невпопад (время), или "
     "«понимал все ответы».\n"
     "Больше ничего от себя не добавляй и не пересказывай.")
@@ -1141,9 +1249,13 @@ _LISTEN_PROMPT = (
 
 _READ_DOC_PROMPT = (
     "Это инструкция к заданиям разметки. Перепиши её текст полностью и дословно, по порядку: заголовки, "
-    "абзацы, списки (каждый пункт с новой строки), таблицы — строками «| … |». Картинки и схемы опиши одной "
-    "строкой в квадратных скобках: что на них показано. Ничего не сокращай, не пересказывай и не добавляй "
-    "от себя.")
+    "абзацы, списки (каждый пункт с новой строки), таблицы — строками «| … |». Ничего не сокращай, не "
+    "пересказывай и не добавляй от себя.\n"
+    "Схемы, блок-схемы, деревья решений и таблицы, нарисованные картинкой, перепиши текстом ПОЛНОСТЬЮ — "
+    "это главное в инструкции: каждый вопрос или условие и куда ведёт каждый ответ, например «Разговорное "
+    "имя / родственник? — ДА → …; НЕТ → следующий вопрос: …», вплоть до итоговых вариантов ответа. "
+    "Скриншоты и примеры с текстом — перепиши их текст и укажи, какой ответ для них правильный. Картинку "
+    "без текста и смысла для правил опиши одной строкой в квадратных скобках.")
 
 
 def _short_error(exc: Optional[BaseException]) -> str:

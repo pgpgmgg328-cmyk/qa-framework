@@ -83,6 +83,12 @@ class TaskMemory:
     dialog_attempts: Counter = field(default_factory=Counter)    # текст диалога → попыток закрыть
     instruction_pages: int = 0                                   # прочитано страниц инструкции в этом задании
     batch_notes: list[str] = field(default_factory=list)         # «пакет остановлен: …» — для следующего шага
+    # --- v4.8: разбор ошибки для базы знаний ---
+    observation: str = ""                                        # что модель увидела в задании (последний шаг)
+    case: str = ""                                               # описание задания, в котором она ошиблась
+    hints: list[str] = field(default_factory=list)               # подсказки платформы к неверным ответам
+    human_answer: str = ""                                       # ответ, который выбрал человек в окне браузера
+    lesson_saved: bool = False
 
     def reset(self, task_id: str) -> None:
         """Полный сброс при смене задания (раскрытие папок задание не меняет)."""
@@ -182,7 +188,7 @@ class TaskMemory:
             if after is None:
                 entry.result = "✓ введено (поле исчезло — форма обновилась)"
             elif normalize_text(after.value) == normalize_text(pending.typed):
-                entry.result = "✓ введено"
+                entry.result = "✓ введено" if pending.typed else "✓ поле очищено"
             else:
                 entry.result = f"⚠ в поле сейчас: «{after.value[:60]}»"
 

@@ -383,13 +383,19 @@ class _ActionFields(BaseModel):
             return None
         return index if index >= 0 else None
 
-    @field_validator("target_text", "type_text", "query", "scroll_direction", mode="before")
+    @field_validator("target_text", "query", "scroll_direction", mode="before")
     @classmethod
     def _coerce_optional_str(cls, value: Any) -> Any:
         if value is None:
             return None
         text = str(value).strip()
         return text or None
+
+    @field_validator("type_text", mode="before")
+    @classmethod
+    def _coerce_type_text(cls, value: Any) -> Any:
+        """Пустая строка у type — «очистить поле» (текст к снятому варианту «Другое»)."""
+        return None if value is None else str(value).strip()
 
 
 class PlannedAction(_ActionFields):
@@ -488,6 +494,16 @@ class DecisionContext:
     feedback:    list[str] = field(default_factory=list)   # «Неверный ответ» после отправки, подсказки
     wrong_answers: list[str] = field(default_factory=list)  # ответы, признанные неверными
     model:       str = ""                                  # модель для этого вида заданий (лестница)
+    audio:       list["AudioClip"] = field(default_factory=list)  # записи звонка — модели, которая слышит
+
+
+@dataclass
+class AudioClip:
+    """Запись из задания для модели, которая умеет слушать (Gemini)."""
+
+    n: int                  # [АУДИО n]
+    data: bytes
+    fmt: str                # mp3, wav, ogg …
 
 
 @dataclass

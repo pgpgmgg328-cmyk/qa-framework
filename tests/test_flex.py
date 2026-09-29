@@ -201,11 +201,13 @@ def test_training_feedback_lesson_and_stop_on_orders_list(tmp_path, monkeypatch)
     assert feedback.wrong_answers == ["«Нет»"]
     assert feedback.plan == "кажется, разные отели"
     assert any("НЕВЕРНЫЙ ОТВЕТ" in h for h in feedback.history)
-    # урок в базе знаний и в промпте следующего задания этого вида
+    # разбор ошибки в базе знаний и в промпте следующего задания этого вида: подсказка и верный ответ
     files = list((tmp_path / "knowledge").glob("*.md"))
-    assert len(files) == 1 and "Правильный ответ: Да" in files[0].read_text(encoding="utf-8")
+    saved = files[0].read_text(encoding="utf-8")
+    assert len(files) == 1 and "Правильный ответ: Да" in saved
+    assert "Неверно: «Нет». " in saved and "Верный ответ: «Да»." in saved
     last_ctx = llm.calls[-1][1]
-    assert "Уроки из прошлых ошибок" in last_ctx.knowledge
+    assert "Разборы ошибок из тренировки" in last_ctx.knowledge and "Верный ответ: «Да»." in last_ctx.knowledge
     # второе задание начато с чистой памятью
     second = [ctx for state, ctx in llm.calls if "Хостел Кедр" in state.task_text]
     assert second and second[0].history == [] and second[0].wrong_answers == []
@@ -237,6 +239,40 @@ def test_audio_is_transcribed_and_played_to_the_end(tmp_path, monkeypatch):
     # ответ принят с первой отправки: агент дослушал запись до «Завершить задание»
     assert agent._tasks_done == 1 and agent._wrong_total == 0
     assert agent._memory.submit_failures == 0
+
+
+def test_answer_changed_by_a_human_during_playback_is_kept(tmp_path, monkeypatch, caplog):
+    """Лог пользователя: пока запись доигрывала, человек выбрал «Был автоответчик», а агент потом
+    вернул свой «Результат правильный». Теперь ответ человека отправляется, модель его не меняет,
+    а случай сохраняется разбором для следующих заданий; записи модель получает вместе с расшифровкой."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("robot"))
+    original = MediaManager.wait_finished
+
+    async def human_clicks_while_playing(self, frame, state):
+        await frame.get_by_text("Результат неправильный. Был автоответчик").click()
+        return await original(self, frame, state)
+
+    monkeypatch.setattr(MediaManager, "wait_finished", human_clicks_while_playing)
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        assert ctx.audio and ctx.audio[0].n == 1 and ctx.audio[0].fmt == "wav" and len(ctx.audio[0].data) > 10_000
+        if any("Человек в окне браузера" in note for note in ctx.notes):
+            return submit(state)
+        right = find(state, "Результат правильный")
+        return batch(click(right, observation="Абонент спрашивает «что вы хотите?»"), submit(state))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        with caplog.at_level("INFO", logger="twork.agent"):
+            await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 1 and agent._wrong_total == 0 and len(llm.calls) == 1
+    assert "👤 Пока запись доигрывала, ответ в окне поменяли" in caplog.text
+    saved = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
+    assert "поправил ответ на «Результат неправильный. Был автоответчик»" in saved
+    assert "что вы хотите?" in saved and "с первого раза верно: 0 из 1" in saved   # ошибка модели
 
 
 def test_openrouter_outage_does_not_burn_the_task_and_transcription_is_retried(tmp_path, monkeypatch):
@@ -654,11 +690,13 @@ def test_exam_after_good_training_and_failed_result_is_recognized(tmp_path, monk
 
 
 def test_model_ladder_moves_task_type_to_stronger_model(tmp_path, monkeypatch):
-    """Лестница моделей: дешёвая модель ошиблась в первом же задании тренировки — порог 80% из
-    3 заданий ей уже не набрать, вид заданий сразу переходит к следующей модели (она исправляет
-    ответ, решает остальную тренировку и экзамен); выбор сохраняется в базе знаний."""
+    """Лестница моделей: одна ошибка дешёвой модели — ещё не повод менять модель (80% из 5 заданий
+    достижимы); вторая ошибка подряд — порог уже не набрать, вид переходит к следующей модели (она
+    исправляет ответ, решает остальную тренировку и экзамен); выбор сохраняется в базе знаний."""
     monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("cleaning"))
     monkeypatch.setattr(agent_module, "LLM_MODELS", ("cheap", "strong"))
+    monkeypatch.setattr(agent_module, "LADDER_MIN_TASKS", 5)
+    monkeypatch.setattr(agent_module, "EXAM_MIN_ACCURACY", 0.0)      # здесь проверяется лестница, не порог
 
     def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
         return cleaning_answer(state, correct=ctx.model == "strong" or bool(ctx.feedback))
@@ -669,11 +707,11 @@ def test_model_ladder_moves_task_type_to_stronger_model(tmp_path, monkeypatch):
         return agent, llm
 
     agent, llm = run(scenario())
-    assert [ctx.model for _, ctx in llm.calls] == ["cheap"] + ["strong"] * 5
-    assert agent._order_train == [2, 3] and agent._order_exam is True
+    assert [ctx.model for _, ctx in llm.calls] == ["cheap"] * 3 + ["strong"] * 4
+    assert agent._order_train == [1, 3] and agent._order_exam is True
     stats = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
-    assert "- текущая модель: strong" in stats and "- модель cheap: с первого раза верно 0 из 1" in stats
-    assert "- модель strong: с первого раза верно 2 из 2" in stats and "- экзамен: пройден" in stats
+    assert "- текущая модель: strong" in stats and "- модель cheap: с первого раза верно 0 из 2" in stats
+    assert "- модель strong: с первого раза верно 1 из 1" in stats and "- экзамен: пройден" in stats
 
 
 def test_failed_exam_moves_task_type_to_next_model_and_pinned_model_stays(tmp_path, monkeypatch):

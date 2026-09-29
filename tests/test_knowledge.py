@@ -31,7 +31,8 @@ def test_knowledge_roundtrip_keeps_user_notes(tmp_path):
     assert again.tooltips == {"Да": "Один и тот же объект"}
     assert len(again.lessons) == 1 and again.notes == "Телефоны не сравнивать."
     text = fresh.prompt_text(again)
-    assert text.index("Заметки пользователя") < text.index("Уроки") < text.index("Инструкция к заданиям")
+    # инструкция — сразу после правил пользователя (её не вытесняют разборы ошибок), разборы — после
+    assert text.index("Заметки пользователя") < text.index("Инструкция к заданиям") < text.index("Разборы ошибок")
     # запись агента не затирает заметки пользователя
     fresh.add_lesson(again, "Новый урок")
     assert "Телефоны не сравнивать." in path.read_text(encoding="utf-8")

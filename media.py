@@ -27,6 +27,7 @@ from playwright.async_api import Error as PlaywrightError, Frame
 
 from config import (
     AUDIO_MAX_WAIT,
+    AUDIO_TO_MODEL_MB,
     AUDIO_TRANSCRIBE,
     LLM_VISION_DETAIL,
     VISION_CELL,
@@ -35,8 +36,8 @@ from config import (
     VISION_DETAIL_MAX,
     VISION_SINGLE_MAX,
 )
-from dom_parser import inspection_task, photo_groups
-from models import LLMUnavailable, MediaAudio, MediaImage, PageState, VisionImage
+from dom_parser import coverage_task, inspection_task, photo_groups
+from models import AudioClip, LLMUnavailable, MediaAudio, MediaImage, PageState, VisionImage
 
 logger = logging.getLogger("twork.media")
 
@@ -196,6 +197,8 @@ class MediaManager:
         # OpenRouter был недоступен: запись уже скачана, расшифровка — повторить не раньше срока
         self._audio_data: dict[str, tuple[bytes, str]] = {}
         self._retry_at: dict[str, float] = {}
+        # записи текущего задания — для модели, которая слушает сама (AUDIO_TO_MODEL)
+        self._clips: dict[str, tuple[bytes, str]] = {}
 
     # ------------------------------------------------------------------
     # Фото
@@ -262,7 +265,8 @@ class MediaManager:
             return {"n": img.n, "uid": img.uid, "src": img.src}
 
         wanted = {i.n for i in images}
-        if len(images) <= (VISION_DETAIL_MAX if inspection_task(state) else VISION_SINGLE_MAX):
+        detail = inspection_task(state) or coverage_task(state)
+        if len(images) <= (VISION_DETAIL_MAX if detail else VISION_SINGLE_MAX):
             jobs = [{"kind": "single", "items": [item(i)], "maxSide": VISION_IMAGE_SIDE, "quality": 0.85}
                     for i in images]
             return jobs, [f"ФОТО {i.n}" for i in images]
@@ -354,6 +358,7 @@ class MediaManager:
         if not data:
             self._transcripts[audio.src] = _Transcript(None, "запись не удалось скачать")
             return
+        self._clips[audio.src] = (data, mime)
         subtype = (mime.split("/")[-1].split(";")[0] or "mpeg").strip().lower()
         filename = f"audio.{_EXT_BY_MIME.get(subtype, 'mp3')}"
         try:
@@ -374,6 +379,16 @@ class MediaManager:
             self._transcripts[audio.src] = _Transcript(text)
         else:
             self._transcripts[audio.src] = _Transcript(None, "расшифровка недоступна")
+
+    def audio_clips(self, state: PageState) -> list[AudioClip]:
+        """Скачанные записи задания (не больше AUDIO_TO_MODEL_MB каждая) — модели, которая слушает."""
+        out: list[AudioClip] = []
+        for audio in state.audios:
+            data, mime = self._clips.get(audio.src, (b"", ""))
+            if data and len(data) <= AUDIO_TO_MODEL_MB * 1024 * 1024:
+                subtype = (mime.split("/")[-1].split(";")[0] or "mpeg").strip().lower()
+                out.append(AudioClip(n=audio.n, data=data, fmt=_EXT_BY_MIME.get(subtype, subtype)))
+        return out
 
     def transcripts_failed(self, state: PageState) -> bool:
         """Ни одну запись задания не расшифровать: не удалось окончательно (не «ещё готовится»)
@@ -493,6 +508,7 @@ class MediaManager:
         self._play_attempts.clear()
         self._audio_data.clear()             # отложенные расшифровки прошлого задания не нужны
         self._retry_at.clear()
+        self._clips.clear()
         if len(self._transcripts) > 50:
             for src in list(self._transcripts)[:-20]:
                 self._transcripts.pop(src, None)

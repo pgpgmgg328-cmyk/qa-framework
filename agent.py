@@ -37,6 +37,7 @@ from browser_controller import BrowserController, is_connection_lost
 from config import (
     ACTION_WAIT,
     AUDIO_PLAY_TO_END,
+    AUDIO_TO_MODEL,
     BATCH_ACTIONS,
     CAPTCHA_TIMEOUT,
     CLOSE_BROWSER_WHEN_DONE,
@@ -100,6 +101,10 @@ logger = logging.getLogger("twork.agent")
 # столько секунд (первое ожидание подряд / следующие)
 SKIP_WAIT_FIRST, SKIP_WAIT_NEXT = 8.0, 20.0
 OUTAGE_PAUSE = 5.0          # OpenRouter недоступен: пауза перед следующей попыткой шага, с
+# оценка точности модели для экзамена: столько «заданий» точности всей тренировки добавляется к её
+# собственным — пока у модели 1–3 задания, одна ошибка не превращает оценку в 66% или 0%
+_EXAM_PRIOR = 5
+AUDIO_SETTLE = 1.5          # запись доиграла — пауза, пока страница отметит прослушивание, с
 
 
 class StepResult(str, Enum):
@@ -327,7 +332,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.7 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.8 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -507,6 +512,8 @@ class Agent:
             return StepResult.ACTED
         if decision.plan:
             self._memory.plan = decision.plan
+        if decision.observation and not all(step.action == ActionType.SKIP for step in decision.steps()):
+            self._memory.observation = decision.observation
 
         # 13. Сверка целей и выполнение пакета действий
         await self._run_batch(frame, decision, state)
@@ -574,18 +581,23 @@ class Agent:
         """Первый ответ на задание тренировки: верен ли он; принятый ответ — правильный.
         Вне тренировки правильность неизвестна (экзамен подсказок не даёт)."""
         pool, mem = self._pool, self._memory
+        if accepted:
+            self._save_case_lesson(accepted=answer)
         if mode == "exam" or (accepted and mode != "training"):
             return
         model = self._model_for(pool)
         if accepted:
             if not mem.wrong_answers:
-                self._order_train[0] += 1
+                first_ok = not mem.human_answer         # ответ модели поправил человек — ошибка модели
+                self._order_train[0] += int(first_ok)
                 self._order_train[1] += 1
                 if pool is not None:
-                    self._knowledge.training_attempt(pool, True)
-                    self._knowledge.model_attempt(pool, model, True)
+                    self._knowledge.training_attempt(pool, first_ok)
+                    self._knowledge.model_attempt(pool, model, first_ok)
                     self._climb_ladder(pool, model)
-            if pool is not None and " = «" not in answer and answer.startswith("«"):
+            # после двух неверных ответов платформа принимает любой третий — он не «правильный»
+            if (pool is not None and len(mem.wrong_answers) < 2
+                    and " = «" not in answer and answer.startswith("«")):
                 self._knowledge.training_answer(pool, answer)
         elif len(mem.wrong_answers) == 1:
             self._order_train[1] += 1
@@ -593,6 +605,35 @@ class Agent:
                 self._knowledge.training_attempt(pool, False)
                 self._knowledge.model_attempt(pool, model, False)
                 self._climb_ladder(pool, model)
+
+    def _save_case_lesson(self, *, accepted: str = "") -> None:
+        """Разбор ошибки в базу знаний — один на задание: что было в задании (как его увидела
+        модель), какие ответы платформа отклонила, её подсказка и верный ответ. Такой разбор
+        модель применяет к похожим заданиям, а не ко всем подряд (как голое «ответ X — неверно»).
+        Ответ, выбранный человеком в окне браузера, — тоже урок (в экзамене платформа молчит)."""
+        pool, mem = self._pool, self._memory
+        if pool is None or mem.lesson_saved or not (mem.wrong_answers or mem.human_answer):
+            return
+        mem.lesson_saved = True
+        case = re.sub(r"\s+", " ", mem.case or mem.observation).strip().rstrip(".")
+        parts = [f"Задание: {case[:320]}." if case else f"Задание «{pool.title[:70]}»."]
+        if mem.wrong_answers:
+            parts.append("Неверно: " + "; ".join(mem.wrong_answers) + ".")
+        if mem.hints:
+            parts.append("Подсказка платформы: " + " ".join(mem.hints)[:700])
+        if mem.human_answer and accepted == mem.human_answer:
+            parts.append(f"Человек (он слушал/смотрел сам) поправил ответ на {mem.human_answer} — это верный ответ.")
+        elif mem.human_answer:
+            parts.append(f"Человек выбирал ответ {mem.human_answer}, отправлен {accepted or 'другой'} — "
+                         "верен ли он, не известно.")
+        elif accepted and len(mem.wrong_answers) < 2:
+            parts.append(f"Верный ответ: {accepted}.")
+        elif accepted:
+            parts.append(f"Третий ответ {accepted} принят, но после двух ошибок платформа пропускает "
+                         "дальше с любым ответом — верен ли он, не известно.")
+        else:
+            parts.append("Верный ответ не известен.")
+        self._knowledge.add_lesson(pool, " ".join(parts))
 
     # ------------------------------------------------------------------
     # Лестница моделей: самая дешёвая модель, которая справляется с этим видом заданий
@@ -628,7 +669,9 @@ class Agent:
     def _climb_ladder(self, pool: PoolKnowledge, model: str, *, reason: str = "") -> None:
         """Перейти к следующей модели лестницы, если текущая часто ошибается в тренировке
         (или не сдала экзамен). Выше справляющихся нет — остаться на самой точной из опробованных
-        (сильная модель не всегда точнее дешёвой). Закреплённую человеком модель агент не меняет."""
+        (сильная модель не всегда точнее дешёвой), но сравнивать не раньше, чем текущая решит
+        LADDER_MIN_TASKS заданий: по одному-трём заданиям точность не видна. Закреплённую
+        человеком модель агент не меняет."""
         ladder = self._ladder
         if pool.pinned_model or model not in ladder:
             return
@@ -645,6 +688,8 @@ class Agent:
             return
         if reason:                      # экзамен не сдан, а сильнее модели нет — выбирать не из чего
             return
+        if pool.model_stats.get(model, [0, 0])[1] < LADDER_MIN_TASKS:
+            return                      # у этой модели ещё мало заданий, чтобы сравнивать
 
         def score(name: str) -> float:  # доля верных с первого раза, сглаженная на малом числе заданий
             ok, total = pool.model_stats.get(name, [0, 0])
@@ -659,23 +704,28 @@ class Agent:
         logger.warning("📉 Вид «%s»: модель %s точнее не стала (с первого раза верно %d из %d, у %s — %d из %d) — "
                        "дальше этот вид решает %s", pool.title, model, ok, total, best, bok, btotal, best)
 
-    def _training_accuracy(self) -> Optional[tuple[int, int]]:
-        """Точность тренировки для решения об экзамене. С лестницей моделей — точность той
-        модели, которой агент будет решать экзамен; иначе — этого заказа или вида заданий.
-        None — экзамен можно начинать: заданий мало, и ошибок среди них не больше, чем
-        допускает порог (даже с верными ответами в недостающих до EXAM_MIN_TASKS заданиях)."""
+    def _exam_estimate(self) -> Optional[tuple[float, str]]:
+        """Ожидаемая точность на экзамене и откуда она (для лога). По тренировке этого заказа
+        (если в нём меньше EXAM_MIN_TASKS заданий — по всем тренировкам этого вида). С лестницей
+        моделей — точность той модели, которая будет решать экзамен, но пока у неё мало заданий,
+        оценка тянется к точности всей тренировки (одна ошибка из трёх ещё не значит 66%).
+        None — заданий мало, и ошибок среди них не больше, чем допускает порог: можно начинать."""
         pool = self._pool
+        ok, total = self._order_train
+        if total < EXAM_MIN_TASKS and pool is not None and pool.train_total >= EXAM_MIN_TASKS:
+            ok, total = pool.train_first_ok, pool.train_total
+        if not total or (total < EXAM_MIN_TASKS
+                         and ok + EXAM_MIN_TASKS - total >= EXAM_MIN_ACCURACY * EXAM_MIN_TASKS):
+            return None
+        overall = ok / total
+        source = f"в тренировке с первого раза верно {ok} из {total}"
         if pool is not None and len(self._ladder) > 1:
-            ok, total = pool.model_stats.get(self._model_for(pool), [0, 0])
-        else:
-            ok, total = self._order_train
-            if total < EXAM_MIN_TASKS and pool is not None and pool.train_total >= EXAM_MIN_TASKS:
-                ok, total = pool.train_first_ok, pool.train_total
-        if total >= EXAM_MIN_TASKS:
-            return ok, total
-        if total and ok + EXAM_MIN_TASKS - total < EXAM_MIN_ACCURACY * EXAM_MIN_TASKS:
-            return ok, total
-        return None
+            model = self._model_for(pool)
+            mok, mtotal = pool.model_stats.get(model, [0, 0])
+            if mtotal and (mok, mtotal) != (ok, total):
+                estimate = (mok + _EXAM_PRIOR * overall) / (mtotal + _EXAM_PRIOR)
+                return estimate, f"{source}; у модели {model}, которая будет решать экзамен, — {mok} из {mtotal}"
+        return overall, source
 
     async def _exam_gate(self, state: PageState) -> bool:
         """Экзамен после тренировки с низкой точностью не начинать (окно «Экзамен … Начать»)
@@ -689,19 +739,18 @@ class Agent:
                       and any(_label_matches(b.text, START_BUTTON_TEXTS) for b in dialog_buttons))
         if not exam_start and self._page_mode(state) != "exam":
             return False
-        accuracy = self._training_accuracy()
-        if accuracy is None or accuracy[0] >= EXAM_MIN_ACCURACY * accuracy[1]:
+        estimate = self._exam_estimate()
+        if estimate is None or estimate[0] + 1e-9 >= EXAM_MIN_ACCURACY:
             return False
         key = self._pool.key if self._pool is not None else ""
         if key not in self._exam_block_logged:
             self._exam_block_logged.add(key)
-            ok, total = accuracy
+            accuracy, source = estimate
             logger.warning(
-                "⛔ ЭКЗАМЕН НЕ НАЧИНАЮ: в тренировке с первого раза верно %d из %d (%d%%), а нужно не меньше "
-                "%d%%. С такой точностью экзамен, скорее всего, не будет сдан — денег за него не будет, а "
-                "токены уйдут. Пройдите экзамен сами (агент не мешает и ждёт) или, чтобы агент решал его, "
-                "поставьте в .env EXAM_MIN_ACCURACY=0",
-                ok, total, ok * 100 // total, round(EXAM_MIN_ACCURACY * 100))
+                "⛔ ЭКЗАМЕН НЕ НАЧИНАЮ: %s — ожидаемая точность ≈ %d%%, а нужно не меньше %d%%. С такой "
+                "точностью экзамен, скорее всего, не будет сдан — денег за него не будет, а токены уйдут. "
+                "Пройдите экзамен сами (агент не мешает и ждёт) или, чтобы агент решал его, поставьте в .env "
+                "EXAM_MIN_ACCURACY=0", source, int(accuracy * 100), round(EXAM_MIN_ACCURACY * 100))
         await asyncio.sleep(FRAME_LOAD_WAIT)
         return True
 
@@ -794,13 +843,16 @@ class Agent:
                 "СМЕНА ЗАДАНИЯ: %s → %s «%s»",
                 self._task_identifier[:8] or "—", state.task_identifier[:8], state.task_preview[:60],
             )
+            self._save_case_lesson()          # задание сменилось без принятого ответа
             self._memory.reset(state.task_identifier)
             self._media.forget_task()
             self._stop_catching_documents()
             self._frame_shot = None
             pool = self._knowledge.for_state(state)
             if pool is not None and pool is not self._pool:
-                known = "есть инструкция" if pool.has_instruction else "инструкции пока нет"
+                known = ("инструкцию перечитаю: прежде схемы и таблицы из PDF записывались одной строкой"
+                         if pool.instruction_outdated else
+                         "есть инструкция" if pool.has_instruction else "инструкции пока нет")
                 logger.info("Вид задания: «%s» (%s, уроков: %d)", pool.title, known, len(pool.lessons))
             self._pool = pool
         self._identity = identity
@@ -851,6 +903,8 @@ class Agent:
             image_b64 = await self._frame_screenshot(frame, state)
 
         transcripts = await self._media.transcripts(state) if state.audios else []
+        # сама запись — модели, которая умеет слушать (коннектор отдаст её только такой модели)
+        audio = self._media.audio_clips(state) if AUDIO_TO_MODEL and state.audios else []
         # полностью — только последняя открытая страница; факты с прежних модель переносит в plan
         research = [
             r.render(i + 1, full=i == len(mem.web_results) - 1) for i, r in enumerate(mem.web_results)
@@ -872,6 +926,7 @@ class Agent:
             plan=mem.plan,
             feedback=list(mem.feedback),
             wrong_answers=list(mem.wrong_answers),
+            audio=audio,
         )
 
     async def _frame_screenshot(self, frame: Frame, state: PageState) -> Optional[str]:
@@ -1481,7 +1536,9 @@ class Agent:
             mem.add(action, target, result=f"✗ {outcome.detail}")
             mem.mark_no_effect(action, target.key)
             return "fail"
-        note = f"«{decision.type_text[:80]}»" if action == ActionType.TYPE and decision.type_text else ""
+        note = ""
+        if action == ActionType.TYPE:
+            note = f"«{decision.type_text[:80]}»" if decision.type_text else "(очистить поле)"
         if outcome.method == "js":
             note = (note + " (js-клик)").strip()
         mem.expect(action, target, state, typed=decision.type_text, note=note)
@@ -1605,8 +1662,19 @@ class Agent:
         if AUDIO_PLAY_TO_END and any(not a.ended for a in state.audios):
             fresh = await DomParser(frame).parse(quiet=True)
             await self._media.wait_finished(frame, fresh)
+            await asyncio.sleep(AUDIO_SETTLE)      # страница отмечает прослушивание не сразу
             state = await DomParser(frame).parse(quiet=True)
             target = state.by_key(target.key) if target is not None else None
+            chosen = self._describe_answer(state)
+            if chosen != rejected and chosen != "(ничего не выбрано)":
+                # пока запись доигрывала, ответ поменял человек (он тоже слушал) — его ответ главный
+                logger.warning("👤 Пока запись доигрывала, ответ в окне поменяли: %s → %s. Это сделал человек — "
+                               "отправляю его ответ", rejected, chosen)
+                mem.human_answer = chosen
+                mem.case = mem.case or mem.observation
+                mem.batch_notes.append(
+                    f"Человек в окне браузера сам выбрал ответ {chosen} вместо {rejected} — он слушал запись. "
+                    "Ответ человека верный: не меняй его, только отправь задание (submit).")
 
         answer = self._describe_answer(state)
         mode = self._page_mode(state)
@@ -1651,15 +1719,13 @@ class Agent:
         if any(_WRONG_RE.search(t) for t in errors):
             self._wrong_total += 1
             mem.wrong_answers.append(answer)
-            self._record_training(mode, accepted=False, answer=answer)
             mem.feedback = errors + [f"Подсказка платформы: {h}" for h in hints]
             logger.warning("❌ Платформа: неверный ответ (%s)%s", answer,
-                           f"; подсказка: {hints[0][:160]}" if hints else "")
-            if self._pool is not None:
-                lesson = f"Задание «{state.task_preview[:70]}»: ответ {answer} — неверно."
-                if hints:
-                    lesson += " Подсказка платформы: " + " ".join(hints)[:600]
-                self._knowledge.add_lesson(self._pool, lesson)
+                           f"; подсказка: {hints[0][:300]}" if hints else "")
+            # разбор ошибки уйдёт в базу знаний, когда станет известен итог задания
+            mem.case = mem.case or mem.observation or f"задание «{state.task_preview[:70]}»"
+            mem.hints += [h for h in hints if h not in mem.hints]
+            self._record_training(mode, accepted=False, answer=answer)
             mem.add(ActionType.SUBMIT, button, result="✗ платформа: НЕВЕРНЫЙ ОТВЕТ — прочитай подсказку и исправь ответ")
             return
 

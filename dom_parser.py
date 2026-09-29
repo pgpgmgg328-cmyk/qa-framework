@@ -1547,6 +1547,9 @@ def _content_headings(headings: list[str]) -> list[str]:
 
 # Проверка качества по фото: мелкие детали (пыль, скотч, пятна) решают ответ
 _INSPECTION_RE = re.compile(r"(качеств|чистот|грязн|загрязн|клининг|уборк|дефект|поврежден)", re.IGNORECASE)
+# полнота съёмки: все ли поверхности сняты, не обрезаны ли фото, верный ли ракурс — на коллаже в ~390 px
+# на фото этого не разглядеть
+_COVERAGE_RE = re.compile(r"(поверхност|ракурс|обрезан|наличи[еяю] (всех )?фото)", re.IGNORECASE)
 
 
 def inspection_task(state: PageState) -> bool:
@@ -1554,6 +1557,13 @@ def inspection_task(state: PageState) -> bool:
     if not state.images:
         return False
     return bool(_INSPECTION_RE.search(f"{state.pool_title}\n{_plain_text(state.reader)[:3000]}"))
+
+
+def coverage_task(state: PageState) -> bool:
+    """Задание — проверка полноты фото (все ли поверхности сняты целиком и с нужного ракурса)."""
+    if not state.images or inspection_task(state):
+        return False
+    return bool(_COVERAGE_RE.search(f"{state.pool_title}\n{_plain_text(state.reader)[:3000]}"))
 
 
 def _plain_text(lines: list[str]) -> str:

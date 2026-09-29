@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from config import KNOWLEDGE_DIR, KNOWLEDGE_PROMPT_CHARS
+from config import KNOWLEDGE_DIR, KNOWLEDGE_LESSON_CHARS, KNOWLEDGE_PROMPT_CHARS
 from models import PageState, normalize_text
 
 logger = logging.getLogger("twork.knowledge")
@@ -45,6 +45,12 @@ _HEADER_HELP = (
     "закрепляет модель для этого вида заданий."
 )
 _PIN_RE = re.compile(r"(?im)^\s*модель агента\s*:\s*([a-z0-9][a-z0-9_.:/@+-]*)[^\n]*\n?")
+# урок прежних версий без самого задания и без подсказки: «ответ X — неверно» модель применяла ко
+# всем заданиям подряд — такие в запрос не идут
+_BARE_LESSON_RE = re.compile(r"^Задание «[^»]*»: ответ .+ — неверно\.$")
+# как агент читал инструкцию: вкладки с инструкцией, прочитанные до v4.8, — это PDF, у которого
+# схемы и таблицы остались «одной строкой»; такие агент перечитает один раз
+READ_MARK = "чтение v2"
 
 
 @dataclass
@@ -72,7 +78,13 @@ class PoolKnowledge:
 
     @property
     def has_instruction(self) -> bool:
-        return len(self.instruction.strip()) >= 80
+        return len(self.instruction.strip()) >= 80 and not self.instruction_outdated
+
+    @property
+    def instruction_outdated(self) -> bool:
+        """Инструкция из вкладки, прочитанная прежним способом (PDF: схемы — одной строкой)."""
+        meta = self.instruction_meta
+        return "источник: вкладка" in meta and READ_MARK not in meta
 
     @property
     def pinned_model(self) -> str:
@@ -156,13 +168,20 @@ class KnowledgeBase:
         text = _clean_block(text)
         if len(text) < 80:
             return
-        if normalize_text(text) in normalize_text(pool.instruction):
+        meta = f"Прочитано: {datetime.now():%Y-%m-%d %H:%M}, источник: {source}, {READ_MARK}"
+        if pool.instruction_outdated:
+            append = False                      # перечитанная инструкция заменяет прежнюю
+        elif normalize_text(text) in normalize_text(pool.instruction):
             return
         if append and pool.instruction:
             text = f"{pool.instruction}\n\n{text}"
+        before = len(pool.instruction) if pool.instruction_outdated else 0
         pool.instruction = text
-        pool.instruction_meta = f"Прочитано: {datetime.now():%Y-%m-%d %H:%M}, источник: {source}"
-        logger.info("📘 Инструкция «%s» сохранена (%d симв.)", pool.title, len(text))
+        pool.instruction_meta = meta
+        if before:
+            logger.info("📘 Инструкция «%s» перечитана: было %d симв., стало %d", pool.title, before, len(text))
+        else:
+            logger.info("📘 Инструкция «%s» сохранена (%d симв.)", pool.title, len(text))
         self._write(pool)
 
     def save_tooltips(self, pool: PoolKnowledge, tips: dict[str, str]) -> None:
@@ -208,7 +227,7 @@ class KnowledgeBase:
             return
         pool.lessons.append(lesson)
         pool.lessons = pool.lessons[-_MAX_LESSONS:]
-        logger.info("📘 Урок для «%s»: %s", pool.title, lesson[:160])
+        logger.info("📘 Разбор ошибки для «%s»: %s", pool.title, lesson[:300])
         self._write(pool)
 
     # ------------------------------------------------------------------
@@ -216,33 +235,51 @@ class KnowledgeBase:
     # ------------------------------------------------------------------
 
     def prompt_text(self, pool: Optional[PoolKnowledge], limit: int = KNOWLEDGE_PROMPT_CHARS) -> str:
+        """Знания для запроса. Инструкция — сразу после правил пользователя и целиком (длинные
+        разборы ошибок её не вытесняют, а начало запроса меньше меняется и берётся из кэша);
+        разборы ошибок — самые свежие, сколько войдёт."""
         self._load()
-        parts: list[str] = []
+        head: list[str] = []
         if self._general:
-            parts.append("Общие правила (knowledge/_general.md):\n" + self._general)
-        if pool is not None:
-            notes = _PIN_RE.sub("", pool.notes).strip()          # выбор модели — не для модели
-            if notes:
-                parts.append("Заметки пользователя для этого вида заданий:\n" + notes)
-            if pool.lessons:
-                parts.append("Уроки из прошлых ошибок (платформа сообщила правильный ответ/подсказку):\n"
-                             + "\n".join(f"- {x}" for x in pool.lessons[-20:]))
-            if pool.tooltips:
-                parts.append("Пояснения к вариантам ответа (подсказки «?» на странице):\n"
-                             + "\n".join(f"- «{k}»: {v}" for k, v in pool.tooltips.items()))
-            if pool.train_answers:
-                top = sorted(pool.train_answers.items(), key=lambda kv: -kv[1])[:6]
-                parts.append(
-                    "Какие ответы в тренировке этого вида оказались правильными (для калибровки, а не вместо "
-                    "проверки): " + "; ".join(f"{a} — {n}" for a, n in top)
-                    + (f". Твоя точность в тренировке: {pool.training_line()} — проверяй внимательнее."
-                       if pool.train_total and pool.train_first_ok < pool.train_total else "."))
-            if pool.instruction:
-                parts.append("Инструкция к заданиям этого вида:\n" + pool.instruction)
-        text = "\n\n".join(parts)
-        if len(text) > limit:
-            text = text[:limit] + "\n[… инструкция сокращена: полный текст в папке knowledge …]"
-        return text
+            head.append("Общие правила (knowledge/_general.md):\n" + self._general)
+        if pool is None:
+            return _cut("\n\n".join(head), limit)
+        notes = _PIN_RE.sub("", pool.notes).strip()          # выбор модели — не для модели
+        if notes:
+            head.append("Заметки пользователя для этого вида заданий:\n" + notes)
+        tail: list[str] = []
+        if pool.tooltips:
+            tail.append("Пояснения к вариантам ответа (подсказки «?» на странице):\n"
+                        + "\n".join(f"- «{k}»: {v}" for k, v in pool.tooltips.items()))
+        if pool.train_answers:
+            top = sorted(pool.train_answers.items(), key=lambda kv: -kv[1])[:6]
+            tail.append(
+                "Какие ответы в тренировке этого вида оказались правильными (для калибровки, а не вместо "
+                "проверки): " + "; ".join(f"{a} — {n}" for a, n in top)
+                + (f". Твоя точность в тренировке: {pool.training_line()} — проверяй внимательнее."
+                   if pool.train_total and pool.train_first_ok < pool.train_total else "."))
+        lessons = [x for x in pool.lessons if not _BARE_LESSON_RE.match(x)]
+        fixed = sum(len(x) + 2 for x in head + tail)
+        room = max(limit - fixed, 0)
+        lesson_room = min(sum(len(x) + 3 for x in lessons), KNOWLEDGE_LESSON_CHARS) if lessons else 0
+        parts = list(head)
+        if pool.instruction:
+            header = "Инструкция к заданиям этого вида:\n"
+            parts.append(header + _cut(pool.instruction, max(room - lesson_room - len(header) - 2, 400)))
+        parts += tail
+        left = limit - sum(len(x) + 2 for x in parts)
+        if lessons and left > 200:
+            chosen: list[str] = []
+            for lesson in reversed(lessons):                 # свежие важнее
+                if len(lesson) + 3 > left - 160:
+                    break
+                chosen.insert(0, lesson)
+                left -= len(lesson) + 3
+            if chosen:
+                parts.append("Разборы ошибок из тренировки — конкретные задания этого вида. Применяй разбор, "
+                             "только если в новом задании те же признаки; на другие задания его не переноси:\n"
+                             + "\n".join(f"- {x}" for x in chosen))
+        return _cut("\n\n".join(parts), limit)
 
     # ------------------------------------------------------------------
     # Файлы
@@ -265,6 +302,12 @@ def _slug(title: str) -> str:
     s = re.sub(r"[^\w\s-]", "", title, flags=re.UNICODE).strip()
     s = re.sub(r"\s+", "_", s)
     return (s or "task")[:60]
+
+
+def _cut(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n[… сокращено: полный текст — в папке knowledge …]"
 
 
 def _clean_block(text: str) -> str:

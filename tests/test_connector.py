@@ -560,6 +560,7 @@ def test_gemini_listens_to_the_recording(monkeypatch):
     assert audio == {"type": "input_audio", "input_audio": {"data": "SUQzZmFrZS1tcDM=", "format": "mp3"}}
     ask = requests[0]["messages"][0]["content"][0]["text"]      # кто отвечал — человек или автоответчик
     assert "«Абонент (автоответчик)»" in ask and "голосовой помощник" in ask and "ВЫВОД СЛУШАТЕЛЯ" in ask
+    assert "«что вы хотите?»" in ask and "какого банка" in ask               # шаблонные вопросы помощника
     assert requests[0]["model"] == "google/gemini-3.1-flash-lite" and requests[0]["usage"] == {"include": True}
 
     responses = [bad_request("This model does not support audio input"), (200, {"text": "Алло."})]
@@ -568,6 +569,69 @@ def test_gemini_listens_to_the_recording(monkeypatch):
         assert run(connector.transcribe(b"ID3fake-mp3", "audio.mp3", "audio/mpeg")) == "Алло."
     assert "google/gemini-3.1-flash-lite" in connector._dead_transcribers
     assert [r["_path"] for r in requests] == ["/v1/chat/completions", "/v1/audio/transcriptions"]
+
+
+def test_listening_model_hears_the_call_when_deciding(monkeypatch):
+    """Автоответчик слышно по голосу: модель, которая решает задание и умеет слушать (Gemini),
+    получает и саму запись; модель без слуха (gpt) — только расшифровку. Не приняла запись
+    (ошибка 400) — повтор без неё, и дальше этой модели записи не отправляются."""
+    from models import AudioClip
+
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    call = PageState(task_text="Прослушайте звонок", elements=state().elements)
+    ctx = DecisionContext(transcripts=["[АУДИО 1] расшифровка:\n[0:01] Абонент (человек): Что вы хотите?"],
+                          audio=[AudioClip(n=1, data=b"ID3call", fmt="mpeg")],
+                          model="google/gemini-3.1-flash-lite")
+    with fake_openai([completion(json.dumps(VALID))] * 2) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        run(connector.decide(call, ctx))
+        run(connector.decide(call, DecisionContext(**{**ctx.__dict__, "model": "openai/gpt-5.4-mini"})))
+    heard, deaf = requests[0]["messages"][1]["content"], requests[1]["messages"][1]["content"]
+    assert [p["type"] for p in heard] == ["text", "text", "input_audio", "text"]
+    assert heard[2] == {"type": "input_audio", "input_audio": {"data": "SUQzY2FsbA==", "format": "mp3"}}
+    assert "послушай их сама" in heard[0]["text"] and "Что вы хотите?" in heard[0]["text"]
+    assert isinstance(deaf, str) and "послушай" not in deaf and "Что вы хотите?" in deaf
+    assert "по-русски" in heard[-1]["text"]
+
+    responses = [bad_request("Audio input is not supported for this model"), completion(json.dumps(VALID)),
+                 completion(json.dumps(VALID))]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        decision = run(connector.decide(call, ctx))
+        run(connector.decide(call, ctx))
+    assert decision.action == ActionType.OPEN
+    assert isinstance(requests[1]["messages"][1]["content"], str)            # повтор — без записи
+    assert "послушай" not in requests[1]["messages"][1]["content"]
+    assert isinstance(requests[2]["messages"][1]["content"], str)            # и дальше — без неё
+    assert not connector.hears_audio("google/gemini-3.1-flash-lite")
+
+    # ошибка 400 без объяснения: сначала повтор с простым JSON, затем — без записи
+    responses = [bad_request("Provider returned error"), bad_request("Provider returned error"),
+                 completion(json.dumps(VALID))]
+    with fake_openai(responses) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        assert run(connector.decide(call, ctx)).action == ActionType.OPEN
+    assert [isinstance(r["messages"][1]["content"], str) for r in requests] == [False, False, True]
+    assert not connector.hears_audio("google/gemini-3.1-flash-lite")
+
+
+def test_audio_capable_models_come_from_the_model_list(monkeypatch):
+    use_model(monkeypatch, "google/gemini-3.1-flash-lite")
+    listed = [{"id": "google/gemini-3.1-flash-lite", "pricing": {"prompt": "0.00000025", "completion": "0.0000015"},
+               "architecture": {"input_modalities": ["text", "image", "file", "audio"]}},
+              {"id": "openai/gpt-5.4-mini", "pricing": {"prompt": "0.00000075", "completion": "0.0000045"},
+               "architecture": {"input_modalities": ["text", "image", "file"]}}]
+    with fake_openai([], models=listed) as (url, _):
+        connector = make_connector(monkeypatch, url)
+        run(connector._load_live_prices())
+    try:
+        assert connector.hears_audio("google/gemini-3.1-flash-lite")
+        assert not connector.hears_audio("openai/gpt-5.4-mini")
+        assert not connector.hears_audio("google/gemini-9-unknown")          # нет в списке — не слышит
+    finally:
+        oc.AUDIO_MODELS.clear()
+        oc._MODALITIES_KNOWN[0] = False
+    assert oc.hears_audio("google/gemini-9-unknown") and not oc.hears_audio("google/gemini-3.8-flash-tts")
 
 
 def test_transcription_during_block_is_postponed_not_failed(monkeypatch):
@@ -601,6 +665,8 @@ def test_pdf_instruction_is_rewritten_by_the_model(monkeypatch):
     assert part == {"type": "file", "file": {"filename": "instruction.pdf",
                                              "file_data": "data:application/pdf;base64,JVBERi0xLjQgZmFrZQ=="}}
     assert requests[0]["model"] == "google/gemini-3.1-flash-lite" and abs(connector.usage.cost - 0.0003) < 1e-12
+    ask = requests[0]["messages"][0]["content"][0]["text"]     # схемы и деревья решений — текстом целиком
+    assert "деревья решений" in ask and "ПОЛНОСТЬЮ" in ask and requests[0]["max_tokens"] >= 16000
 
 
 def test_provider_errors_are_waited_out(monkeypatch, caplog):

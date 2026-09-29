@@ -43,6 +43,13 @@ def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
 
 
+def _env_default(name: str, default: str, old_defaults: tuple[str, ...] = ()) -> str:
+    """Значение из .env. Значение, которое стояло в прежнем .env.example (его копируют целиком),
+    считается неизменённым умолчанием — берётся новое значение по умолчанию."""
+    raw = (os.getenv(name) or "").strip()
+    return default if not raw or raw in old_defaults else raw
+
+
 def _env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -132,9 +139,10 @@ LLM_MODELS: tuple[str, ...] = parse_models(os.getenv("LLM_MODEL", "")) or parse_
 LLM_MODEL: str = LLM_MODELS[0]
 # Лестница: переход к следующей модели, когда в тренировке у текущей верно с первого раза меньше
 # этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели или раньше, если
-# порог уже недостижим)
+# порог уже недостижим). Модель, к которой перешли, решает не меньше LADDER_MIN_TASKS заданий,
+# прежде чем агент сравнит её с прежней: по 1–3 заданиям точность не видна
 LADDER_MIN_ACCURACY: float = float(os.getenv("LADDER_MIN_ACCURACY", "0.8"))
-LADDER_MIN_TASKS: int = int(os.getenv("LADDER_MIN_TASKS", "3"))
+LADDER_MIN_TASKS: int = int(_env_default("LADDER_MIN_TASKS", "5", ("3",)))   # «3» — из образца до v4.8
 # «Обдумывание» перед ответом (reasoning у OpenRouter): auto — выключено (none → minimal → low,
 # что примет модель): быстрее и дешевле; low / medium — точнее, но оплачивается как ответ
 LLM_REASONING_EFFORT: str = os.getenv("LLM_REASONING_EFFORT", "auto").strip().lower()
@@ -190,6 +198,11 @@ if TRANSCRIBE_MODELS in ((), ("openai/gpt-4o-transcribe", "openai/whisper-1")):
     # пусто или значение из прежнего .env.example — как по умолчанию: сначала запись слушает Gemini
     TRANSCRIBE_MODELS = parse_models(DEFAULT_TRANSCRIBE)
 TRANSCRIBE_LANGUAGE: str = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
+# Модель, которая решает задание и умеет слушать (Gemini), получает и саму запись звонка, а не
+# только расшифровку: человек или автоответчик — слышно по голосу. До AUDIO_TO_MODEL_MB мегабайт
+# на запись; минута звонка — около 2 тыс. токенов (≈ $0.001 у Gemini 3.1 Flash-Lite)
+AUDIO_TO_MODEL: bool = _env_bool("AUDIO_TO_MODEL", True)
+AUDIO_TO_MODEL_MB: float = float(os.getenv("AUDIO_TO_MODEL_MB", "8"))
 # «Прослушайте звонок до конца»: перед отправкой ответа запись доигрывается до конца
 AUDIO_PLAY_TO_END: bool = _env_bool("AUDIO_PLAY_TO_END", True)
 AUDIO_MAX_WAIT: float = float(os.getenv("AUDIO_MAX_WAIT", "600"))   # макс. ожидание конца записи, с
@@ -311,8 +324,9 @@ STOP_ON_ORDERS_LIST: bool = _env_bool("STOP_ON_ORDERS_LIST", True)
 CLOSE_BROWSER_WHEN_DONE: bool = _env_bool("CLOSE_BROWSER_WHEN_DONE", False)
 # Экзамен после тренировки агент начинает, только если в тренировке с первого раза верно не меньше
 # этой доли ответов (иначе экзамен, скорее всего, не будет сдан — денег за него не будет, а токены
-# уйдут). Решение принимается, когда в тренировке не меньше EXAM_MIN_TASKS заданий. 0 — не проверять
-EXAM_MIN_ACCURACY: float = float(os.getenv("EXAM_MIN_ACCURACY", "0.8"))
+# уйдут). Решение принимается, когда в тренировке не меньше EXAM_MIN_TASKS заданий. 0 — не проверять.
+# 0.7: к концу тренировки агент накапливает разборы ошибок и отвечает точнее, чем в её начале
+EXAM_MIN_ACCURACY: float = float(_env_default("EXAM_MIN_ACCURACY", "0.7", ("0.8",)))   # «0.8» — из образца до v4.8
 EXAM_MIN_TASKS: int = int(os.getenv("EXAM_MIN_TASKS", "3"))
 # Признаки: в URL фрейма нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
 TASK_URL_KEYWORDS: tuple[str, ...] = _env_list("TASK_URL_KEYWORDS", ("/task",))
@@ -325,7 +339,10 @@ KNOWLEDGE_DIR: str = _project_path(os.getenv("KNOWLEDGE_DIR", "knowledge"))
 READ_INSTRUCTIONS: bool = _env_bool("READ_INSTRUCTIONS", True)   # открыть «Подробную инструкцию» один раз
 INSTRUCTION_WAIT: float = float(os.getenv("INSTRUCTION_WAIT", "25"))  # ждать загрузку инструкции, с
 READ_TOOLTIPS: bool = _env_bool("READ_TOOLTIPS", True)           # прочитать подсказки «?» у вариантов
-KNOWLEDGE_PROMPT_CHARS: int = int(os.getenv("KNOWLEDGE_PROMPT_CHARS", "9000"))
+# Знания о виде заданий в каждом запросе, символов: инструкция — целиком (её не вытесняют уроки),
+# на разборы ошибок из тренировки остаётся не меньше KNOWLEDGE_LESSON_CHARS
+KNOWLEDGE_PROMPT_CHARS: int = int(os.getenv("KNOWLEDGE_PROMPT_CHARS", "14000"))
+KNOWLEDGE_LESSON_CHARS: int = int(os.getenv("KNOWLEDGE_LESSON_CHARS", "3500"))
 
 # ---------------------------------------------------------------------------
 # Поиск в интернете (отдельная вкладка того же окна)
