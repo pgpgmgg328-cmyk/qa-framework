@@ -327,7 +327,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.6 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.7 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -627,22 +627,37 @@ class Agent:
 
     def _climb_ladder(self, pool: PoolKnowledge, model: str, *, reason: str = "") -> None:
         """Перейти к следующей модели лестницы, если текущая часто ошибается в тренировке
-        (или не сдала экзамен). Закреплённую человеком модель агент не меняет."""
+        (или не сдала экзамен). Выше справляющихся нет — остаться на самой точной из опробованных
+        (сильная модель не всегда точнее дешёвой). Закреплённую человеком модель агент не меняет."""
         ladder = self._ladder
         if pool.pinned_model or model not in ladder:
             return
-        position = ladder.index(model)
-        if position + 1 >= len(ladder):
+        if not reason and not self._ruled_out(pool, model):
             return
-        if not reason:
-            if not self._ruled_out(pool, model):
-                return
-            ok, total = pool.model_stats[model]
-            reason = f"в тренировке с первого раза верно {ok} из {total}"
-        following = ladder[position + 1]
-        self._knowledge.set_model(pool, following)
-        logger.warning("📈 Вид «%s»: модель %s не справляется (%s) — дальше этот вид решает %s",
-                       pool.title, model, reason, following)
+        above = [m for m in ladder[ladder.index(model) + 1:] if not self._ruled_out(pool, m)]
+        if above:
+            if not reason:
+                ok, total = pool.model_stats[model]
+                reason = f"в тренировке с первого раза верно {ok} из {total}"
+            self._knowledge.set_model(pool, above[0])
+            logger.warning("📈 Вид «%s»: модель %s не справляется (%s) — дальше этот вид решает %s",
+                           pool.title, model, reason, above[0])
+            return
+        if reason:                      # экзамен не сдан, а сильнее модели нет — выбирать не из чего
+            return
+
+        def score(name: str) -> float:  # доля верных с первого раза, сглаженная на малом числе заданий
+            ok, total = pool.model_stats.get(name, [0, 0])
+            return (ok + 1) / (total + 2)
+
+        tried = [m for m in ladder if pool.model_stats.get(m, [0, 0])[1] > 0]
+        best = max(tried, key=lambda m: (score(m), -ladder.index(m)))
+        if best == model or score(best) <= score(model):
+            return
+        (ok, total), (bok, btotal) = pool.model_stats[model], pool.model_stats[best]
+        self._knowledge.set_model(pool, best)
+        logger.warning("📉 Вид «%s»: модель %s точнее не стала (с первого раза верно %d из %d, у %s — %d из %d) — "
+                       "дальше этот вид решает %s", pool.title, model, ok, total, best, bok, btotal, best)
 
     def _training_accuracy(self) -> Optional[tuple[int, int]]:
         """Точность тренировки для решения об экзамене. С лестницей моделей — точность той
@@ -1576,6 +1591,16 @@ class Agent:
         для этого вида заданий, модель исправляет ответ на следующем шаге.
         """
         mem = self._memory
+        rejected = self._describe_answer(state)
+        if rejected in mem.wrong_answers:
+            # платформа этот ответ уже признала неверным — отправлять его снова бессмысленно
+            logger.warning("Не отправляю: ответ %s платформа уже признала неверным — модель выберет другой", rejected)
+            mem.add(ActionType.SUBMIT, None,
+                    result=f"⛔ не отправлено: ответ {rejected} уже признан неверным — выбери другой вариант")
+            mem.batch_notes.append(f"Ответ {rejected} платформа уже признала неверным. Не отправляй его снова — "
+                                   "выбери другой вариант.")
+            mem.submit_failures += 1
+            return
         # «Прослушайте звонок до конца»: запись доигрывается ДО нажатия
         if AUDIO_PLAY_TO_END and any(not a.ended for a in state.audios):
             fresh = await DomParser(frame).parse(quiet=True)

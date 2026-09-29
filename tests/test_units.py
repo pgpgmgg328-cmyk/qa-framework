@@ -489,6 +489,44 @@ def test_exam_gate_and_ladder_decide_early_on_few_training_tasks(tmp_path, monke
     assert agent._model_for(pool) == "other-cheap"                  # лестницу в .env поменяли
 
 
+def test_ladder_returns_to_the_more_accurate_cheaper_model(tmp_path, monkeypatch):
+    """Лог пользователя: Gemini ошиблась 1 раз из 4, вид перешёл к gpt-5.4-mini, а та ошибалась
+    чаще. Выше идти некуда — агент возвращает модель, которая была точнее (и дешевле), и дальше
+    между ними не прыгает."""
+    import agent as agent_module
+    from knowledge import KnowledgeBase
+
+    kb = KnowledgeBase(str(tmp_path))
+    agent = Agent(llm=_NoLLM(), knowledge=kb)
+    pool = kb.for_state(PageState(pool_key="k2", pool_title="Звонок", pool_signature=["h:звонок"]))
+    monkeypatch.setattr(agent_module, "LLM_MODELS", ("gemini", "gpt"))
+    for ok in (True, True, True, False):
+        kb.model_attempt(pool, "gemini", ok)
+        agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gpt"
+    kb.model_attempt(pool, "gpt", False)
+    agent._climb_ladder(pool, "gpt")
+    assert agent._model_for(pool) == "gemini"                         # 3 из 4 точнее, чем 0 из 1
+    kb.model_attempt(pool, "gemini", False)
+    agent._climb_ladder(pool, "gemini")
+    assert agent._model_for(pool) == "gemini"                         # не прыгает обратно к gpt
+    assert "- текущая модель: gemini" in pool.path.read_text(encoding="utf-8")
+
+
+def test_catcher_offers_the_largest_pdf_first():
+    """Крошечный PDF (1 КБ — заглушка) модель на T-Work не прочитала; настоящая инструкция — большая."""
+    from documents import CaughtDocument, DocumentCatcher
+
+    class Context:
+        def on(self, event, handler):
+            pass
+
+    catcher = DocumentCatcher(Context())
+    catcher.documents = [CaughtDocument("https://x/stub.pdf", "application/pdf", b"%PDF-1.4 stub"),
+                         CaughtDocument("https://x/big.pdf", "application/pdf", b"%PDF-1.7 " + b"x" * 5000)]
+    assert [d.url for d in catcher.pdfs()] == ["https://x/big.pdf", "https://x/stub.pdf"]
+
+
 def test_order_summary_tells_how_long_the_key_limit_lasts():
     class KeyLLM:
         def budget_left(self):

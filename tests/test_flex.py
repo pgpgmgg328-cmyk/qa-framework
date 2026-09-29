@@ -306,6 +306,31 @@ def test_audio_task_without_transcript_waits_for_a_human(tmp_path, monkeypatch, 
     assert "ответ без неё был бы угадыванием. Нужна помощь человека" in caplog.text
 
 
+def test_rejected_answer_is_not_submitted_again(tmp_path, monkeypatch):
+    """Ответ, который платформа признала неверным, агент снова не отправляет (в логе пользователя
+    модель трижды отправила «Был человек»): модель получает заметку и выбирает другой вариант."""
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("robot"))
+
+    def policy(state: PageState, ctx: DecisionContext, llm: ScriptedLLM) -> LLMDecision:
+        human = find(state, "Результат неправильный. Был человек")
+        machine = find(state, "Результат неправильный. Был автоответчик")
+        if not ctx.wrong_answers:
+            return batch(click(human), submit(state))
+        if not any("уже признала неверным" in note for note in ctx.notes):
+            return submit(state)                           # упрямо отправляет отклонённый ответ
+        return batch(click(machine), submit(state))
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, "")
+        await agent.run()
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert agent._tasks_done == 1 and agent._wrong_total == 1        # отклонённый ответ ушёл один раз
+    assert len(llm.calls) == 3
+    assert llm.calls[1][1].wrong_answers == ["«Результат неправильный. Был человек»"]
+
+
 def test_web_research_fills_org_form(tmp_path, monkeypatch):
     monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("org"))
 

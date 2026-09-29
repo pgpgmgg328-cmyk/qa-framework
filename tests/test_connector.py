@@ -558,6 +558,8 @@ def test_gemini_listens_to_the_recording(monkeypatch):
     assert text == heard and requests[0]["_path"] == "/v1/chat/completions"
     audio = requests[0]["messages"][0]["content"][1]
     assert audio == {"type": "input_audio", "input_audio": {"data": "SUQzZmFrZS1tcDM=", "format": "mp3"}}
+    ask = requests[0]["messages"][0]["content"][0]["text"]      # кто отвечал — человек или автоответчик
+    assert "«Абонент (автоответчик)»" in ask and "голосовой помощник" in ask and "ВЫВОД СЛУШАТЕЛЯ" in ask
     assert requests[0]["model"] == "google/gemini-3.1-flash-lite" and requests[0]["usage"] == {"include": True}
 
     responses = [bad_request("This model does not support audio input"), (200, {"text": "Алло."})]

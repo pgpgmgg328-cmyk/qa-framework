@@ -82,9 +82,11 @@ class DocumentCatcher:
             pass
 
     def pdfs(self) -> list[CaughtDocument]:
+        """PDF по убыванию размера: крошечный PDF (килобайт) — обычно заглушка или превью, а не
+        инструкция — модель на нём только ошибается (так было на T-Work)."""
         seen: set[bytes] = set()
         out = []
-        for doc in self.documents:
+        for doc in sorted(self.documents, key=lambda d: -len(d.data)):
             if doc.is_pdf and doc.data[:2048] not in seen:
                 seen.add(doc.data[:2048])
                 out.append(doc)
