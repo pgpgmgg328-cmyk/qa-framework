@@ -20,6 +20,7 @@ import json
 import logging
 import os
 import re
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -74,6 +75,7 @@ class PoolKnowledge:
     model: str = ""
     model_stats: dict[str, list[int]] = field(default_factory=dict)   # модель → [верно, всего]
     instruction_attempted: bool = False     # в этом запуске уже пытались открыть инструкцию
+    instruction_unread: bool = False        # инструкцию открыли, но прочитать не удалось (PDF, ошибка)
     tooltips_attempted: bool = False
 
     @property
@@ -178,6 +180,7 @@ class KnowledgeBase:
         before = len(pool.instruction) if pool.instruction_outdated else 0
         pool.instruction = text
         pool.instruction_meta = meta
+        pool.instruction_unread = False
         if before:
             logger.info("📘 Инструкция «%s» перечитана: было %d симв., стало %d", pool.title, before, len(text))
         else:
@@ -215,6 +218,12 @@ class KnowledgeBase:
     def set_model(self, pool: PoolKnowledge, model: str) -> None:
         pool.model = model
         self._write(pool)
+
+    def ensure_file(self, pool: PoolKnowledge) -> Optional[Path]:
+        """Файл вида заданий (создать, если его ещё нет) — например, чтобы человек вписал инструкцию."""
+        if pool.path is None or not pool.path.exists():
+            self._write(pool)
+        return pool.path
 
     def exam_result(self, pool: PoolKnowledge, passed: bool) -> None:
         pool.exams.append(f"{'пройден' if passed else 'не пройден'} ({datetime.now():%Y-%m-%d %H:%M})")
@@ -296,6 +305,55 @@ class KnowledgeBase:
             os.replace(tmp, pool.path)
         except OSError as exc:
             logger.warning("Не удалось записать файл знаний: %s", exc)
+
+
+def import_previous(directory: str, project_dir: Path) -> int:
+    """Новую версию распаковали в новую папку — база знаний пуста: уроки, статистика тренировок (по
+    ней агент решает, начинать ли экзамен) и инструкции остались в папке прежней версии. Копирует
+    файлы из самой свежей базы знаний в соседних папках «twork…» (там ничего не меняется)."""
+    target = Path(directory)
+    marker = target / "_imported.txt"           # перенос был: базу потом очистили сами — не повторять
+    if marker.exists() or (target.is_dir() and any(not f.name.startswith("_") for f in target.glob("*.md"))):
+        return 0
+    here = project_dir.resolve()
+    found: list[tuple[float, Path]] = []
+    try:
+        for folder in project_dir.parent.iterdir():
+            if not folder.is_dir() or "twork" not in folder.name.lower() or folder.resolve() == here:
+                continue
+            nested = [c / "knowledge" for c in folder.iterdir() if c.is_dir() and c.resolve() != here]
+            for kdir in [folder / "knowledge", *nested]:
+                files = [f for f in kdir.glob("*.md") if not f.name.startswith("_") and _is_pool_file(f)]
+                if files and kdir.resolve() != target.resolve():
+                    found.append((max(f.stat().st_mtime for f in files), kdir))
+    except OSError as exc:
+        logger.debug("Папки прежних версий не просмотрены: %s", exc)
+        return 0
+    if not found:
+        return 0
+    source = max(found)[1]
+    copied = 0
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        for f in source.glob("*.md"):
+            if not (target / f.name).exists():
+                shutil.copy2(f, target / f.name)
+                copied += 1
+        marker.write_text(f"База знаний скопирована из {source}\n", encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Базу знаний прежней версии скопировать не удалось: %s", exc)
+    if copied:
+        logger.info("📚 База знаний пуста — скопировал %d файл(ов) из папки прежней версии %s (уроки, статистика "
+                    "тренировок, инструкции)", copied, source)
+    return copied
+
+
+def _is_pool_file(path: Path) -> bool:
+    try:
+        with path.open(encoding="utf-8") as fh:
+            return "<!-- pool:" in fh.read(4096)
+    except OSError:
+        return False
 
 
 def _slug(title: str) -> str:

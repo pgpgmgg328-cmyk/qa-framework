@@ -50,3 +50,25 @@ def test_startup_hints_for_known_errors():
     busy = Exception("BrowserType.launch_persistent_context: Failed to create a ProcessSingleton")
     assert "уже открыт" in startup_hint(busy)
     assert startup_hint(Exception("что-то совсем другое")) is None
+
+
+def test_closed_browser_errors_are_not_dumped_at_exit():
+    """Лог пользователя: после Ctrl+C — «Future exception was never retrieved … TargetClosedError»
+    с трассировкой. Браузер закрыт — это не ошибка агента; прочие ошибки по-прежнему видны."""
+    from main import _quiet_after_close
+
+    class TargetClosedError(Exception):
+        pass
+
+    class Loop:
+        def __init__(self) -> None:
+            self.reported: list[dict] = []
+
+        def default_exception_handler(self, context: dict) -> None:
+            self.reported.append(context)
+
+    loop = Loop()
+    _quiet_after_close(loop, {"message": "Future exception was never retrieved", "exception": TargetClosedError()})
+    assert loop.reported == []
+    _quiet_after_close(loop, {"message": "boom", "exception": ValueError("x")})
+    assert len(loop.reported) == 1

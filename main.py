@@ -17,8 +17,20 @@ logger = logging.getLogger("twork.main")
 
 async def main() -> None:
     from agent import Agent  # импорт после проверки конфигурации
+    from config import KNOWLEDGE_DIR, PROJECT_DIR
+    from knowledge import import_previous
 
+    asyncio.get_running_loop().set_exception_handler(_quiet_after_close)
+    import_previous(KNOWLEDGE_DIR, PROJECT_DIR)     # новая версия в новой папке — база знаний прежней
     await Agent().run()
+
+
+def _quiet_after_close(loop: asyncio.AbstractEventLoop, context: dict) -> None:
+    """Браузер закрыт (Ctrl+C, окно закрыто) — недоделанные операции Playwright падают с
+    TargetClosedError; это не ошибка агента, трассировку в лог не пишем."""
+    if type(context.get("exception")).__name__ == "TargetClosedError":
+        return
+    loop.default_exception_handler(context)
 
 
 # Частые ошибки запуска → понятная подсказка вместо трассировки

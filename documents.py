@@ -3,7 +3,9 @@
 Инструкция к заказу бывает PDF (в диалоге или во вкладке — просмотрщик PDF или холст, текста на
 странице нет) или догружается скриптом уже после загрузки страницы. Поэтому:
 - DocumentCatcher, пока агент открывает инструкцию, запоминает ответы сервера с документами:
-  PDF и JSON по адресам с «instruction» (в нём бывает HTML/текст инструкции);
+  PDF и JSON по адресам с «instruction» (в нём бывает HTML/текст инструкции). PDF, который
+  открыл встроенный просмотрщик Chrome, браузер часто отдаёт лишь началом (536 байт на T-Work):
+  тогда документ скачивается целиком по его адресу запросом с куки браузера;
 - page_text ждёт, пока на вкладке появится текст, и читает все её фреймы;
 - describe_page — что на странице вместо текста (для лога, если прочитать не удалось).
 """
@@ -11,6 +13,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import html
 import json
 import logging
@@ -19,12 +22,13 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from playwright.async_api import BrowserContext, Error as PlaywrightError, Page, Response
+from playwright.async_api import BrowserContext, Error as PlaywrightError, Frame, Page, Response
 
 logger = logging.getLogger("twork.documents")
 
 _MAX_BYTES = 20 * 1024 * 1024
 _MIN_TEXT = 200                     # символов без пробелов — «в инструкции есть текст»
+_MIN_PDF = 2048                     # PDF инструкции меньше 2 КБ не бывает — это начало файла или заглушка
 
 
 def meaningful(text: str) -> bool:
@@ -40,6 +44,13 @@ class CaughtDocument:
     @property
     def is_pdf(self) -> bool:
         return "pdf" in self.mime or self.data[:5] == b"%PDF-"
+
+    @property
+    def complete(self) -> bool:
+        """Целый PDF: заголовок, конец файла (%%EOF) и разумный размер. Начало файла (его отдаёт
+        браузер, когда PDF открыл встроенный просмотрщик) модель не примет: ошибка 400."""
+        return (self.data[:5] == b"%PDF-" and len(self.data) >= _MIN_PDF
+                and b"%%EOF" in self.data[-4096:])
 
 
 class DocumentCatcher:
@@ -81,6 +92,56 @@ class DocumentCatcher:
         except (PlaywrightError, KeyError, ValueError):
             pass
 
+    async def fetch(self, url: str, referer: str = "", frame: Optional[Frame] = None) -> Optional[CaughtDocument]:
+        """Скачать PDF по адресу целиком, без просмотрщика: запросом из фрейма задания (тот же сайт,
+        его куки), затем запросом контекста браузера (куки контекста)."""
+        data, mime = b"", ""
+        if frame is not None:
+            try:
+                res = await asyncio.wait_for(frame.evaluate(_JS_FETCH, {"src": url, "limit": _MAX_BYTES}), 90)
+                if res and res.get("ok"):
+                    data, mime = base64.b64decode(res["b64"]), str(res.get("type") or "")
+            except (PlaywrightError, asyncio.TimeoutError, ValueError) as exc:
+                logger.debug("Документ %s из фрейма не скачан: %s", url[:100], exc)
+        if data[:5] != b"%PDF-":
+            try:
+                response = await self._context.request.get(
+                    url, headers={"Referer": referer} if referer else None, timeout=60_000,
+                    fail_on_status_code=False)
+                if response.ok:
+                    data = await response.body()
+                    mime = response.headers.get("content-type") or ""
+                else:
+                    logger.debug("Документ %s: HTTP %s", url[:100], response.status)
+            except PlaywrightError as exc:
+                logger.debug("Документ %s не скачан: %s", url[:100], exc)
+        if not data or len(data) > _MAX_BYTES or data[:5] != b"%PDF-":
+            return None
+        mime = mime.split(";")[0].strip().lower() or "application/pdf"
+        doc = CaughtDocument(url, mime, data)
+        if not any(d.url == url and len(d.data) == len(data) for d in self.documents):
+            self.documents.append(doc)
+        return doc
+
+    async def full_pdfs(self, urls: Optional[list[str]] = None, referer: str = "",
+                        frame: Optional[Frame] = None) -> list[CaughtDocument]:
+        """Целые PDF инструкции, от большего к меньшему. Пойман только обрывок — скачать целиком по
+        адресам пойманных PDF и по адресам вкладки и её фреймов (urls)."""
+        good = [d for d in self.pdfs() if d.complete]
+        if good:
+            return good
+        candidates: list[str] = []
+        for url in [d.url for d in self.documents if d.is_pdf] + list(urls or []):
+            if url.startswith(("http://", "https://")) and url not in candidates:
+                candidates.append(url)
+        for url in candidates[:6]:
+            doc = await self.fetch(url, referer, frame)
+            if doc is not None and doc.complete:
+                logger.info("📘 Браузер получил PDF инструкции не целиком — скачал его по адресу %s (%d КБ)",
+                            url[:100], len(doc.data) // 1024)
+                good.append(doc)
+        return sorted(good, key=lambda d: -len(d.data))
+
     def pdfs(self) -> list[CaughtDocument]:
         """PDF по убыванию размера: крошечный PDF (килобайт) — обычно заглушка или превью, а не
         инструкция — модель на нём только ошибается (так было на T-Work)."""
@@ -107,6 +168,26 @@ class DocumentCatcher:
                 if meaningful(text) and text not in parts:
                     parts.append(text)
         return "\n\n".join(parts)
+
+
+# скачать файл из фрейма задания: тот же сайт — с его куки (как это делает сама страница)
+_JS_FETCH = r"""
+async ({ src, limit }) => {
+    try {
+        const same = new URL(src, location.href).origin === location.origin;
+        const r = await fetch(src, { credentials: same ? 'include' : 'omit' });
+        if (!r.ok) return { ok: false, error: 'HTTP ' + r.status };
+        const blob = await r.blob();
+        if (blob.size > limit) return { ok: false, error: 'файл больше лимита: ' + blob.size };
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        let s = '';
+        for (let i = 0; i < buf.length; i += 0x8000) s += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+        return { ok: true, b64: btoa(s), type: blob.type || r.headers.get('content-type') || '' };
+    } catch (e) {
+        return { ok: false, error: String(e) };
+    }
+}
+"""
 
 
 def _strings(value: Any) -> list[str]:
@@ -177,6 +258,16 @@ async def describe_page(page: Page) -> str:
     frames = [f.url[:100] for f in page.frames[1:]]
     return (f"тип {info.get('type')}, символов {info.get('chars')}, холстов {info.get('canvas')}, "
             f"картинок {info.get('img')}, встроенных {info.get('embeds')}, фреймов {frames}")
+
+
+def document_urls(pages: list[Page]) -> list[str]:
+    """Адреса вкладки с инструкцией и её фреймов (встроенный PDF — «…/instruction/<id>/pdf»)."""
+    urls: list[str] = []
+    for page in pages:
+        for url in [page.url] + [f.url for f in page.frames]:
+            if url.startswith(("http://", "https://")) and url not in urls:
+                urls.append(url)
+    return urls
 
 
 def describe_documents(catcher: Optional[DocumentCatcher]) -> str:

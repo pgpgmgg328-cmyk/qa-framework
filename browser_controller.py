@@ -68,6 +68,10 @@ from models import ElementKind, ParsedElement, normalize_text
 from window_guard import WindowGuard, win_api
 
 logger = logging.getLogger("twork.browser")
+# JS по элементу (JS-клик, что перекрывает элемент, значение поля): элемента уже нет (задание
+# сменилось, платформа вернула на список) — без явного срока Playwright ждал его 30 с на каждую
+# операцию, и клик «висел» по минуте
+_EVAL_TIMEOUT_MS = 3_000
 
 
 @dataclass
@@ -593,7 +597,7 @@ class BrowserController:
                 except PlaywrightError:
                     await locator.select_option(value=text, timeout=3_000)
                 actual = await locator.evaluate(
-                    "e => ((e.selectedOptions[0] || {}).textContent || '').trim()"
+                    "e => ((e.selectedOptions[0] || {}).textContent || '').trim()", timeout=_EVAL_TIMEOUT_MS,
                 )
             else:
                 focus = await self._click_locator(locator, el.label())
@@ -608,11 +612,11 @@ class BrowserController:
                     await locator.press_sequentially(
                         text, delay=TYPE_DELAY_MS, timeout=max(5_000, len(text) * (TYPE_DELAY_MS + 50)),
                     )
-                actual = await locator.evaluate(_JS_READ_VALUE)
+                actual = await locator.evaluate(_JS_READ_VALUE, timeout=_EVAL_TIMEOUT_MS)
                 if _compact(actual) != _compact(text):
                     # маска/автоформатирование съели символы — вводим значение целиком
                     await locator.fill(text, timeout=3_000)
-                    actual = await locator.evaluate(_JS_READ_VALUE)
+                    actual = await locator.evaluate(_JS_READ_VALUE, timeout=_EVAL_TIMEOUT_MS)
         except PlaywrightError as exc:
             return ActionOutcome(ok=False, detail=f"ошибка ввода: {_short(exc)}")
         matches = _compact(actual) == _compact(text)
@@ -643,7 +647,8 @@ class BrowserController:
             dy = vp["height"] * 0.6 * (-1 if direction == "up" else 1)
             try:
                 if el is not None and await frame.locator(f'[data-agent-id="{el.uid}"]').count():
-                    await frame.locator(f'[data-agent-id="{el.uid}"]').first.evaluate(_JS_SCROLL, dy)
+                    await frame.locator(f'[data-agent-id="{el.uid}"]').first.evaluate(
+                        _JS_SCROLL, dy, timeout=_EVAL_TIMEOUT_MS)
                 else:
                     await frame.evaluate("dy => window.scrollBy(0, dy)", dy)
             except PlaywrightError as exc:
@@ -775,6 +780,12 @@ class BrowserController:
             # «точку клика не перекрывает другой элемент») без самого клика
             await locator.click(trial=True, timeout=CLICK_TIMEOUT_MS)
         except PlaywrightError as exc:
+            try:
+                gone = not await locator.count()
+            except PlaywrightError:
+                gone = True
+            if gone:                         # задание сменилось или платформа вернула на список заказов
+                return ActionOutcome(ok=False, stale=True, detail="элемент исчез — страница сменилась")
             blocker = await self._describe_blocker(locator)
             logger.warning("«%s» не готов к клику (%s) — JS-фоллбэк", what, blocker or _short(exc))
             if await self._js_click(locator):
@@ -829,7 +840,7 @@ class BrowserController:
     @staticmethod
     async def _js_click(locator: Locator) -> bool:
         try:
-            await locator.evaluate(_JS_CLICK)
+            await locator.evaluate(_JS_CLICK, timeout=_EVAL_TIMEOUT_MS)
             logger.debug("JS-клик выполнен")
             return True
         except PlaywrightError as exc:
@@ -839,7 +850,7 @@ class BrowserController:
     @staticmethod
     async def _describe_blocker(locator: Locator) -> str:
         try:
-            return str(await locator.evaluate(_JS_BLOCKER))
+            return str(await locator.evaluate(_JS_BLOCKER, timeout=_EVAL_TIMEOUT_MS))
         except PlaywrightError:
             return ""
 

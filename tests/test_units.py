@@ -694,6 +694,116 @@ def test_catcher_offers_the_largest_pdf_first():
     assert [d.url for d in catcher.pdfs()] == ["https://x/big.pdf", "https://x/stub.pdf"]
 
 
+def test_only_whole_pdfs_go_to_the_model_and_stubs_are_downloaded_again():
+    """Лог пользователя: браузер получил от PDF инструкции только 536 байт (его открыл встроенный
+    просмотрщик Chrome), модель дважды вернула ошибку 400, экзамен решался без инструкции. Обрывок
+    модели не отправляется: агент скачивает документ целиком по адресу (запросом с куки браузера)."""
+    from documents import CaughtDocument, DocumentCatcher
+    from tests.helpers import PDF_BYTES, run
+
+    stub = PDF_BYTES[:536]
+    asked: list[tuple[str, str]] = []
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.ok, self.status, self._body = True, 200, body
+            self.headers = {"content-type": "application/pdf"}
+
+        async def body(self) -> bytes:
+            return self._body
+
+    class Request:
+        async def get(self, url, headers=None, timeout=None, fail_on_status_code=None):
+            asked.append((url, (headers or {}).get("Referer", "")))
+            return Response(PDF_BYTES if url.endswith("/pdf") else stub)
+
+    class Context:
+        request = Request()
+
+        def on(self, event, handler):
+            pass
+
+    assert not CaughtDocument("u", "application/pdf", stub).complete
+    assert CaughtDocument("u", "application/pdf", PDF_BYTES).complete
+    catcher = DocumentCatcher(Context())
+    tab = "https://klecks-operator.tbank.ru/klecks/instruction/8dac3e"
+    catcher.documents = [CaughtDocument(tab, "application/pdf", stub)]
+    docs = run(catcher.full_pdfs([tab, "chrome-extension://viewer/index.html", tab + "/pdf"],
+                                 referer="https://klecks-operator.tbank.ru/klecks/task"))
+    assert [d.url for d in docs] == [tab + "/pdf"] and docs[0].data == PDF_BYTES
+    assert [u for u, _ in asked] == [tab, tab + "/pdf"]                       # расширение просмотрщика — нет
+    assert all(ref.endswith("/klecks/task") for _, ref in asked)
+    asked.clear()
+    assert [d.url for d in run(catcher.full_pdfs([tab]))] == [tab + "/pdf"] and not asked   # целый уже есть
+
+
+def test_blind_exam_is_not_started(tmp_path, monkeypatch):
+    """Лог пользователя: экзамены «Тип звонка» и «Фраза из диалога» агент решал без инструкции (PDF не
+    прочитан) и без тренировки (новая папка — база знаний пуста) и провалил, а после проваленного
+    экзамена задания этого вида закрываются. Теперь такой экзамен агент не решает."""
+    import agent as agent_module
+    from tests.helpers import run
+
+    monkeypatch.setattr(agent_module, "FRAME_LOAD_WAIT", 0)
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("only",), title="Тип звонка")
+    exam = PageState(reader=["#### Экзамен", "1 из 10 заданий", "### Определите тип звонка"])
+    assert run(agent._exam_gate(exam)) is False                     # инструкцию ещё не открывали
+    pool.instruction_unread = True
+    assert run(agent._exam_gate(exam)) is True                      # вслепую — нет
+    assert pool.path is not None and pool.path.exists()             # файл есть: инструкцию можно вписать
+    kb.save_instruction(pool, "Разговорное имя / родственник? — ДА → ПОЛЕЗНЫЙ. " * 5, "вкладка https://x")
+    assert run(agent._exam_gate(exam)) is False                     # инструкция есть — можно
+    pool.instruction, pool.instruction_unread = "", True
+    agent._order_train = [9, 10]
+    assert run(agent._exam_gate(exam)) is False                     # тренировка показала точность — можно
+
+
+def test_small_training_counts_less(tmp_path, monkeypatch):
+    """4 из 5 в тренировке — ещё не 80%: по пяти заданиям точность видна плохо, а проваленный экзамен
+    закрывает задания (в логе так и вышло)."""
+    agent, kb, pool = _ladder_agent(tmp_path, monkeypatch, models=("only",))
+    agent._order_train = [4, 5]
+    assert round(agent._exam_estimate()[0], 3) == round(5 / 7, 3)
+    agent._order_train = [3, 4]
+    assert agent._exam_estimate()[0] < 0.7
+    agent._order_train = [15, 18]
+    assert agent._exam_estimate()[0] >= 0.7
+
+
+def test_knowledge_of_the_previous_version_is_copied_once(tmp_path):
+    """Новую версию распаковали в новую папку (лог: twork-agent-v4.8) — база знаний пуста, и
+    статистика тренировок, по которой агент решает про экзамен, осталась в папке v4.7."""
+    from knowledge import import_previous
+
+    old = tmp_path / "twork-agent-v4.7" / "knowledge"
+    older = tmp_path / "twork-agent-v4.6" / "knowledge"
+    other = tmp_path / "photos" / "knowledge"
+    for folder in (old, older, other):
+        folder.mkdir(parents=True)
+    pool_file = "# Тип звонка\n<!-- pool: abc123 -->\n\n## Инструкция\nПравила\n"
+    (older / "Тип-abc.md").write_text(pool_file, encoding="utf-8")
+    (old / "Тип-abc.md").write_text(pool_file.replace("Правила", "Новые правила"), encoding="utf-8")
+    (old / "_general.md").write_text("Общее правило", encoding="utf-8")
+    (other / "x.md").write_text(pool_file, encoding="utf-8")
+    import os
+    import time
+    os.utime(older / "Тип-abc.md", (time.time() - 3600, time.time() - 3600))
+    project = tmp_path / "twork-agent-v4.9"
+    target = project / "knowledge"
+    project.mkdir()
+
+    assert import_previous(str(target), project) == 2
+    assert "Новые правила" in (target / "Тип-abc.md").read_text(encoding="utf-8")
+    assert (target / "_general.md").exists() and (target / "_imported.txt").exists()
+    (target / "Тип-abc.md").unlink()                                   # базу очистили сами
+    assert import_previous(str(target), project) == 0                  # второй раз не переносится
+    fresh = tmp_path / "twork-agent-v5" / "knowledge"
+    (fresh.parent).mkdir()
+    (fresh).mkdir()
+    (fresh / "Своё-1.md").write_text(pool_file, encoding="utf-8")
+    assert import_previous(str(fresh), fresh.parent) == 0              # своя база есть — не трогать
+
+
 def test_order_summary_tells_how_long_the_key_limit_lasts():
     class KeyLLM:
         def budget_left(self):

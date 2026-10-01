@@ -19,7 +19,7 @@ from dom_parser import DomParser, geo_facts, render_page
 from knowledge import KnowledgeBase
 from media import MediaManager
 from models import ActionType, DecisionContext, ElementKind, LLMDecision, PageState, ParsedElement, PlannedAction
-from tests.helpers import install_routes, run, workspace_url
+from tests.helpers import PDF_BYTES, install_routes, run, workspace_url
 
 # ---------------------------------------------------------------------------
 # Помощники
@@ -435,11 +435,12 @@ def test_instruction_and_tooltips_are_read_once_and_used(tmp_path, monkeypatch):
     assert "## Заметки" in content
 
 
-@pytest.mark.parametrize("kind", ["late", "pdf", "json"])
+@pytest.mark.parametrize("kind", ["late", "pdf", "json", "stub"])
 def test_instruction_in_a_tab_without_page_text_is_read(tmp_path, monkeypatch, kind):
     """Инструкция во вкладке, где текста сразу (или вообще) нет: текст догружается скриптом (late),
     это PDF (pdf — его переписывает модель) или JSON с HTML (json). Агент дожидается текста или берёт
-    документ, который скачала страница."""
+    документ, который скачала страница. stub — как в логе пользователя: браузер получил только начало
+    PDF (536 байт), агент скачивает файл целиком и не отправляет модели обрывок."""
     monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("atm", instr=kind))
     monkeypatch.setattr(agent_module, "INSTRUCTION_WAIT", 8)
 
@@ -458,13 +459,14 @@ def test_instruction_in_a_tab_without_page_text_is_read(tmp_path, monkeypatch, k
 
         async def read_document(self, data: bytes, filename: str, mime: str) -> Optional[str]:
             self.documents.append((data[:8], filename, mime))
+            self.sizes.append(len(data))
             return ("Проверка наличия фото. Для каждой поверхности банкомата должны быть фото: лицевая часть, "
                     "обе боковые стороны, верхняя панель. Если хотя бы одной стороны нет — выбирайте «Фото "
                     "присутствуют частично». Чёрные и размытые фото считаются отсутствующими.")
 
     async def scenario():
         llm = ReaderLLM(policy)
-        llm.documents = []
+        llm.documents, llm.sizes = [], []
         agent = Agent(browser=BrowserController(on_context=install_routes), llm=llm,
                       knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
         await agent.run()
@@ -474,8 +476,9 @@ def test_instruction_in_a_tab_without_page_text_is_read(tmp_path, monkeypatch, k
     assert agent._tasks_done == 1
     content = next((tmp_path / "knowledge").glob("*.md")).read_text(encoding="utf-8")
     assert "## Инструкция" in content and "обе боковые стороны" in content
-    if kind == "pdf":
+    if kind in ("pdf", "stub"):
         assert llm.documents == [(b"%PDF-1.4", "instruction.pdf", "application/pdf")]
+        assert llm.sizes == [len(PDF_BYTES)]                          # целиком, а не обрывок в 536 байт
     else:
         assert not llm.documents                                       # модель не понадобилась
 
@@ -738,6 +741,28 @@ def test_failed_exam_moves_task_type_to_next_model_and_pinned_model_stays(tmp_pa
     agent, llm = run(scenario())
     assert {ctx.model for _, ctx in llm.calls} == {"strong"} and agent._order_exam is False
     assert "- текущая модель: mid" in path.read_text(encoding="utf-8")
+
+
+def test_click_on_a_vanished_element_gives_up_fast():
+    """Лог пользователя: пока агент кликал вариант, платформа вернула на список заказов — клик «висел»
+    больше минуты (две операции по 30 с). Элемента нет — клик сдаётся за секунды."""
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.set_content("<button id='b' data-agent-id='1-1'>Простота и удобство</button>")
+            controller = BrowserController.__new__(BrowserController)
+            controller._page = page
+            locator = page.locator("[data-agent-id='1-1']").first
+            await page.evaluate("document.getElementById('b').remove()")
+            started = time.monotonic()
+            outcome = await controller._click_locator(locator, "Простота и удобство")
+            elapsed = time.monotonic() - started
+            await browser.close()
+            return outcome, elapsed
+
+    outcome, elapsed = run(scenario())
+    assert not outcome.ok and outcome.stale and elapsed < 12
 
 
 def test_media_manager_fetches_authorized_attachments(tmp_path):

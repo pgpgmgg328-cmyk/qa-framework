@@ -69,7 +69,7 @@ from config import (
     TASK_URL_KEYWORDS,
     WEB_RESEARCH,
 )
-from documents import DocumentCatcher, describe_documents, describe_page, meaningful, page_text
+from documents import DocumentCatcher, describe_documents, describe_page, document_urls, meaningful, page_text
 from dom_parser import DomParser, _plain_text, is_denied_button
 from knowledge import KnowledgeBase, PoolKnowledge
 from media import MediaManager
@@ -315,6 +315,7 @@ class Agent:
         self._frame_shot_task = ""
         self._doc_catcher: Optional[DocumentCatcher] = None   # документы, пока открыта инструкция
         self._instruction_seen = ""                           # что было на вкладке инструкции (для лога)
+        self._instruction_urls: list[str] = []                # адреса вкладки и фреймов инструкции (PDF)
         # учёт токенов: у LLMConnector есть usage (сценарные «LLM» тестов — без него)
         usage = getattr(self._llm, "usage", None)
         self._task_usage_start = usage.snapshot() if usage is not None else None
@@ -332,7 +333,7 @@ class Agent:
             self._task_usage_start = self._llm.usage.snapshot()      # проверку не считаем заданием
         async with self._browser:
             logger.info("=" * 60)
-            logger.info("АГЕНТ v4.8 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
+            logger.info("АГЕНТ v4.9 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
             logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
@@ -717,7 +718,9 @@ class Agent:
         if not total or (total < EXAM_MIN_TASKS
                          and ok + EXAM_MIN_TASKS - total >= EXAM_MIN_ACCURACY * EXAM_MIN_TASKS):
             return None
-        overall = ok / total
+        # сглаживание: по 4–5 заданиям точность видна плохо, а проваленный экзамен закрывает
+        # задания этого вида — «4 из 5» считается как ≈ 71%, «3 из 4» — как ≈ 67%
+        overall = (ok + 1) / (total + 2)
         source = f"в тренировке с первого раза верно {ok} из {total}"
         if pool is not None and len(self._ladder) > 1:
             model = self._model_for(pool)
@@ -740,6 +743,19 @@ class Agent:
         if not exam_start and self._page_mode(state) != "exam":
             return False
         estimate = self._exam_estimate()
+        pool = self._pool
+        if estimate is None and pool is not None and pool.instruction_unread and not pool.instruction.strip():
+            # ни инструкции, ни тренировки — экзамен вслепую; не сдан — задания этого вида закроются
+            if pool.key not in self._exam_block_logged:
+                self._exam_block_logged.add(pool.key)
+                logger.warning(
+                    "⛔ ЭКЗАМЕН НЕ НАЧИНАЮ: инструкцию к этому виду заданий прочитать не удалось, а тренировки "
+                    "этого вида у агента нет — это решение вслепую, а после проваленного экзамена задания этого "
+                    "вида закрываются. Пройдите экзамен сами (агент не мешает и ждёт), сначала пройдите с агентом "
+                    "тренировку или впишите текст инструкции в раздел «Инструкция» файла %s",
+                    self._knowledge.ensure_file(pool) or "этого вида в папке knowledge")
+            await asyncio.sleep(FRAME_LOAD_WAIT)
+            return True
         if estimate is None or estimate[0] + 1e-9 >= EXAM_MIN_ACCURACY:
             return False
         key = self._pool.key if self._pool is not None else ""
@@ -1006,6 +1022,8 @@ class Agent:
         text = _plain_text(state.dialog_lines)
         if state.dialog_frames:
             text = "\n".join(filter(None, [text, await self._read_child_frames(frame)]))
+        self._instruction_urls += [c.url for c in frame.child_frames if c.url.startswith(("http://", "https://"))
+                                   and c.url not in self._instruction_urls]
         failed = any("ошибка загрузки" in n.lower() for n in state.notice_texts())
         title = (text.strip().splitlines() or ["инструкция"])[0][:80]
         body = text
@@ -1025,8 +1043,12 @@ class Agent:
                 self._memory.add(ActionType.CLICK, None, note="(авто)",
                                  result=f"📘 прочитана инструкция «{title[:60]}» — она в разделе ЗНАНИЯ")
         if failed:
+            if self._pool is not None and not self._pool.instruction.strip():
+                self._pool.instruction_unread = True
             logger.warning("Инструкция не загрузилась (сообщение платформы) — продолжаю без неё")
         elif len(re.sub(r"\s+", "", body)) < 200:
+            if self._pool is not None:
+                self._pool.instruction_unread = True
             logger.warning("Инструкция открыта, но текста в ней не найдено (%d симв.). Вкладка: %s. Скачано: %s",
                            len(body), self._instruction_seen or "не открывалась",
                            describe_documents(self._doc_catcher))
@@ -1084,8 +1106,12 @@ class Agent:
             catcher = self._doc_catcher
             text = await page_text(page, INSTRUCTION_WAIT,
                                    give_up=(lambda: bool(catcher.documents)) if catcher is not None else None)
-            logger.info("Инструкция прочитана из вкладки %s (%d симв.)", page.url[:80], len(text))
-            if not meaningful(text):
+            self._instruction_urls += [u for u in document_urls([page]) if u not in self._instruction_urls]
+            if meaningful(text):
+                logger.info("Инструкция прочитана из вкладки %s (%d симв.)", page.url[:80], len(text))
+            else:
+                logger.info("Вкладка с инструкцией %s: текста на странице нет (%d симв.) — ищу документ",
+                            page.url[:80], len(text))
                 self._instruction_seen = f"{page.url[:80]}: {await describe_page(page)}"
         except PlaywrightError as exc:
             logger.info("Вкладку с инструкцией прочитать не удалось (%s)", _short(exc))
@@ -1099,6 +1125,7 @@ class Agent:
     def _start_catching_documents(self) -> None:
         self._stop_catching_documents()
         self._instruction_seen = ""
+        self._instruction_urls = []
         try:
             self._doc_catcher = DocumentCatcher(self._browser.context)
         except PlaywrightError as exc:
@@ -1121,7 +1148,15 @@ class Agent:
             logger.info("📘 Инструкция взята из ответа сервера (%d симв.)", len(text))
             return text
         reader = getattr(self._llm, "read_document", None)
-        for doc in catcher.pdfs()[:2] if reader is not None else []:
+        if reader is None or not (catcher.pdfs() or self._instruction_urls):
+            return ""
+        frame = await self._browser.find_target_frame()
+        docs = await catcher.full_pdfs(self._instruction_urls, referer=frame.url if frame else self._browser.page.url,
+                                       frame=frame)
+        if not docs and catcher.pdfs():
+            logger.warning("📘 PDF инструкции пришёл не целиком (%s) и целиком не скачался — модели его не "
+                           "отправляю (она вернула бы ошибку)", describe_documents(catcher))
+        for doc in docs[:2]:
             logger.info("📘 Инструкция — PDF (%d КБ): переписываю её текст моделью (один раз для вида заданий)",
                         max(len(doc.data) // 1024, 1))
             text = await reader(doc.data, "instruction.pdf", "application/pdf") or ""
@@ -1184,6 +1219,7 @@ class Agent:
             if meaningful(text):
                 self._knowledge.save_instruction(pool, text, f"вкладка {page.url[:80]}")
             else:
+                pool.instruction_unread = True
                 logger.warning("Инструкция во вкладке без текста — %s; %s", self._instruction_seen,
                                describe_documents(self._doc_catcher))
             await self._browser.ensure_front()

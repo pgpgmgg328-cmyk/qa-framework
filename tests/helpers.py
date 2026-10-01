@@ -56,7 +56,8 @@ def fixture_url(task: str) -> str:
 def workspace_url(scenario: str, *, popup: bool = False, autoinstruction: bool = False,
                   start: bool = False, instr: str = "") -> str:
     """start=True — задание открывается заставкой «Тренировка … [Начать]» (под ней идёт загрузка).
-    instr=late|pdf|json — инструкция во вкладке: текст догружается скриптом / PDF / JSON с HTML."""
+    instr=late|pdf|json|stub — инструкция во вкладке: текст догружается скриптом / PDF / JSON с HTML /
+    PDF, который браузер получил лишь началом."""
     extra = ("&popup=1" if popup else "") + ("&autoinstruction=1" if autoinstruction else "") + ("&start=1" if start else "")
     extra += f"&instr={instr}" if instr else ""
     return f"https://t-work.test/workspace.html?scenario={scenario}{extra}"
@@ -77,8 +78,15 @@ INSTRUCTION_PAGES = {
             "fetch('/klecks/api/instruction-file/3a1e.pdf').then(r => r.arrayBuffer())</script></body></html>"),
     "json": ("<!doctype html><html><body><canvas width='600' height='800'></canvas><script>"
              "fetch('/klecks/api/instruction/3a1e').then(r => r.json())</script></body></html>"),
+    # как встроенный просмотрщик PDF в Chrome на T-Work: браузер получает лишь начало файла
+    # (запрос с Range — 536 байт), целиком документ отдаётся только обычным запросом
+    "stub": ("<!doctype html><html><body><canvas width='600' height='800'></canvas><script>"
+             "fetch('/klecks/api/instruction-file/3a1e.pdf', {headers: {Range: 'bytes=0-535'}})"
+             ".then(r => r.arrayBuffer())</script></body></html>"),
 }
-PDF_BYTES = b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\ntrailer << /Root 1 0 R >>\n%%EOF\n"
+# PDF инструкции: больше 2 КБ и с концом файла %%EOF — как настоящий (меньше — это обрывок или заглушка)
+PDF_BYTES = (b"%PDF-1.4\n1 0 obj << /Type /Catalog >> endobj\n2 0 obj << /Length 3000 >>\nstream\n" + b"0" * 3000
+             + b"\nendstream\nendobj\ntrailer << /Root 1 0 R >>\n%%EOF\n")
 
 
 def png_bytes(seed: str, width: int = 320, height: int = 240) -> bytes:
@@ -144,7 +152,11 @@ async def install_routes(context: BrowserContext) -> None:
             elif path.startswith("/klecks/instruction/"):
                 await html(route, INSTRUCTION_PAGES[query.get("kind", ["late"])[0]])
             elif path.startswith("/klecks/api/instruction-file/"):
-                await route.fulfill(status=200, content_type="application/pdf", body=PDF_BYTES)
+                if route.request.headers.get("range"):
+                    await route.fulfill(status=206, content_type="application/pdf", body=PDF_BYTES[:536],
+                                        headers={"Content-Range": f"bytes 0-535/{len(PDF_BYTES)}"})
+                else:
+                    await route.fulfill(status=200, content_type="application/pdf", body=PDF_BYTES)
             elif path.startswith("/klecks/api/instruction/"):
                 await route.fulfill(status=200, content_type="application/json",
                                     body=json.dumps({"id": "3a1e", "title": "Инструкция", "content": INSTRUCTION_HTML}))
