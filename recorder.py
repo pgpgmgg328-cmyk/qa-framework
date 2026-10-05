@@ -2,10 +2,15 @@
 и то, что делает человек.
 
 Запуск: python main.py --record
+        python main.py --record --url https://profit.ozon.ru   — исследовать другую площадку
 
 Пока вы вручную проходите задания в открывшемся окне, на каждом новом экране
-сохраняется папка recordings/<сессия>/<NNN>_<где>_<задание>/:
+(когда страница закончила фоновые запросы и перестала меняться) сохраняется папка
+recordings/<сессия>/<NNN>_<где>_<задание>/:
   frame.html   — HTML фрейма задания (с метками data-agent-id, которые расставил парсер)
+  frames/*.html — HTML вложенных фреймов страницы (задание бывает во фрейме во фрейме)
+  components.json — устройство интерфейса по фреймам: роли, aria- и data-атрибуты, классы,
+                 кнопки, переключатели, поля, диалоги, лоадеры и скелетоны, iframe
   screen.jpg   — скриншот окна
   llm_view.txt — ровно то, что агент отправил бы модели на этом экране
   state.json   — разобранный снимок: элементы, типы, состояния, текст задания
@@ -45,6 +50,97 @@ logger = logging.getLogger("twork.recorder")
 _PART_LIMIT_BYTES = 24 * 1024 * 1024      # веб-загрузка GitHub принимает файлы до 25 МБ
 _MAX_EXTERNAL_SHOTS = 300
 _MAX_SNAPSHOTS = 3000
+_MAX_CHILD_FRAMES = 10
+_MAX_FRAME_HTML = 3 * 1024 * 1024
+
+# Устройство интерфейса фрейма — по нему подбирается поддержка новой площадки (её дизайн-
+# системы): какие роли и aria-состояния у переключателей, какие классы у кнопок, как выглядят
+# диалоги, лоадеры и скелетоны. Обходит и открытые shadow root.
+_JS_INVENTORY = r"""
+() => {
+    const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
+    const all = [];
+    let shadowRoots = 0;
+    const walk = (root) => {
+        const w = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
+        for (let n = w.nextNode(); n; n = w.nextNode()) {
+            all.push(n);
+            if (n.shadowRoot) { shadowRoots++; walk(n.shadowRoot); }
+        }
+    };
+    walk(document);
+    const STATE_ATTRS = ['aria-checked', 'aria-selected', 'aria-pressed', 'aria-expanded', 'aria-disabled',
+                         'aria-current', 'aria-invalid', 'aria-busy', 'aria-hidden', 'aria-modal',
+                         'data-state', 'data-checked', 'data-selected', 'data-disabled', 'data-active'];
+    const roles = {}, aria = {}, states = {}, data = {}, classes = {}, tags = {};
+    const bump = (map, key) => { map[key] = (map[key] || 0) + 1; };
+    const clsOf = (el) => String((el.getAttribute && el.getAttribute('class')) || '');
+    for (const el of all) {
+        const tag = String(el.localName || '');
+        if (tag.includes('-')) bump(tags, tag);
+        const role = el.getAttribute('role');
+        if (role) bump(roles, role);
+        for (const a of el.attributes) {
+            if (a.name.startsWith('aria-')) bump(aria, a.name);
+            else if (a.name.startsWith('data-') && !a.name.startsWith('data-agent')) bump(data, a.name);
+            if (STATE_ATTRS.includes(a.name)) bump(states, a.name + '=' + String(a.value).slice(0, 24));
+        }
+        for (const t of clsOf(el).split(/\s+/)) if (t) bump(classes, t);
+    }
+    const top = (map, n) => Object.fromEntries(Object.entries(map).sort((a, b) => b[1] - a[1]).slice(0, n));
+    const visible = (el) => {
+        const r = el.getBoundingClientRect();
+        if (r.width < 1 || r.height < 1) return false;
+        return el.checkVisibility ? el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) : true;
+    };
+    const describe = (el) => {
+        const r = el.getBoundingClientRect();
+        const state = {};
+        for (const a of STATE_ATTRS) if (el.hasAttribute(a)) state[a] = el.getAttribute(a);
+        const out = {
+            tag: el.localName, role: el.getAttribute('role') || '',
+            cls: clsOf(el).split(/\s+/).filter(Boolean).slice(0, 5).join(' '),
+            text: norm(el.innerText || el.getAttribute('aria-label') || el.getAttribute('title')
+                       || el.getAttribute('placeholder') || '').slice(0, 120),
+            visible: visible(el), box: [Math.round(r.left), Math.round(r.top), Math.round(r.width), Math.round(r.height)],
+            disabled: !!el.disabled, state,
+            testid: el.getAttribute('data-testid') || el.getAttribute('data-test-id') || el.getAttribute('data-qa')
+                    || el.getAttribute('data-widget') || el.getAttribute('data-test') || '',
+            cursor: getComputedStyle(el).cursor,
+        };
+        if (el.localName === 'input') { out.type = el.type; out.checked = !!el.checked; out.name = el.name || ''; }
+        return out;
+    };
+    const pick = (sel, n) => {
+        const found = [];
+        for (const el of all) {
+            if (found.length >= n) break;
+            try { if (el.matches(sel)) found.push(describe(el)); } catch (e) { return found; }
+        }
+        return found;
+    };
+    return JSON.stringify({
+        url: location.href, title: document.title, elements: all.length, shadowRoots,
+        roles: top(roles, 60), aria: top(aria, 60), states: top(states, 80), data: top(data, 60),
+        classes: top(classes, 200), customTags: top(tags, 60),
+        buttons: pick('button, [role="button"], a[href], input[type="submit"], input[type="button"], [role="tab"]', 150),
+        choices: pick('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [role="switch"], '
+                      + '[role="option"], [role="menuitemradio"], [role="menuitemcheckbox"], [aria-checked], [aria-selected], '
+                      + '[data-state="checked"], [data-state="unchecked"]', 200),
+        fields: pick('input:not([type="radio"]):not([type="checkbox"]):not([type="hidden"]), textarea, select, '
+                     + '[contenteditable="true"], [role="textbox"], [role="combobox"], [role="listbox"], [role="spinbutton"]', 80),
+        dialogs: pick('[role="dialog"], [role="alertdialog"], [aria-modal="true"], dialog', 20),
+        loaders: pick('[aria-busy="true"], [role="progressbar"], [class*="spin" i], [class*="load" i], '
+                      + '[class*="skeleton" i], [class*="shimmer" i], [class*="placeholder" i]', 60),
+        notices: pick('[role="alert"], [role="status"], [class*="toast" i], [class*="notification" i], '
+                      + '[class*="error" i], [class*="warning" i]', 40),
+        iframes: all.filter((e) => e.localName === 'iframe').slice(0, 20).map((e) => {
+            const r = e.getBoundingClientRect();
+            return { src: String(e.src || '').slice(0, 300), name: e.name || '', w: Math.round(r.width), h: Math.round(r.height) };
+        }),
+    });
+}
+"""
 
 # Слушатели действий человека. Ставятся в КАЖДЫЙ документ контекста (включая iframe
 # и новые вкладки) через add_init_script. Фаза capture — событие фиксируется до того,
@@ -150,8 +246,10 @@ class Recorder:
         browser: Optional[BrowserController] = None,
         out_dir: Optional[Path] = None,
         interval: float = 1.0,
+        url: Optional[str] = None,
     ) -> None:
-        self._browser = browser or BrowserController(headless=False)   # записывать можно только в видимом окне
+        # записывать можно только в видимом окне; url — другая площадка вместо TARGET_URL
+        self._browser = browser or BrowserController(headless=False, start_url=url)
         self._root = out_dir or (PROJECT_DIR / "recordings")
         self._interval = interval
         self._session_dir = self._root / datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -258,8 +356,8 @@ class Recorder:
         signature = self._signature(state, frame, where)
         if self._current is not None and signature == self._current.signature:
             return
-        # экран меняется — ждём, пока он «успокоится», и снимаем заново
-        await self._browser.wait_settle(frame, timeout_ms=2000)
+        # экран меняется — ждём, пока страница закончит фоновые запросы и перестанет меняться
+        await self._browser.wait_for_network_idle_and_dom(frame, timeout_ms=4000)
         state = await DomParser(frame).parse(quiet=True)
         signature = self._signature(state, frame, where)
         if self._current is not None and signature == self._current.signature:
@@ -323,6 +421,7 @@ class Recorder:
         (folder / "llm_view.txt").write_text(
             LLMConnector.build_user_message(state, DecisionContext()), encoding="utf-8",
         )
+        await self._save_components(page, frame, folder)
         (folder / "state.json").write_text(state.model_dump_json(indent=1), encoding="utf-8")
 
         frames = []
@@ -351,6 +450,32 @@ class Recorder:
             state.task_preview[:60] or frame.url[:60], len(state.elements),
             f", сообщения: {' | '.join(state.alerts)[:80]}" if state.alerts else "",
         )
+
+    async def _save_components(self, page: Page, frame: Frame, folder: Path) -> None:
+        """Устройство интерфейса каждого фрейма (components.json) и HTML вложенных фреймов."""
+        frames: list[dict[str, Any]] = []
+        child = 0
+        for f in page.frames:
+            if f.is_detached():
+                continue
+            entry: dict[str, Any] = {"url": f.url, "name": f.name, "main": f is page.main_frame,
+                                     "snapshot": f is frame}
+            try:
+                entry["inventory"] = json.loads(await f.evaluate(_JS_INVENTORY))
+            except (PlaywrightError, ValueError) as exc:
+                entry["error"] = str(exc)[:200]
+            if f is not page.main_frame and f is not frame and child < _MAX_CHILD_FRAMES:
+                child += 1
+                try:
+                    html = await f.content()
+                    if len(html) <= _MAX_FRAME_HTML:
+                        (folder / "frames").mkdir(exist_ok=True)
+                        (folder / "frames" / f"{child:02d}.html").write_text(html, encoding="utf-8")
+                        entry["html"] = f"frames/{child:02d}.html"
+                except PlaywrightError as exc:
+                    entry.setdefault("error", str(exc)[:200])
+            frames.append(entry)
+        self._write_json(folder / "components.json", {"page_url": page.url, "frames": frames})
 
     def _close_current(self) -> None:
         current, self._current = self._current, None
@@ -463,9 +588,9 @@ class Recorder:
         path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
 
 
-async def record() -> list[Path]:
-    """Точка входа режима записи (python main.py --record)."""
+async def record(url: Optional[str] = None) -> list[Path]:
+    """Точка входа режима записи (python main.py --record [--url адрес другой площадки])."""
     started = time.monotonic()
-    parts = await Recorder().run()
+    parts = await Recorder(url=url).run()
     logger.info("Запись длилась %.0f с", time.monotonic() - started)
     return parts

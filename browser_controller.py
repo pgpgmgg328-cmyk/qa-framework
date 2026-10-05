@@ -37,6 +37,7 @@ from playwright.async_api import (
     Locator,
     Page,
     Playwright,
+    Request,
     async_playwright,
 )
 
@@ -68,6 +69,89 @@ from models import ElementKind, ParsedElement, normalize_text
 from window_guard import WindowGuard, win_api
 
 logger = logging.getLogger("twork.browser")
+# ---------------------------------------------------------------------------
+# Сеть страницы: незавершённые XHR/fetch (React/Angular догружают форму после загрузки)
+# ---------------------------------------------------------------------------
+
+_BUSY_RESOURCES = frozenset({"xhr", "fetch"})
+# Запрос висит дольше — это long-poll или поток (уведомления, чат): конца у него нет,
+# ждать его — значит ждать всегда
+_LONG_REQUEST_S = 15.0
+_FORGET_REQUEST_S = 300.0           # событие о конце запроса так и не пришло — забыть
+
+
+class NetworkTracker:
+    """Незавершённые XHR/fetch по страницам: Playwright сообщает о начале и конце каждого запроса."""
+
+    def __init__(self) -> None:
+        self._inflight: dict[Request, tuple[float, Optional[Page]]] = {}
+        self._last_activity: dict[Page, float] = {}
+
+    def attach(self, context: BrowserContext) -> None:
+        context.on("request", self._on_request)
+        context.on("requestfinished", self._on_done)
+        context.on("requestfailed", self._on_done)
+
+    @staticmethod
+    def _page_of(request: Request) -> Optional[Page]:
+        try:
+            return request.frame.page
+        except Exception:  # noqa: BLE001 — у запросов service worker нет фрейма
+            return None
+
+    def _on_request(self, request: Request) -> None:
+        if request.resource_type not in _BUSY_RESOURCES:
+            return
+        page = self._page_of(request)
+        now = time.monotonic()
+        self._inflight[request] = (now, page)
+        if page is not None:
+            self._last_activity[page] = now
+
+    def _on_done(self, request: Request) -> None:
+        entry = self._inflight.pop(request, None)
+        if entry is not None and entry[1] is not None:
+            self._last_activity[entry[1]] = time.monotonic()
+
+    def busy(self, page: Page, *, long_request_s: float = _LONG_REQUEST_S) -> int:
+        """Сколько XHR/fetch страницы ещё идёт (без long-poll — висящих дольше long_request_s)."""
+        now = time.monotonic()
+        for request in [r for r, (t, _) in self._inflight.items() if now - t > _FORGET_REQUEST_S]:
+            self._inflight.pop(request, None)
+        return sum(1 for started, p in self._inflight.values() if p is page and now - started < long_request_s)
+
+    def quiet_for(self, page: Page) -> float:
+        """Секунд с последнего начала или конца XHR/fetch на странице."""
+        return time.monotonic() - self._last_activity.get(page, 0.0)
+
+
+# Видимые индикаторы загрузки: aria-busy, неопределённый прогресс-бар (у прогресса «3 из 14»
+# есть aria-valuenow — это не загрузка), спиннеры и скелетоны по токенам классов. extra —
+# селектор лоадеров конкретной площадки (дописывается по записи её страниц)
+_JS_LOADERS_VISIBLE = r"""
+(extra) => {
+    const RE = /(^|[-_])(spinner|loader|loading|preloader|skeleton|shimmer)([-_]|$)/i;
+    let sel = '[aria-busy="true"], [role="progressbar"], [class*="spin" i], [class*="load" i], '
+            + '[class*="skeleton" i], [class*="shimmer" i]';
+    let extraOk = false;
+    if (extra) { try { document.querySelector(extra); sel += ', ' + extra; extraOk = true; } catch (e) {} }
+    const vw = innerWidth, vh = innerHeight;
+    for (const n of document.querySelectorAll(sel)) {
+        const cls = String(n.getAttribute('class') || '');
+        const progress = n.getAttribute('role') === 'progressbar' && !n.hasAttribute('aria-valuenow');
+        const own = (extraOk && n.matches(extra)) || n.getAttribute('aria-busy') === 'true' || progress
+            || cls.split(/\s+/).some((t) => RE.test(t));
+        if (!own) continue;
+        const r = n.getBoundingClientRect();
+        if (r.width < 4 || r.height < 4 || r.bottom < 0 || r.right < 0 || r.top > vh || r.left > vw) continue;
+        if (n.checkVisibility && !n.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true })) continue;
+        return (n.localName || '') + (cls ? '.' + cls.split(/\s+/).slice(0, 2).join('.') : '');
+    }
+    return '';
+}
+"""
+
+
 # JS по элементу (JS-клик, что перекрывает элемент, значение поля): элемента уже нет (задание
 # сменилось, платформа вернула на список) — без явного срока Playwright ждал его 30 с на каждую
 # операцию, и клик «висел» по минуте
@@ -228,6 +312,7 @@ class BrowserController:
         *,
         on_context: Optional[Callable[[BrowserContext], Awaitable[None]]] = None,
         headless: Optional[bool] = None,
+        start_url: Optional[str] = None,
     ) -> None:
         self._playwright: Optional[Playwright] = None
         self._browser:    Optional[Browser] = None
@@ -237,10 +322,13 @@ class BrowserController:
         self._window_task: Optional[asyncio.Task] = None
         self._guard: Optional[WindowGuard] = None
         self._cdp = None                    # CDP-сессия главной страницы (состояние окна)
+        self.network = NetworkTracker()     # незавершённые XHR/fetch — для ожидания «UI готов»
         # хук после создания контекста: маршруты (тесты, блокировка аналитики), куки и т.п.
         self._on_context = on_context
         # None — как в .env (HEADLESS); режим записи принудительно открывает окно
         self._headless = HEADLESS if headless is None else headless
+        # стартовая страница: другой сайт (запись: --url) или None — TARGET_URL из .env
+        self._start_url = start_url
 
     # ------------------------------------------------------------------
     # Жизненный цикл
@@ -253,7 +341,7 @@ class BrowserController:
             "Старт Playwright: %s, url=%s, profile=%s",
             "видимое окно на весь экран" if headed
             else f"без окна, viewport {VIEWPORT_WIDTH}×{VIEWPORT_HEIGHT}, масштаб {zoom:.0%}",
-            TARGET_URL, USER_DATA_DIR or "—",
+            self._start_url or TARGET_URL, USER_DATA_DIR or "—",
         )
         self._playwright = await async_playwright().start()
         launch_opts: dict = {
@@ -307,15 +395,18 @@ class BrowserController:
             self._context = await self._browser.new_context(**context_opts)
             self._page = await self._context.new_page()
 
+        self.network.attach(self._context)
         if self._on_context is not None:
             await self._on_context(self._context)
-        logger.info("Переход на %s", TARGET_URL)
+        url = self._start_url or TARGET_URL
+        logger.info("Переход на %s", url)
         try:
-            await self._page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=60_000)
+            await self._page.goto(url, wait_until="domcontentloaded", timeout=60_000)
         except PlaywrightError as exc:
             # Не падаем: окно остаётся открытым, адрес можно ввести вручную,
             # а агент/запись дождутся страницы с заданием
-            logger.error("Не удалось открыть TARGET_URL=%s — %s", TARGET_URL, _navigation_hint(exc))
+            logger.error("Не удалось открыть %s%s — %s", "TARGET_URL=" if self._start_url is None else "",
+                         url, _navigation_hint(exc))
             logger.error(
                 "Впишите в .env в TARGET_URL адрес страницы, где вы открываете задания "
                 "(скопируйте его из адресной строки своего браузера). Сейчас этот адрес "
@@ -730,6 +821,42 @@ class BrowserController:
             logger.debug("wait_settle: %s", _short(exc))
             await asyncio.sleep(quiet_ms / 1000)
             return "navigated"
+
+    async def wait_for_network_idle_and_dom(
+        self, frame: Optional[Frame] = None, *, idle_ms: int = 500, timeout_ms: int = 10_000,
+        long_request_s: float = _LONG_REQUEST_S, extra_loaders: str = "",
+    ) -> bool:
+        """Перед снимком DOM реактивной формы (React, Angular): дождаться, пока страница закончит
+        фоновые XHR/fetch и idle_ms после них не начнёт новых, DOM перестанет меняться и пропадут
+        видимые индикаторы загрузки (спиннеры, скелетоны, aria-busy; extra_loaders — селектор
+        лоадеров конкретной площадки). Long-poll (запрос дольше long_request_s) не ждём.
+        True — страница успокоилась за timeout_ms; False — нет (снимок всё равно можно делать)."""
+        page = frame.page if frame is not None else self.page
+        frame = frame or page.main_frame
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            if (self.network.busy(page, long_request_s=long_request_s)
+                    or self.network.quiet_for(page) < idle_ms / 1000):
+                await asyncio.sleep(0.1)
+                continue
+            left_ms = int((deadline - time.monotonic()) * 1000)
+            if left_ms <= 0:
+                break
+            if await self.wait_settle(frame, quiet_ms=min(SETTLE_QUIET_MS, idle_ms), timeout_ms=left_ms) != "quiet":
+                continue                     # DOM всё меняется или фрейм перезагрузился — заново
+            try:
+                loader = await frame.evaluate(_JS_LOADERS_VISIBLE, extra_loaders)
+            except PlaywrightError as exc:
+                logger.debug("Лоадеры не проверены: %s", _short(exc))
+                loader = ""
+            if loader:
+                logger.debug("Ещё виден индикатор загрузки: %s", loader)
+                await asyncio.sleep(0.2)
+                continue
+            if not self.network.busy(page, long_request_s=long_request_s):
+                return True                  # пока ждали DOM, новых запросов не началось
+        logger.debug("Страница не успокоилась за %d мс", timeout_ms)
+        return False
 
     async def screenshot_b64(self, frame: Frame, mode: str) -> Optional[str]:
         """Скриншот для vision-модели: главная картинка задания или весь фрейм (JPEG, base64)."""

@@ -49,8 +49,12 @@ def test_recorder_captures_screens_actions_and_tabs(tmp_path):
     session = next(p for p in tmp_path.iterdir() if p.is_dir())
     shots = sorted(p for p in session.iterdir() if p.is_dir() and p.name[:3].isdigit())
     assert len(shots) >= 3
-    for name in ("frame.html", "screen.jpg", "llm_view.txt", "state.json", "meta.json", "actions.json"):
+    for name in ("frame.html", "screen.jpg", "llm_view.txt", "state.json", "meta.json", "actions.json",
+                 "components.json"):
         assert (shots[0] / name).exists(), name
+    components = json.loads((shots[0] / "components.json").read_text(encoding="utf-8"))
+    snapshot = next(f for f in components["frames"] if f["snapshot"])
+    assert "klecks" in snapshot["url"] and snapshot["inventory"]["buttons"]       # опись фрейма задания
     assert "data-agent-id" in (shots[0] / "frame.html").read_text(encoding="utf-8")
     assert "[FOLDER закрыта] «Электроника»" in (shots[0] / "llm_view.txt").read_text(encoding="utf-8")
 

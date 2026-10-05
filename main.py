@@ -3,6 +3,9 @@
   python main.py            — агент решает задания сам
   python main.py --record   — режим записи: вы решаете задания вручную, агент
                               сохраняет экраны и ваши действия (ключ API не нужен)
+  python main.py --record --url https://profit.ozon.ru
+                            — то же на другой площадке: запись нужна, чтобы
+                              изучить её интерфейс и научить агента работать с ней
 """
 
 import argparse
@@ -61,7 +64,17 @@ def parse_args() -> argparse.Namespace:
         "--record", action="store_true",
         help="режим записи: агент ничего не нажимает, сохраняет экраны и ваши действия",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--url", default=None,
+        help="с --record: открыть другую площадку вместо TARGET_URL (например, https://profit.ozon.ru)",
+    )
+    args = parser.parse_args()
+    if args.url and not args.record:
+        parser.error("--url работает только вместе с --record: решать задания агент пока умеет только "
+                     "на площадке из TARGET_URL")
+    if args.url and not args.url.startswith(("http://", "https://")):
+        parser.error("--url: нужен полный адрес, например https://profit.ozon.ru")
+    return args
 
 
 if __name__ == "__main__":
@@ -78,7 +91,7 @@ if __name__ == "__main__":
         if args.record:
             from recorder import record
 
-            asyncio.run(record())
+            asyncio.run(record(args.url))
         else:
             asyncio.run(main())
     except KeyboardInterrupt:
