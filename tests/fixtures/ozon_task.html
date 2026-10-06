@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Ozon.Task</title>
+<!-- Копия СТРУКТУРЫ страницы задания task.ozon.ru (Nuxt, Ozon UI «ozi»), снятой с живого сайта:
+     шапка сайта, заголовок проекта, таймер, блоки-карточки с <label><input type=radio>, одна
+     кнопка «Отправить», окно инструкции без role="dialog" (открывается само при первом заходе,
+     с задержкой), экран «закончились задачи». Товары и бренды вымышлены.
+     ?instruction=0 — окно инструкции само не открывается. -->
+<style>
+  body { margin: 0; font: 15px/1.4 Arial, sans-serif; }
+  .ozi__header__header__9Lsuq { height: 96px; border-bottom: 1px solid #ddd; padding: 8px 24px; }
+  .ozi__header__header__9Lsuq a, .ozi__header__header__9Lsuq button { margin-right: 16px; }
+  ._content_441nl_32 { padding: 16px 24px 120px; max-width: 760px; }
+  ._header_aogvx_22 { display: flex; align-items: center; gap: 12px; }
+  ._element_1ch65_2 { border: 1px solid #ccc; border-radius: 12px; padding: 16px; margin: 12px 0; }
+  ._focused_1ch65_21 { border-color: #005bff; }
+  .ozi__radio__container__vMUXU { display: flex; align-items: center; gap: 8px; padding: 4px 0; cursor: pointer; }
+  .ozi__radio__radio__vMUXU { width: 20px; height: 20px; margin: 0; }
+  ._actions_1l70j_16 { position: fixed; left: 0; right: 0; bottom: 0; background: #fff; padding: 12px 24px; }
+  .ozi__button__primary___8pxO { background: #005bff; color: #fff; border: 0; border-radius: 8px; padding: 10px 40px; }
+  .ozi__backdrop__backdrop__H2ks_ { position: fixed; inset: 0; background: rgba(0, 0, 0, .4); }
+  .ozi__window__root__lcYqb { position: fixed; top: 0; right: 0; bottom: 0; width: 560px; background: #fff;
+                              overflow: auto; padding: 24px; }
+  ._figure img { width: 240px; height: 160px; display: block; }
+</style>
+</head>
+<body>
+<div id="__nuxt"></div>
+<div id="teleports"></div>
+<div id="ozi-window-teleport-target" class="ozi__window__target__lcYqb"></div>
+<script>
+const PAGES = [
+  [
+    { kind: 'names', title: 'Джем Ягодная Поляна Клубничный дой-пак 400 г', options: [
+        ['plu:1001', 'Джем Ягодная Поляна клубничный 400г'],
+        ['plu:1002', 'Джем Ягодная Поляна клубничный 300г'],
+        ['plu:1003', 'Джем Ягодная Поляна вишневый 400г'],
+        ['plu:1004', 'Майонез Ягодная Поляна Провансаль 400мл'] ] },
+    { kind: 'names', title: 'Сок Солнечный Сад томат с солью 1 л', options: [
+        ['plu:2001', 'Сок Солнечный Сад яблочный 1л'],
+        ['plu:2002', 'Сок Солнечный Сад томатный 2л'],
+        ['plu:2003', 'Сок Солнечный Сад мультифрукт 1л'] ] },
+  ],
+  [
+    { kind: 'pair', first: 'Напиток Северный Бор морс клюквенный 1 л',
+      second: 'Морс Северный Бор из клюквы 1л', link1: 'https://shop-one.test/p/101', link2: 'https://shop-two.test/p/202',
+      photo: '/static/ozon-photo-1.png' },
+  ],
+];
+const params = new URLSearchParams(location.search);
+let page = 0;
+window.__answers = [];
+
+const h = (html) => { const t = document.createElement('template'); t.innerHTML = html.trim(); return t.content.firstElementChild; };
+const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+const radio = (name, value, label) => `
+  <div><label class="ozi__data-cell__dataCell__sj1El ozi__radio__container__vMUXU ozi-table-500" style="--columns: max-content 1fr;">
+    <div class="ozi__radio__leftContent__vMUXU"><input data-testid="RadioInput-${esc(label)}" class="ozi__radio__radio__vMUXU"
+      type="radio" name="${name}" value="${esc(value)}"></div>
+    <div class="ozi__data-cell__content__sj1El"><div class="ozi__data-content__dataContent__TA_HC">
+      <div class="ozi__data-content__label__TA_HC">${esc(label)}</div></div></div>
+  </label></div>`;
+const text = (label, value, cls) => `
+  <div data-testid="UIText" class="_left_ksrjm_9">${label ? `<div data-testid="FieldLabel" class="_label_oin6w_3 ozi-label-400">${esc(label)}</div>` : ''}
+    <p data-testid="UITextContent" class="_text_ksrjm_2 ${cls || 'ozi-body-400'}">${esc(value)}</p></div>`;
+const divider = (label) => `<div class="_divider_1uuh4_2">${label ? `<div data-testid="FieldLabel" class="_label_oin6w_3">${esc(label)}</div>` : ''}</div>`;
+const link = (href) => `<div><a href="${href}" data-testid="UILink" class="ozi__link__link__eAFdD" target="_blank" rel="noopener noreferrer">${href}</a></div>`;
+
+function card(task, i) {
+  const name = `result_${page}_${i}`;
+  let body = '';
+  if (task.kind === 'names') {
+    body = text('Название товара', task.title, 'ozi-heading-200') + divider('Список вариантов')
+      + text('', 'Выберете название, которое соответсвует товару:', 'ozi-body-500')
+      + '<div class="_group_3j9x5_6">' + task.options.map(([v, l]) => radio(name, v, l)).join('')
+      + radio(name, '__no_match__', 'Нет нужного варианта') + '</div>';
+  } else {
+    body = `<div class="_figure"><figure><img data-testid="UiImage" src="${task.photo}" alt=""></figure></div>`
+      + text('Товар 1', task.first, 'ozi-heading-200') + text('', 'Ссылка на товар:') + link(task.link1) + divider()
+      + text('Товар 2', task.second, 'ozi-heading-200') + text('', 'Ссылка на товар:') + link(task.link2) + divider()
+      + text('', 'Это одинаковые товары?', 'ozi-body-500')
+      + '<div class="_group_3j9x5_6">' + radio(name, '1', 'Да') + radio(name, '0', 'Нет') + '</div>';
+  }
+  return `<div class="_element_1ch65_2 _card_1ch65_8 grid-item-12" tabindex="0"><div class="_content_1ch65_25">
+    <div class="_list_1ynrc_8">${body}</div></div></div>`;
+}
+
+function header() {
+  return `<div class="ozi__header__header__9Lsuq"><div class="ozi__header__container__9Lsuq">
+    <div class="ozi__header__topContent__9Lsuq"><a href="/">Task</a>
+      <div data-testid="streak-counter" class="_wrapper_1mw2d_12">0 дней</div>
+      <a href="https://profit.ozon.test/cabinet/">Оzon Profit</a><a href="https://ozon.test/ozonid">Ozon ID</a>
+      <button data-testid="education-button" type="button">Обучение</button>
+      <button data-testid="bans-button" type="button" aria-label="Блокировки заданий"></button>
+      <button data-testid="notifications-button" type="button" aria-label="Уведомления"></button></div>
+    <div class="ozi__tabs__tabs__PiNzb"><a data-testid="tasks-tab" href="/">Задания</a>
+      <a data-testid="statistics-tab" href="/user/history">Статистика</a>
+      <a data-testid="skills-tab" href="/user/skills">Навыки</a><a data-testid="rewards-tab" href="/user/rewards">Награды</a></div>
+  </div></div>`;
+}
+
+function render() {
+  const nuxt = document.getElementById('__nuxt');
+  const tasks = PAGES[page];
+  let content;
+  if (!tasks) {
+    content = `<div class="grid-container"><article class="_container_kva0r_4 grid-item-12">
+      <section class="_content_kva0r_18"><h1 class="ozi-heading-700 _title_kva0r_22">Вы молодец!</h1>
+      <div class="ozi-body-700 _text_kva0r_26">Ого! В текущем проекте закончились задачи! Возвращайтесь к списку проектов</div>
+      <section class="_footer_kva0r_31"><a href="/" class="ozi__button__button___8pxO ozi__button__primary___8pxO">К списку проектов</a></section>
+      </section></article></div>`;
+  } else {
+    content = `<div class="_container_1l70j_4"><div class="_header_1l70j_66"><div class="grid-container"><div class="_container_aogvx_8">
+      <div class="_header_aogvx_22"><a href="/" class="_backLink_aogvx_29" data-testid="PageHeaderBackLink">Вcе задания</a>
+        <div class="_titleBlock_aogvx_46"><h1 class="_title_aogvx_46 ozi-heading-500">Выбор одинаковых названий товаров</h1></div>
+        <div class="_rightContent_aogvx_77"><div class="_container_1md8u_8">
+          <button data-testid="TasksInstructionButton" class="ozi__button__button___8pxO" onclick="openInstruction()">Инструкция</button>
+          <a href="https://profit.ozon.test/cabinet/chat/?id=1" data-testid="ChatUrlButton" target="_blank" class="ozi__button__button___8pxO">Чат с заказчиком</a>
+        </div></div></div>
+      <div class="_container_jgo9q_4" data-testid="time"><span class="_label_jgo9q_10">Время:</span><span id="timer">29:58</span></div>
+      </div></div></div>
+      <div class="_container_ijpdw_2">${tasks.map(card).join('')}</div>
+      <div class="_actionsContainer_1l70j_16"><div class="_actions_1l70j_16">
+        <button data-testid="TasksSendButton" class="ozi__button__button___8pxO ozi__button__primary___8pxO" onclick="send()">Отправить</button>
+        <p class="_caption_1l70j_30 ozi-body-500" data-testid="TasksPageControlsHint">Отправленные задачи сохраняются в статистике</p>
+      </div></div></div>`;
+  }
+  nuxt.innerHTML = `<div id="app-layout" class="_wrapper_441nl_3">${header()}<div class="_content_441nl_32">${content}</div></div>`;
+}
+
+function send() {
+  const groups = [...new Set([...document.querySelectorAll('input[type=radio]')].map((i) => i.name))];
+  const answers = groups.map((g) => (document.querySelector(`input[name="${g}"]:checked`) || {}).value || '');
+  window.__answers.push(answers);
+  fetch('/api/answers', { method: 'POST', body: JSON.stringify(answers) }).catch(() => {});
+  page += 1;
+  document.getElementById('__nuxt').innerHTML = '';          // как на сайте: блоки пропадают и приходят новые
+  setTimeout(render, 300);
+}
+
+function openInstruction() {
+  const target = document.getElementById('ozi-window-teleport-target');
+  target.innerHTML = `<div class="ozi__backdrop__backdrop__H2ks_ ozi__light__light__2PxEl"></div>
+  <div class="ozi__light__light__2PxEl"><div tabindex="-1" class="ozi__focus-trap__focusTrapWrapper__ZLT5_ ozi__window__root__lcYqb">
+    <div data-testid="InstructionPopup" class="ozi__window__window__lcYqb ozi__drawer__drawer__b9VFS">
+      <div class="_modal_1tmm3_2"><div class="ozi__text-view__textView__SCm2O ozi-heading-400 _title_1tmm3_8">Инструкция
+        <a href="/task/demo/instruction" data-testid="InstructionPopupHeaderLinkButton" target="_blank">Открыть в новой вкладке</a></div>
+      <div class="ozi-body-500">Ознакомьтесь перед выполнением задания</div>
+      <div class="document"><h2>Сравнение названий товаров</h2>
+        <p>Сравните исходное название товара с вариантами из списка и выберите вариант с тем же брендом и теми же
+        ключевыми характеристиками: объём или вес, вкус, жирность, модель, количество в упаковке.</p>
+        <p>Сокращения и опечатки на ценниках допустимы, если товар всё равно понятен. Если среди вариантов нет
+        товара с тем же брендом и характеристиками или название обрезано так, что товар нельзя понять уверенно,
+        выбирайте «Нет нужного варианта».</p>
+        <p>Отличие в одной ключевой характеристике (например, 300 г вместо 400 г) — это другой товар.</p></div>
+      <a href="/task/demo/instruction" data-testid="InstructionPopupFooterLinkButton" target="_blank">Открыть в новой вкладке</a>
+      </div>
+      <button data-testid="InstructionPopupCloseButton" type="button" class="ozi__window__closeIcon__lcYqb"
+        onclick="closeInstruction()"><svg width="16" height="16"><path d="M2 2L14 14M14 2L2 14" stroke="#000"/></svg></button>
+    </div></div></div>`;
+  window.__instructionOpened = (window.__instructionOpened || 0) + 1;
+}
+function closeInstruction() { document.getElementById('ozi-window-teleport-target').innerHTML = ''; }
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeInstruction(); });
+
+// Nuxt рисует страницу не сразу; инструкция при первом заходе открывается ещё позже
+setTimeout(render, 400);
+if (params.get('instruction') !== '0') setTimeout(openInstruction, 1200);
+</script>
+</body>
+</html>

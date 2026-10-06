@@ -45,6 +45,14 @@ SESSION_COOKIE = {"name": "session", "value": "ok", "domain": "klecks-operator.t
                   "sameSite": "None", "secure": True}
 
 
+def launch_options() -> dict:
+    """Браузер тестов: Chromium Playwright, а при BROWSER_CHANNEL=chrome — установленный Chrome
+    (как у агента, когда Chromium не скачивается)."""
+    from config import BROWSER_CHANNEL
+
+    return {"headless": True, **({"channel": BROWSER_CHANNEL} if BROWSER_CHANNEL else {})}
+
+
 def main_url(task: str) -> str:
     return f"https://t-work.test/index.html?task={task}"
 
@@ -187,6 +195,62 @@ async def install_routes(context: BrowserContext) -> None:
             await route.abort()
 
     await context.route("**/*", handle)
+
+
+# ---------------------------------------------------------------------------
+# Ozon Profit: задания в главном фрейме https://task.ozon.test/task/<id>, список проектов —
+# https://task.ozon.test/, вход — https://sso.ozon.test/ (страница с полем телефона)
+# ---------------------------------------------------------------------------
+OZON_TASK_URL = "https://task.ozon.test/task/demo"
+OZON_PROJECTS_URL = "https://task.ozon.test/?sortBy=PROJECT_CARD_SORTING_NEWEST_FIRST"
+OZON_LOGIN_URL = "https://sso.ozon.test/auth/ozonid"
+OZON_LOGIN = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>OZON</title></head><body>
+<h1>Войдите по номеру телефона</h1><label>Телефон <input id="phone" type="tel" placeholder="+7 000 000-00-00"></label>
+<button type="button">Войти</button></body></html>"""
+
+
+def use_platform(monkeypatch, adapter, target_url: str) -> None:
+    """Настройки площадки — как при PLATFORM=… в .env (config читается один раз, при импорте)."""
+    import agent
+    import browser_controller
+    import dom_parser
+
+    for module in (agent, browser_controller, dom_parser):
+        for name, value in adapter.settings.items():
+            if hasattr(module, name):
+                monkeypatch.setattr(module, name, value)
+    monkeypatch.setattr(browser_controller, "TARGET_URL", target_url)
+
+
+def ozon_routes(answers: list) -> Callable[[BrowserContext], Awaitable[None]]:
+    """Подмена task.ozon.test; отправленные ответы страницы задания складываются в answers."""
+
+    async def install(context: BrowserContext) -> None:
+        async def handle(route: Route) -> None:
+            url = urlsplit(route.request.url)
+            host, path = url.hostname or "", url.path
+
+            async def html(body: str) -> None:
+                await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=body)
+
+            if host == "task.ozon.test":
+                if path == "/api/answers":
+                    answers.append(json.loads(route.request.post_data or "[]"))
+                    await route.fulfill(status=200, content_type="application/json", body="{}")
+                elif path.startswith("/static/"):
+                    await route.fulfill(status=200, content_type="image/png", body=png_bytes(path))
+                elif path.startswith("/task/"):
+                    await html((FIXTURES / "ozon_task.html").read_text(encoding="utf-8"))
+                else:
+                    await html((FIXTURES / "ozon_projects.html").read_text(encoding="utf-8"))
+            elif host == "sso.ozon.test":
+                await html(OZON_LOGIN)
+            else:
+                await route.abort()
+
+        await context.route("**/*", handle)
+
+    return install
 
 
 def run(coro: Coroutine[Any, Any, Any]) -> Any:

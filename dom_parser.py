@@ -52,7 +52,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import Frame
 
-from config import FINISH_DENY_SUBSTRINGS, MAX_ELEMENTS, READER_MAX_CHARS
+from config import (DIALOG_SELECTORS, FINISH_DENY_SUBSTRINGS, MAX_ELEMENTS, PAGE_SKIP_SELECTORS, POOL_URL_RE,
+                    READER_MAX_CHARS)
 from models import (
     ElementKind,
     FolderState,
@@ -217,6 +218,11 @@ _JS_SNAPSHOT = r"""
     // ------------------------------------------------- 1. кандидаты
     let selectorOk = true;
     try { document.createElement('div').matches(args.selectors); } catch (e) { selectorOk = false; }
+    // селекторы площадки из .env: ошибочный селектор не должен ронять снимок
+    const validSel = (s) => { if (!s) return ''; try { document.createElement('div').matches(s); return s; } catch (e) { return ''; } };
+    // части страницы вне задания (шапка сайта, чат): модель их не видит и не нажимает
+    const SKIP_SEL = validSel(args.skipSel);
+    const skipped = (el) => !!SKIP_SEL && !!el.closest && !!el.closest(SKIP_SEL);
     const matchesSel = (el) => {
         if (!selectorOk) return false;
         try { return el.matches(args.selectors); } catch (e) { return false; }
@@ -239,6 +245,7 @@ _JS_SNAPSHOT = r"""
         const bySelector = matchesSel(el);
         const byPointer = !bySelector && args.pointer && pointerCandidate(el);
         if (!bySelector && !byPointer) continue;
+        if (skipped(el)) continue;
         const r = visibleRect(el);
         if (!r) { if (bySelector) hiddenCount++; continue; }
         // большие «кликабельные карточки» — не строки
@@ -353,6 +360,9 @@ _JS_SNAPSHOT = r"""
         }
         return '';
     };
+    const CLOSE_CLASS_RE = /(^|[_-])(close|cross|dismiss)/i;
+    const closeIcon = (el) => isButtonish(el)
+        && (tokensOf(el).some((t) => CLOSE_CLASS_RE.test(t)) || /(close|dismiss)/i.test(attr(el, 'data-testid') || ''));
     // tui-select без видимого текста: подпись — placeholder/значение внутреннего input
     const innerField = (el) => (el.querySelector ? el.querySelector('input, textarea, [role="textbox"]') : null);
     const dropdownLabel = (el) => {
@@ -468,8 +478,10 @@ _JS_SNAPSHOT = r"""
         } else if (parent) {
             passUp(rec, parent);                  // прочая безымянная иконка — просто часть строки
         } else if (rec.choice || rec.dropdown || looksLikeToggle(el) || isButtonish(el)) {
-            // одиночная иконка без строки-родителя: подпись — у ближайшего предка с текстом
-            rec.label = contextLabel(el);
+            // одиночная иконка без строки-родителя: подпись — у ближайшего предка с текстом;
+            // крестик окна без текста и aria-label (Ozon: ozi__window__closeIcon) — «Закрыть»,
+            // а не текст всего окна
+            rec.label = closeIcon(el) ? 'Закрыть' : contextLabel(el);
             keep = meaningful(rec.label);
             if (keep && looksLikeToggle(el)) rec.selfToggle = true;
         }
@@ -709,7 +721,9 @@ _JS_SNAPSHOT = r"""
         const ctrl = rec.control || ownQuery(el, 'input[type="radio"], input[type="checkbox"]');
         return !!(ctrl && ctrl.disabled);
     };
-    const DIALOG_SEL = '[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"], tui-dialog';
+    const EXTRA_DIALOG = validSel(args.dialogSel);      // окна площадки без role="dialog" (Ozon)
+    const DIALOG_SEL = '[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"], tui-dialog'
+                     + (EXTRA_DIALOG ? ', ' + EXTRA_DIALOG : '');
     const POPUP_SEL = 'tui-dropdown, tui-data-list, [role="listbox"], [role="menu"], .cdk-overlay-pane';
     const containerOf = (el) => {
         if (!el.closest) return '';
@@ -886,6 +900,7 @@ _JS_SNAPSHOT = r"""
     const IMG_SKIP_RE = /(^|[_-])(icon|logo|avatar|emoji|badge|flag|spinner|loader)([_-]|$)/i;
     for (const n of ALL) {
         if (tagOf(n) !== 'img' || images.length >= 120) continue;
+        if (skipped(n)) continue;
         const src = String(n.currentSrc || n.src || '');
         if (!src || /^data:image\/svg|\.svg(\?|#|$)/i.test(src)) continue;
         if (hasToken(n, IMG_SKIP_RE)) continue;
@@ -965,7 +980,7 @@ _JS_SNAPSHOT = r"""
     try {
         for (const n of document.querySelectorAll(NOTICE_SEL)) {
             if (notices.length >= 12) break;
-            if (!noticeMatches(n) || keptSet.has(n)) continue;
+            if (!noticeMatches(n) || keptSet.has(n) || skipped(n)) continue;
             let inside = false;
             for (const x of noticeIndex.keys()) if (contains(x, n)) { inside = true; break; }
             if (inside) continue;
@@ -1066,6 +1081,7 @@ _JS_SNAPSHOT = r"""
             return;
         }
         if (SKIP_TAGS.has(tag)) return;
+        if (SKIP_SEL && el.matches && el.matches(SKIP_SEL)) return;
         // всплывающие подсказки при наведении — временные, в текст страницы не входят
         if (tag === 'tui-hints' || tag === 'tui-hint' || roleOf(el) === 'tooltip') return;
         const st = styleOf(el);
@@ -1253,6 +1269,17 @@ _ONLY_PHOTOS_RE = re.compile(r"^(?:\s*\[ФОТО \d+(?: не загрузило�
 _GENERIC_HEADINGS = {"выполните задание", "задание", "инструкция", "подробная инструкция"}
 
 
+def _pool_from_url(url: str) -> str:
+    """Ключ вида задания по адресу (POOL_URL_RE): на Ozon вид задания — проект /task/<id>."""
+    if not POOL_URL_RE:
+        return ""
+    try:
+        match = re.search(POOL_URL_RE, urlsplit(url).path)
+    except re.error:
+        return ""
+    return "u" + hashlib.sha1(match.group(0).encode("utf-8")).hexdigest()[:11] if match else ""
+
+
 def _clean_basis(text: str) -> str:
     return normalize_text(_TIMER_RE.sub("", text))
 
@@ -1276,6 +1303,8 @@ class DomParser:
                 "max": _JS_MAX_ELEMENTS,
                 "selectors": INTERACTIVE_SELECTOR,
                 "pointer": True,
+                "dialogSel": ", ".join(DIALOG_SELECTORS),
+                "skipSel": ", ".join(PAGE_SKIP_SELECTORS),
             },
         )
         raw: dict = json.loads(payload)
@@ -1310,6 +1339,8 @@ class DomParser:
             url, reader, elements, images, audios, headings,
         )
         pool_key, pool_title, pool_signature = self._pool(headings, elements, task_text)
+        if pool_key:              # страница уже нарисована: иначе вид задания остался бы без названия
+            pool_key = _pool_from_url(url) or pool_key
         preview = pool_title or preview
         headings = [h.lstrip("#").strip() for h in headings]
 

@@ -46,6 +46,7 @@ from config import (
     LADDER_MIN_ACCURACY,
     LADDER_MIN_TASKS,
     DIALOG_CLOSE_TEXTS,
+    DIALOG_SELECTORS,
     EXIT_CANCEL_TEXTS,
     FINISH_BUTTON_TEXTS,
     FINISH_DENY_SUBSTRINGS,
@@ -61,6 +62,8 @@ from config import (
     MAX_STEPS_PER_TASK,
     MAX_WEB_PER_TASK,
     ORDERS_BUTTON_TEXTS,
+    ORDERS_DONE_TEXTS,
+    PLATFORM,
     READ_INSTRUCTIONS,
     READ_TOOLTIPS,
     START_BUTTON_TEXTS,
@@ -149,9 +152,12 @@ _INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
 _NEW_TAB_RE = re.compile(r"нов(ой|ую|ом) (вкладк|окн)", re.IGNORECASE)     # «Открыть в новой вкладке»
 
 # Всплывающее окно на ГЛАВНОЙ странице сайта (новости, объявления) поверх фрейма задания
+# own — окна самой площадки (DIALOG_SELECTORS): когда задание в главном фрейме (Ozon), инструкцию
+# в таком окне агент читает как диалог задания, а не закрывает как новость
 _JS_PAGE_POPUP = r"""
-() => {
+(own) => {
     const SEL = '[role="dialog"], [aria-modal="true"], dialog[open], tui-dialog, [class*="modal" i]';
+    const ownOf = (d) => { try { return !!own && (!!d.closest(own) || !!d.querySelector(own)); } catch (e) { return false; } };
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const visible = (el) => {
         const r = el.getBoundingClientRect();
@@ -168,6 +174,7 @@ _JS_PAGE_POPUP = r"""
         }
         if (box.width < 150 || box.height < 100 || !visible(d)) continue;
         if (frames.some((f) => d.contains(f))) continue;         // это оболочка самого задания
+        if (ownOf(d)) continue;
         const buttons = [];
         d.querySelectorAll('button, [role="button"], a[href]').forEach((b, i) => {
             if (!visible(b)) return;
@@ -254,6 +261,18 @@ def _label_matches(label: str, texts: tuple[str, ...]) -> bool:
     return any(label == t or label.startswith(t + " ") for t in texts)
 
 
+def _url_tail(url: str) -> str:
+    """Адрес без схемы и домена: «/task» в task.ozon.ru — это домен, а не страница задания."""
+    parts = urlsplit(url or "")
+    return (parts.path + (f"?{parts.query}" if parts.query else "")
+            + (f"#{parts.fragment}" if parts.fragment else "")).lower()
+
+
+def _is_task_url(url: str) -> bool:
+    tail = _url_tail(url)
+    return any(keyword in tail for keyword in TASK_URL_KEYWORDS)
+
+
 @dataclass(frozen=True)
 class TaskIdentity:
     """Что считать «тем же заданием».
@@ -336,7 +355,8 @@ class Agent:
             logger.info("АГЕНТ v4.9 ЗАПУЩЕН. Решаю задания открытого заказа; после заказа %s.",
                         "завершаю работу" if CLOSE_BROWSER_WHEN_DONE else
                         "жду следующий (закончить — закройте окно браузера или Ctrl+C)")
-            logger.info("Шагов с действием максимум: %d, на одно задание: %d", MAX_STEPS, MAX_STEPS_PER_TASK)
+            logger.info("Площадка: %s. Шагов с действием максимум: %d, на одно задание: %d",
+                        PLATFORM.title, MAX_STEPS, MAX_STEPS_PER_TASK)
             logger.info("=" * 60)
             acted = 0
             idle_since: Optional[float] = None
@@ -427,9 +447,16 @@ class Agent:
         # 3. Снимок
         state = await DomParser(frame).parse()
 
-        # 4. Список заказов
-        if self._is_orders_list(state):
+        # 4. Список заказов (или «задачи в проекте закончились»)
+        if self._is_orders_list(state) or self._is_order_done(state):
             return await self._on_orders_list()
+        # Задание в главном фрейме (Ozon): на других страницах сайта — вход в аккаунт, статистика —
+        # агент ничего не делает
+        if frame.parent_frame is None and not _is_task_url(state.frame_url):
+            self._log_idle("Открыта страница сайта, а не задание — жду (если нужен вход в аккаунт, войдите "
+                           "в окне браузера сами и откройте задание кнопкой «Приступить»)")
+            await asyncio.sleep(FRAME_LOAD_WAIT)
+            return StepResult.WAITING
 
         self._refresh_task_context(frame, state)
         self._memory.verify(state)          # фактический результат прошлого действия → в историю
@@ -528,13 +555,24 @@ class Agent:
     @staticmethod
     def _is_orders_list(state: PageState) -> bool:
         """Список заказов: фрейм не на странице задания и есть кнопки «Приступить»."""
-        url = state.frame_url.lower()
-        if any(keyword in url for keyword in TASK_URL_KEYWORDS):
+        if _is_task_url(state.frame_url):
             return False
         return any(
             e.kind == ElementKind.BUTTON and _label_matches(e.text, ORDERS_BUTTON_TEXTS)
             for e in state.elements
         )
+
+    @staticmethod
+    def _is_order_done(state: PageState) -> bool:
+        """«В текущем проекте закончились задачи» (ORDERS_DONE_TEXTS) на месте задания, полей ответа
+        нет — заказ выполнен, как при возврате на список заказов."""
+        if not ORDERS_DONE_TEXTS:
+            return False
+        text = normalize_text(state.task_text)
+        if not any(normalize_text(t) in text for t in ORDERS_DONE_TEXTS):
+            return False
+        answer_kinds = (ElementKind.OPTION, ElementKind.FOLDER, ElementKind.INPUT, ElementKind.DROPDOWN)
+        return not any(e.kind in answer_kinds and e.container == "" for e in state.visible_elements)
 
     async def _on_orders_list(self) -> StepResult:
         """Список заказов: сам заказ агент не выбирает. После выполненного заказа — итог и
@@ -808,7 +846,7 @@ class Agent:
         поверх фрейма задания и перехватывают клики. Закрываем кнопкой «Закрыть/Далее/OK»."""
         page = self._browser.page
         try:
-            popup = await page.main_frame.evaluate(_JS_PAGE_POPUP)
+            popup = await page.main_frame.evaluate(_JS_PAGE_POPUP, ", ".join(DIALOG_SELECTORS))
         except PlaywrightError:
             return False
         if not popup:
@@ -1802,7 +1840,7 @@ class Agent:
             if last.loading:
                 deadline = max(deadline, time.monotonic() + 1.0)   # идёт отправка — ждём дольше
                 continue
-            if self._is_orders_list(last):
+            if self._is_orders_list(last) or self._is_order_done(last):
                 return True, last
             if identity is None or not identity.same_task(TaskIdentity.of(last), submitted=True):
                 return True, last

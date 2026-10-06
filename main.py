@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     )
     args = parser.parse_args()
     if args.url and not args.record:
-        parser.error("--url работает только вместе с --record: решать задания агент пока умеет только "
-                     "на площадке из TARGET_URL")
+        parser.error("--url работает только вместе с --record. Решать задания на другой площадке: "
+                     "PLATFORM=ozon в .env (адрес — TARGET_URL)")
     if args.url and not args.url.startswith(("http://", "https://")):
         parser.error("--url: нужен полный адрес, например https://profit.ozon.ru")
     return args

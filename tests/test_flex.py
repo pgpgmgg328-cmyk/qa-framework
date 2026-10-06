@@ -19,7 +19,7 @@ from dom_parser import DomParser, geo_facts, render_page
 from knowledge import KnowledgeBase
 from media import MediaManager
 from models import ActionType, DecisionContext, ElementKind, LLMDecision, PageState, ParsedElement, PlannedAction
-from tests.helpers import PDF_BYTES, install_routes, run, workspace_url
+from tests.helpers import PDF_BYTES, install_routes, launch_options, run, workspace_url
 
 # ---------------------------------------------------------------------------
 # Помощники
@@ -29,7 +29,7 @@ from tests.helpers import PDF_BYTES, install_routes, run, workspace_url
 @asynccontextmanager
 async def flex_frame(scenario: str, **kw):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(**launch_options())
         context = await browser.new_context(viewport={"width": 1280, "height": 900})
         await install_routes(context)
         page = await context.new_page()
@@ -748,7 +748,7 @@ def test_click_on_a_vanished_element_gives_up_fast():
     больше минуты (две операции по 30 с). Элемента нет — клик сдаётся за секунды."""
     async def scenario():
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
+            browser = await p.chromium.launch(**launch_options())
             page = await browser.new_page()
             await page.set_content("<button id='b' data-agent-id='1-1'>Простота и удобство</button>")
             controller = BrowserController.__new__(BrowserController)

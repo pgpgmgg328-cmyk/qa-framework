@@ -11,13 +11,13 @@ import browser_controller
 from browser_controller import BrowserController
 from dom_parser import DomParser, build_elements_prompt
 from models import ElementKind, FolderState
-from tests.helpers import install_routes, main_url, run
+from tests.helpers import install_routes, launch_options, main_url, run
 
 
 @asynccontextmanager
 async def task_frame(task: str):
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(**launch_options())
         context = await browser.new_context(
             viewport={"width": 1707, "height": 960}, device_scale_factor=0.75,
         )

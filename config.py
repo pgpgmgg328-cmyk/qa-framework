@@ -13,6 +13,8 @@ from typing import Optional
 
 from dotenv import dotenv_values, load_dotenv
 
+from adapters import DEFAULT_PLATFORM, get_platform
+
 PROJECT_DIR = Path(__file__).resolve().parent
 
 # Ищем .env рядом с этим файлом
@@ -41,6 +43,14 @@ def _env_list(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
     if not raw:
         return default
     return tuple(item.strip().lower() for item in raw.split(",") if item.strip())
+
+
+def _env_selectors(name: str, default: tuple[str, ...]) -> tuple[str, ...]:
+    """CSS-селекторы через точку с запятой (внутри селектора бывают запятые), регистр сохраняется."""
+    raw = os.getenv(name)
+    if not raw:
+        return default
+    return tuple(item.strip() for item in raw.split(";") if item.strip())
 
 
 def _env_default(name: str, default: str, old_defaults: tuple[str, ...] = ()) -> str:
@@ -209,9 +219,33 @@ AUDIO_MAX_WAIT: float = float(os.getenv("AUDIO_MAX_WAIT", "600"))   # макс. 
 OPENROUTER_REFERER: str = os.getenv("OPENROUTER_REFERER", "https://localhost/twork-agent")
 
 # ---------------------------------------------------------------------------
+# Площадка: twork (по умолчанию) | ozon. Модуль площадки (adapters/) задаёт значения по
+# умолчанию для настроек ниже — адрес, фреймы, тексты кнопок, признаки окон; .env их перекрывает.
+# ---------------------------------------------------------------------------
+PLATFORM_NAME: str = (os.getenv("PLATFORM") or DEFAULT_PLATFORM).strip().lower()
+try:
+    PLATFORM = get_platform(PLATFORM_NAME)
+    _PLATFORM_ERROR = ""
+except ValueError as _exc:
+    PLATFORM, _PLATFORM_ERROR = get_platform(DEFAULT_PLATFORM), str(_exc)
+_site = PLATFORM.setting
+_TWORK_URL = "https://twork.tbank.ru"
+
+
+def _site_list(name: str, twork_default: tuple[str, ...]) -> tuple[str, ...]:
+    """Список площадки. Значение T-Work, оставшееся в .env из .env.example (его копируют целиком),
+    на другой площадке считается незаданным — берётся значение площадки."""
+    value = _env_list(name, _site(name, twork_default))
+    if PLATFORM.key != DEFAULT_PLATFORM and name in PLATFORM.settings and value == twork_default:
+        return PLATFORM.settings[name]
+    return value
+
+# ---------------------------------------------------------------------------
 # Browser
 # ---------------------------------------------------------------------------
-TARGET_URL: str = os.getenv("TARGET_URL", "https://twork.tbank.ru")
+# адрес T-Work из прежнего .env на другой площадке считается незаданным
+TARGET_URL: str = _env_default("TARGET_URL", _site("TARGET_URL", _TWORK_URL),
+                               () if PLATFORM.key == DEFAULT_PLATFORM else (_TWORK_URL,))
 VIEWPORT_WIDTH: int = int(os.getenv("VIEWPORT_WIDTH", "1280"))
 VIEWPORT_HEIGHT: int = int(os.getenv("VIEWPORT_HEIGHT", "720"))
 HEADLESS: bool = _env_bool("HEADLESS", False)
@@ -252,13 +286,15 @@ SETTLE_TIMEOUT_MS: int = int(os.getenv("SETTLE_TIMEOUT_MS", "4000"))   # вер�
 # Фреймы
 # ---------------------------------------------------------------------------
 # URL целевого фрейма должен содержать одно из этих слов (порядок = приоритет)
-FRAME_KEYWORDS: tuple[str, ...] = _env_list("FRAME_KEYWORDS", ("klecks-operator", "task"))
+FRAME_KEYWORDS: tuple[str, ...] = _site_list("FRAME_KEYWORDS", ("klecks-operator", "task"))
 # URL фреймов, которые нужно игнорировать
 FRAME_IGNORE_KEYWORDS: tuple[str, ...] = _env_list(
     "FRAME_IGNORE_KEYWORDS", ("captcha", "about:blank", "about:srcdoc"),
 )
-# Разрешить работу в главном фрейме, если подходящий iframe не найден
-ALLOW_MAIN_FRAME: bool = _env_bool("ALLOW_MAIN_FRAME", False)
+# Разрешить работу в главном фрейме, если подходящий iframe не найден. В главном фрейме агент
+# решает только на страницах заданий (TASK_URL_KEYWORDS) — вход в аккаунт и прочие страницы
+# сайта он не трогает
+ALLOW_MAIN_FRAME: bool = _env_bool("ALLOW_MAIN_FRAME", _site("ALLOW_MAIN_FRAME", False))
 # Признаки фрейма капчи (проверяются на всей странице, а не по тексту body)
 CAPTCHA_URL_KEYWORDS: tuple[str, ...] = _env_list(
     "CAPTCHA_URL_KEYWORDS",
@@ -292,7 +328,7 @@ START_BUTTON_TEXTS: tuple[str, ...] = _env_list(
 )
 
 # Тексты финальных кнопок (submit) в порядке приоритета
-FINISH_BUTTON_TEXTS: tuple[str, ...] = _env_list(
+FINISH_BUTTON_TEXTS: tuple[str, ...] = _site_list(
     "FINISH_BUTTON_TEXTS",
     ("завершить", "отправить", "сохранить", "готово", "submit", "finish", "save"),
 )
@@ -313,6 +349,11 @@ EXIT_CANCEL_TEXTS: tuple[str, ...] = _env_list(
 DIALOG_CLOSE_TEXTS: tuple[str, ...] = _env_list(
     "DIALOG_CLOSE_TEXTS", ("закрыть", "понятно", "хорошо", "ок", "ok", "готово", "далее", "продолжить"),
 )
+# Окна площадки без role="dialog" / aria-modal (CSS-селекторы через «;»): их агент читает и
+# закрывает как диалоги задания, а не как новости сайта
+DIALOG_SELECTORS: tuple[str, ...] = _env_selectors("DIALOG_SELECTORS", _site("DIALOG_SELECTORS", ()))
+# Части страницы, которые модель не видит и не нажимает: шапка сайта, чат (CSS-селекторы через «;»)
+PAGE_SKIP_SELECTORS: tuple[str, ...] = _env_selectors("PAGE_SKIP_SELECTORS", _site("PAGE_SKIP_SELECTORS", ()))
 
 # ---------------------------------------------------------------------------
 # Список заказов: сюда платформа возвращает после последнего задания заказа
@@ -328,9 +369,14 @@ CLOSE_BROWSER_WHEN_DONE: bool = _env_bool("CLOSE_BROWSER_WHEN_DONE", False)
 # 0.7: к концу тренировки агент накапливает разборы ошибок и отвечает точнее, чем в её начале
 EXAM_MIN_ACCURACY: float = float(_env_default("EXAM_MIN_ACCURACY", "0.7", ("0.8",)))   # «0.8» — из образца до v4.8
 EXAM_MIN_TASKS: int = int(os.getenv("EXAM_MIN_TASKS", "3"))
-# Признаки: в URL фрейма нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
-TASK_URL_KEYWORDS: tuple[str, ...] = _env_list("TASK_URL_KEYWORDS", ("/task",))
-ORDERS_BUTTON_TEXTS: tuple[str, ...] = _env_list("ORDERS_BUTTON_TEXTS", ("приступить",))
+# Признаки: в адресе фрейма (без домена) нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
+TASK_URL_KEYWORDS: tuple[str, ...] = _site_list("TASK_URL_KEYWORDS", ("/task",))
+ORDERS_BUTTON_TEXTS: tuple[str, ...] = _site_list("ORDERS_BUTTON_TEXTS", ("приступить",))
+# Экран «задачи в проекте закончились» на месте задания — заказ выполнен, как возврат на список
+ORDERS_DONE_TEXTS: tuple[str, ...] = _site_list("ORDERS_DONE_TEXTS", ())
+# Вид задания (инструкция, разборы ошибок, статистика тренировки) — по адресу страницы, если он
+# совпадает с этим регулярным выражением (Ozon: /task/<id> — проект). Пусто — по структуре формы
+POOL_URL_RE: str = os.getenv("POOL_URL_RE", _site("POOL_URL_RE", "")).strip()
 
 # ---------------------------------------------------------------------------
 # Инструкции и база знаний (папка knowledge/ — её можно читать и дополнять вручную)
@@ -383,6 +429,8 @@ def validate_config(*, require_llm: bool = True) -> None:
 
     require_llm=False — для режима записи: там LLM не вызывается и ключ не нужен."""
     problems: list[str] = []
+    if _PLATFORM_ERROR:
+        problems.append(_PLATFORM_ERROR)
     if require_llm and not OPENROUTER_API_KEY:
         problems.append("ключ OpenRouter не задан (OPENROUTER_API_KEY) — ключ создаётся на openrouter.ai/keys; "
                         + _missing_key_hint())
@@ -421,6 +469,6 @@ def validate_config(*, require_llm: bool = True) -> None:
 
 
 logger.debug(
-    "Config v4 загружен: model=%s url=%s headless=%s zoom=%.2f",
-    LLM_MODEL, TARGET_URL, HEADLESS, PAGE_ZOOM_FACTOR,
+    "Config v4 загружен: площадка=%s model=%s url=%s headless=%s zoom=%.2f",
+    PLATFORM.key, LLM_MODEL, TARGET_URL, HEADLESS, PAGE_ZOOM_FACTOR,
 )
