@@ -69,6 +69,10 @@ def test_recorder_captures_screens_actions_and_tabs(tmp_path):
     navigation = [json.loads(line) for line in (session / "navigation.jsonl").read_text(encoding="utf-8").splitlines()]
     assert any("task=intro" in n["url"] for n in navigation)
     assert (session / "external" / "001.jpg").exists()
+    # новая вкладка записана полностью (кабинет Ozon открывает проекты в новых вкладках)
+    metas = [json.loads((shot / "meta.json").read_text(encoding="utf-8")) for shot in shots]
+    assert any(m["tab"] == 1 and "task=intro" in m["page_url"] for m in metas)
+    assert metas[0]["tab"] == 0
 
     summary = json.loads((session / "session.json").read_text(encoding="utf-8"))
     assert len(summary["snapshots"]) == len(shots)

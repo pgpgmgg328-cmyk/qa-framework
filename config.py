@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Optional
+from urllib.parse import urlsplit
 
 from dotenv import dotenv_values, load_dotenv
 
@@ -243,9 +244,16 @@ def _site_list(name: str, twork_default: tuple[str, ...]) -> tuple[str, ...]:
 # ---------------------------------------------------------------------------
 # Browser
 # ---------------------------------------------------------------------------
+def _is_twork_url(url: str) -> bool:
+    """Адрес T-Work в любом виде: с «/» на конце, с путём из адресной строки, прежний t-work.ru."""
+    host = (urlsplit(url if "://" in url else "https://" + url).hostname or "").lower()
+    return host in ("twork.tbank.ru", "t-work.ru", "www.t-work.ru") or host.endswith(".twork.tbank.ru")
+
+
 # адрес T-Work из прежнего .env на другой площадке считается незаданным
-TARGET_URL: str = _env_default("TARGET_URL", _site("TARGET_URL", _TWORK_URL),
-                               () if PLATFORM.key == DEFAULT_PLATFORM else (_TWORK_URL,))
+TARGET_URL: str = _env_default("TARGET_URL", _site("TARGET_URL", _TWORK_URL))
+if PLATFORM.key != DEFAULT_PLATFORM and _is_twork_url(TARGET_URL):
+    TARGET_URL = _site("TARGET_URL", _TWORK_URL)
 VIEWPORT_WIDTH: int = int(os.getenv("VIEWPORT_WIDTH", "1280"))
 VIEWPORT_HEIGHT: int = int(os.getenv("VIEWPORT_HEIGHT", "720"))
 HEADLESS: bool = _env_bool("HEADLESS", False)
@@ -336,10 +344,11 @@ FINISH_BUTTON_TEXTS: tuple[str, ...] = _site_list(
 # решению LLM, и не показывает их модели («Завершить смену», «Выйти», «Отправить на
 # доработку» …). Подстроки узкие: «смен» задело бы «Сменить категорию», «работу» —
 # стартовую «Начать работу».
+_DENY_COMMON = ("смену", "смены", "сессию", "сессии", "выйти", "выход", "logout", "аккаунт",
+                "завершить работу", "доработк")
+# площадка может добавить свои (Ozon: «Пропустить» — пропуски ограничены, агент отвечает сам)
 FINISH_DENY_SUBSTRINGS: tuple[str, ...] = _env_list(
-    "FINISH_DENY_SUBSTRINGS",
-    ("смену", "смены", "сессию", "сессии", "выйти", "выход", "logout", "аккаунт",
-     "завершить работу", "доработк"),
+    "FINISH_DENY_SUBSTRINGS", _DENY_COMMON + tuple(_site("EXTRA_DENY_SUBSTRINGS", ())),
 )
 # «Выйти из задания?» — если диалог выхода всё же открылся, агент отвечает «остаться»
 EXIT_CANCEL_TEXTS: tuple[str, ...] = _env_list(
@@ -371,9 +380,15 @@ EXAM_MIN_ACCURACY: float = float(_env_default("EXAM_MIN_ACCURACY", "0.7", ("0.8"
 EXAM_MIN_TASKS: int = int(os.getenv("EXAM_MIN_TASKS", "3"))
 # Признаки: в адресе фрейма (без домена) нет ни одного из TASK_URL_KEYWORDS и есть кнопки «Приступить»
 TASK_URL_KEYWORDS: tuple[str, ...] = _site_list("TASK_URL_KEYWORDS", ("/task",))
+# …но не страницы с этими словами в пути (Ozon: /task/<id>/instruction — инструкция во вкладке)
+NON_TASK_URL_KEYWORDS: tuple[str, ...] = _site_list("NON_TASK_URL_KEYWORDS", ())
 ORDERS_BUTTON_TEXTS: tuple[str, ...] = _site_list("ORDERS_BUTTON_TEXTS", ("приступить",))
 # Экран «задачи в проекте закончились» на месте задания — заказ выполнен, как возврат на список
 ORDERS_DONE_TEXTS: tuple[str, ...] = _site_list("ORDERS_DONE_TEXTS", ())
+# Сообщение платформы о неверном ответе в тренировке, кроме «неверный / неправильный ответ»
+# (Ozon пишет «Для отправки ответа необходимо решить все задания»: неполный ответ агент не отправляет,
+# значит, это неверный)
+WRONG_ANSWER_TEXTS: tuple[str, ...] = _site_list("WRONG_ANSWER_TEXTS", ())
 # Вид задания (инструкция, разборы ошибок, статистика тренировки) — по адресу страницы, если он
 # совпадает с этим регулярным выражением (Ozon: /task/<id> — проект). Пусто — по структуре формы
 POOL_URL_RE: str = os.getenv("POOL_URL_RE", _site("POOL_URL_RE", "")).strip()
@@ -431,6 +446,9 @@ def validate_config(*, require_llm: bool = True) -> None:
     problems: list[str] = []
     if _PLATFORM_ERROR:
         problems.append(_PLATFORM_ERROR)
+    if _site("ALLOW_MAIN_FRAME", False) and not ALLOW_MAIN_FRAME and not FRAME_KEYWORDS:
+        problems.append(f"ALLOW_MAIN_FRAME=false: на площадке {PLATFORM.title} задания открываются в самой "
+                        "странице, без фрейма — агент их никогда не найдёт. Удалите строку ALLOW_MAIN_FRAME из .env")
     if require_llm and not OPENROUTER_API_KEY:
         problems.append("ключ OpenRouter не задан (OPENROUTER_API_KEY) — ключ создаётся на openrouter.ai/keys; "
                         + _missing_key_hint())

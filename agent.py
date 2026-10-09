@@ -36,6 +36,7 @@ from playwright.async_api import Error as PlaywrightError, Frame
 from browser_controller import BrowserController, is_connection_lost
 from config import (
     ACTION_WAIT,
+    ALLOW_MAIN_FRAME,
     AUDIO_PLAY_TO_END,
     AUDIO_TO_MODEL,
     BATCH_ACTIONS,
@@ -61,6 +62,7 @@ from config import (
     MAX_STEPS,
     MAX_STEPS_PER_TASK,
     MAX_WEB_PER_TASK,
+    NON_TASK_URL_KEYWORDS,
     ORDERS_BUTTON_TEXTS,
     ORDERS_DONE_TEXTS,
     PLATFORM,
@@ -69,8 +71,10 @@ from config import (
     START_BUTTON_TEXTS,
     STOP_ON_ORDERS_LIST,
     SUBMIT_WAIT,
+    TARGET_URL,
     TASK_URL_KEYWORDS,
     WEB_RESEARCH,
+    WRONG_ANSWER_TEXTS,
 )
 from documents import DocumentCatcher, describe_documents, describe_page, document_urls, meaningful, page_text
 from dom_parser import DomParser, _plain_text, is_denied_button
@@ -149,6 +153,10 @@ def _exam_outcome(text: str) -> Optional[bool]:
         return True
     return None
 _INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
+# окно входа в аккаунт (сессия истекла): в аккаунт входит только человек
+# («номер телефона» сюда не входит: «найдите номер телефона организации» — обычное задание)
+_LOGIN_RE = re.compile(r"(войти|войдите|вход в (аккаунт|профиль|ozon)|авториз|ozon id|код из (sms|смс)|"
+                       r"(sms|смс)[- ]код|код подтверждения|введите пароль)", re.IGNORECASE)
 _NEW_TAB_RE = re.compile(r"нов(ой|ую|ом) (вкладк|окн)", re.IGNORECASE)     # «Открыть в новой вкладке»
 
 # Всплывающее окно на ГЛАВНОЙ странице сайта (новости, объявления) поверх фрейма задания
@@ -157,7 +165,8 @@ _NEW_TAB_RE = re.compile(r"нов(ой|ую|ом) (вкладк|окн)", re.IGN
 _JS_PAGE_POPUP = r"""
 (own) => {
     const SEL = '[role="dialog"], [aria-modal="true"], dialog[open], tui-dialog, [class*="modal" i]';
-    const ownOf = (d) => { try { return !!own && (!!d.closest(own) || !!d.querySelector(own)); } catch (e) { return false; } };
+    const ownSel = (own || []).filter((s) => { try { document.createElement('div').matches(s); return true; } catch (e) { return false; } }).join(', ');
+    const ownOf = (d) => !!ownSel && (!!d.closest(ownSel) || !!d.querySelector(ownSel));
     const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
     const visible = (el) => {
         const r = el.getBoundingClientRect();
@@ -175,6 +184,8 @@ _JS_PAGE_POPUP = r"""
         if (box.width < 150 || box.height < 100 || !visible(d)) continue;
         if (frames.some((f) => d.contains(f))) continue;         // это оболочка самого задания
         if (ownOf(d)) continue;
+        // окно с полями ввода — форма (вход в аккаунт: «Продолжить» отправило бы SMS), а не новость
+        if (d.querySelector('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]), textarea')) continue;
         const buttons = [];
         d.querySelectorAll('button, [role="button"], a[href]').forEach((b, i) => {
             if (!visible(b)) return;
@@ -261,16 +272,26 @@ def _label_matches(label: str, texts: tuple[str, ...]) -> bool:
     return any(label == t or label.startswith(t + " ") for t in texts)
 
 
+def _is_wrong_answer(text: str) -> bool:
+    """Сообщение платформы о неверном ответе: «Неверный ответ» или текст площадки (WRONG_ANSWER_TEXTS)."""
+    return bool(_WRONG_RE.search(text)) or any(t in normalize_text(text) for t in WRONG_ANSWER_TEXTS)
+
+
 def _url_tail(url: str) -> str:
-    """Адрес без схемы и домена: «/task» в task.ozon.ru — это домен, а не страница задания."""
+    """Путь адреса — без домена («/task» в task.ozon.ru — это домен) и без параметров: у страницы
+    входа в параметрах бывает адрес возврата на задание (…/auth?redirect=https://task…/task/1)."""
+    return urlsplit(url or "").path.lower()
+
+
+def _site_root(url: str) -> str:
     parts = urlsplit(url or "")
-    return (parts.path + (f"?{parts.query}" if parts.query else "")
-            + (f"#{parts.fragment}" if parts.fragment else "")).lower()
+    return f"{parts.scheme}://{parts.netloc}" if parts.netloc else url
 
 
 def _is_task_url(url: str) -> bool:
     tail = _url_tail(url)
-    return any(keyword in tail for keyword in TASK_URL_KEYWORDS)
+    return (any(keyword in tail for keyword in TASK_URL_KEYWORDS)
+            and not any(keyword in tail for keyword in NON_TASK_URL_KEYWORDS))
 
 
 @dataclass(frozen=True)
@@ -284,10 +305,15 @@ class TaskIdentity:
     loose: str
     media: frozenset[str]
     form: str = ""
+    lines: frozenset[str] = frozenset()    # строки текста страницы (без цифр и меток элементов)
 
     @classmethod
     def of(cls, state: PageState) -> "TaskIdentity":
-        return cls(state.content_hash, state.loose_hash, frozenset(state.media_srcs), state.form_hash)
+        lines = frozenset(
+            line for line in (re.sub(r"\d+", "", normalize_text(_plain_text([raw]))) for raw in state.reader)
+            if len(line) >= 3
+        )
+        return cls(state.content_hash, state.loose_hash, frozenset(state.media_srcs), state.form_hash, lines)
 
     def same_task(self, other: "TaskIdentity", *, submitted: bool) -> bool:
         media_related = (not self.media or not other.media or bool(self.media & other.media))
@@ -296,7 +322,15 @@ class TaskIdentity:
         if self.content == other.content:
             # форма изменилась без отправки — это наш же выбор открыл/скрыл поле
             return self.form == other.form or not submitted
+        if not submitted and self._revealed(other):
+            return True
         return self.loose == other.loose and not submitted   # только цифры: таймер, счётчик
+
+    def _revealed(self, other: "TaskIdentity") -> bool:
+        """Ответ открыл (или скрыл) поля, а прежний текст страницы весь на месте: Ozon «Фото ценника
+        читаемое? — Да» добавляет вопросы о ценах. Новое задание прежний текст заменяет."""
+        small, big = sorted((self.lines, other.lines), key=len)
+        return len(small) >= 3 and small <= big
 
 
 class Agent:
@@ -319,6 +353,10 @@ class Agent:
         self._tasks_done = 0
         self._wrong_total = 0
         self._seen_task = False             # агент уже был в задании (для итога заказа на списке заказов)
+        # переход во вкладку с заданием — один раз, до первого задания (см. _follow_task_tab)
+        self._tab_follow = True
+        self._task_site = ""                # сайт заданий, где агент работал (для подсказки в кабинете)
+        self._login_logged = False          # сообщение об окне входа уже выведено
         self._order_mark: Optional[tuple] = None   # начало заказа: (заданий, ошибок, токены, время)
         self._order_train = [0, 0]          # тренировка в этом заказе: верно с первого раза, всего
         self._order_exam: Optional[bool] = None    # итог экзамена в этом заказе
@@ -427,8 +465,14 @@ class Agent:
     # ------------------------------------------------------------------
 
     async def _step(self) -> StepResult:
-        # 1. Окно новостей сайта поверх задания
-        if await self._dismiss_page_popup():
+        # 0. Задание в главном фрейме (Ozon): проект, открытый из кабинета в новой вкладке, — туда
+        if ALLOW_MAIN_FRAME:
+            self._follow_task_tab()
+
+        # 1. Окно новостей сайта поверх задания. Когда задание в главном фрейме, а в окне не
+        # страница задания (вход в Ozon ID, кабинет), окна не трогаем: «Продолжить» в окне входа
+        # отправило бы SMS
+        if (not ALLOW_MAIN_FRAME or _is_task_url(self._browser.page.url)) and await self._dismiss_page_popup():
             return StepResult.IDLE
 
         # 2. Фрейм задания
@@ -453,10 +497,18 @@ class Agent:
         # Задание в главном фрейме (Ozon): на других страницах сайта — вход в аккаунт, статистика —
         # агент ничего не делает
         if frame.parent_frame is None and not _is_task_url(state.frame_url):
-            self._log_idle("Открыта страница сайта, а не задание — жду (если нужен вход в аккаунт, войдите "
-                           "в окне браузера сами и откройте задание кнопкой «Приступить»)")
+            if self._tab_follow:
+                self._log_idle("Открыта страница сайта, а не задание — жду (если нужен вход в аккаунт, войдите "
+                               "в окне браузера сами и откройте задание кнопкой «Приступить»)")
+            else:
+                self._log_idle("Открыта страница сайта, а не задание. Проекты в других вкладках агент после начала "
+                               "работы не берёт (их можно решать самому): чтобы он продолжил, откройте список "
+                               f"проектов в ЭТОЙ вкладке ({self._task_site or _site_root(TARGET_URL)}) и нажмите "
+                               "«Приступить»")
             await asyncio.sleep(FRAME_LOAD_WAIT)
             return StepResult.WAITING
+        if frame.parent_frame is None:
+            self._task_site = _site_root(state.frame_url)       # сюда агента возвращать после кабинета
 
         self._refresh_task_context(frame, state)
         self._memory.verify(state)          # фактический результат прошлого действия → в историю
@@ -464,6 +516,19 @@ class Agent:
         if state.has_captcha and time.monotonic() > self._captcha_suppressed_until:
             await self._wait_captcha_solved()
             return StepResult.IDLE
+
+        # 4а. Окно входа в аккаунт поверх страницы задания в главном фрейме (Ozon: сессия истекла):
+        # в аккаунт входит только человек
+        login = frame.parent_frame is None and self._login_window(state)
+        if login:
+            # ждём сколько нужно (как на странице входа): человек войдёт — агент продолжит сам
+            if not self._login_logged:
+                self._login_logged = True
+                logger.warning("Сайт просит войти в аккаунт — войдите в окне браузера сами, агент подождёт "
+                               "и продолжит после входа")
+            await asyncio.sleep(FRAME_LOAD_WAIT)
+            return StepResult.WAITING
+        self._login_logged = False
 
         # 5. Диалоги поверх задания
         handled = await self._handle_dialog(frame, state)
@@ -501,6 +566,7 @@ class Agent:
             return StepResult.IDLE
         if not self._seen_task:
             self._seen_task = True
+            self._tab_follow = False        # агент начал работать — дальше только своя вкладка
             self._mark_order_start()
 
         # 9. Знания о виде задания: инструкция и подсказки «?» (один раз за запуск)
@@ -563,6 +629,17 @@ class Agent:
         )
 
     @staticmethod
+    def _login_window(state: PageState) -> bool:
+        """Открыто окно входа в аккаунт: поле пароля или телефона, или поле ввода в окне, где речь о
+        входе, коде из SMS, пароле (поля кода часто type=text)."""
+        if not state.dialog_open:
+            return False
+        fields = [e for e in state.visible_elements if e.kind == ElementKind.INPUT and e.container == "dialog"]
+        if any(e.input_type in ("password", "tel") for e in fields):
+            return True
+        return bool(fields) and bool(_LOGIN_RE.search(_plain_text(state.dialog_lines)))
+
+    @staticmethod
     def _is_order_done(state: PageState) -> bool:
         """«В текущем проекте закончились задачи» (ORDERS_DONE_TEXTS) на месте задания, полей ответа
         нет — заказ выполнен, как при возврате на список заказов."""
@@ -586,9 +663,10 @@ class Agent:
             if STOP_ON_ORDERS_LIST and CLOSE_BROWSER_WHEN_DONE:
                 logger.info("%s, агент завершает работу", done)
                 return StepResult.STOP
-            logger.info("%s. Браузер остаётся открытым: откройте следующий заказ («Приступить») — агент "
-                        "продолжит сам. Закончить работу — закройте окно браузера или нажмите Ctrl+C в этом окне.",
-                        done)
+            where = (" в этой же вкладке («К списку проектов» → «Приступить»; проекты в других вкладках агент "
+                     "не трогает — их можно решать самому)" if ALLOW_MAIN_FRAME else " («Приступить»)")
+            logger.info("%s. Браузер остаётся открытым: откройте следующий заказ%s — агент продолжит сам. "
+                        "Закончить работу — закройте окно браузера или нажмите Ctrl+C в этом окне.", done, where)
             self._last_idle_log = time.monotonic()
         else:
             self._log_idle("Открыт список заказов. Выберите заказ и нажмите «Приступить» — агент начнёт решать "
@@ -841,12 +919,38 @@ class Agent:
             note += f" — примерно на {int(left / order_cost + 1e-9)} таких заказов"
         return note
 
+    def _follow_task_tab(self) -> None:
+        """Вкладка агента — вне сайта заданий (кабинет profit.ozon.ru, вход), а в другой вкладке того
+        же окна открыто задание (кабинет открывает проект в новой вкладке): работать там.
+
+        Если агент уже на сайте заданий (список проектов, задание, «закончились задачи»), чужие
+        вкладки этого сайта он не забирает: в них человек может решать проект (экзамен) сам.
+        Следующий проект — в вкладке агента: «К списку проектов» → «Приступить».
+        Переход — только один раз и только пока агент ещё не работал (запустили агента, он ждёт в
+        кабинете, человек открыл проект): иначе из кабинета, куда агент вернулся после закрытой
+        вкладки, он забрал бы проект, который человек открыл для себя."""
+        browser = self._browser
+        current = browser.page.url
+        if not self._tab_follow or _is_task_url(current):
+            return
+        here = (urlsplit(current).hostname or "").lower()
+        search_tab = getattr(self._web, "_page", None)
+        for page in reversed(browser.context.pages):
+            if page is browser.page or page is search_tab or page.is_closed() or not _is_task_url(page.url):
+                continue
+            if (urlsplit(page.url).hostname or "").lower() == here:
+                continue
+            logger.info("Задание открыто в другой вкладке (%s) — перехожу в неё", page.url[:80])
+            browser.adopt_page(page)
+            self._tab_follow = False
+            return
+
     async def _dismiss_page_popup(self) -> bool:
         """Новости/объявления сайта (например, «Одноразовые пароли для TWork») открываются
         поверх фрейма задания и перехватывают клики. Закрываем кнопкой «Закрыть/Далее/OK»."""
         page = self._browser.page
         try:
-            popup = await page.main_frame.evaluate(_JS_PAGE_POPUP, ", ".join(DIALOG_SELECTORS))
+            popup = await page.main_frame.evaluate(_JS_PAGE_POPUP, list(DIALOG_SELECTORS))
         except PlaywrightError:
             return False
         if not popup:
@@ -1039,8 +1143,14 @@ class Agent:
                 await self._browser.wait_settle(frame)
                 return StepResult.ACTED
         size = len(re.sub(r"\s+", "", text))
+        titled = bool(_INSTRUCTION_RE.search(text[:120]))
         instruction = (state.dialog_loading or state.dialog_frames > 0 or size > 700
-                       or (bool(_INSTRUCTION_RE.search(text[:120])) and not start_button))
+                       or (titled and not start_button))
+        if (instruction and not titled and self._memory.instruction_pages == 0
+                and self._pool is not None and self._pool.has_instruction):
+            # инструкция вида уже прочитана, а это большое окно без слова «инструкция» (Ozon:
+            # «Уведомления» — окно того же вида) — не следующая её страница: инструкцию оно не заменяет
+            instruction = False
         if instruction:
             key = normalize_text(text)[:80]
             if self._memory.dialog_attempts[key] < 3:
@@ -1750,6 +1860,23 @@ class Agent:
                     f"Человек в окне браузера сам выбрал ответ {chosen} вместо {rejected} — он слушал запись. "
                     "Ответ человека верный: не меняй его, только отправь задание (submit).")
 
+        # Ozon: на странице до 10 вопросов и одна «Отправить» — пустой блок ушёл бы неверным ответом
+        try:
+            # новый снимок заново размечает элементы: дальше — только по нему (кнопка по ключу)
+            fresh = await DomParser(frame).parse(quiet=True)
+            state, target = fresh, (fresh.by_key(target.key) if target is not None else None)
+        except PlaywrightError:
+            fresh = state
+        missing = self._unanswered_groups(fresh)
+        if missing:
+            hint = "; ".join(f"варианты «{e.label()}»…" for e in self._first_unanswered_options(fresh)[:5])
+            logger.warning("Не отправляю: ответ выбран не во всех вопросах страницы (без ответа: %d)", missing)
+            mem.add(ActionType.SUBMIT, None, result=f"⛔ не отправлено: без ответа вопросов — {missing}")
+            mem.batch_notes.append(f"На странице несколько вопросов, ответ нужен в КАЖДОМ. Без ответа: {missing} "
+                                   f"({hint}). Выбери вариант в каждом из них, потом отправь.")
+            mem.submit_failures += 1
+            return
+
         answer = self._describe_answer(state)
         mode = self._page_mode(state)
         if target is not None and target.kind == ElementKind.BUTTON and self._is_finish_button(target, strict=False):
@@ -1789,11 +1916,17 @@ class Agent:
 
         mem.submit_failures += 1
         errors = [t for t in (after.notice_texts("error", "warning") if after else []) if t not in errors_before]
+        if not errors and after is not None:
+            # то же уведомление о неверном ответе от прошлой попытки ещё на экране — «новым» оно не выглядит
+            errors = [t for t in after.notice_texts("error", "warning") if _is_wrong_answer(t)]
         hints = after.notice_texts("hint") if after else []
-        if any(_WRONG_RE.search(t) for t in errors):
+        if any(_is_wrong_answer(t) for t in errors):
             self._wrong_total += 1
             mem.wrong_answers.append(answer)
-            mem.feedback = errors + [f"Подсказка платформы: {h}" for h in hints]
+            explained = [t if _WRONG_RE.search(t) else
+                         f"Ответ НЕВЕРНЫЙ — платформа его не приняла (её сообщение: «{t}»; ответ был полным, "
+                         "значит, неверен выбор в каком-то из вопросов)" for t in errors]
+            mem.feedback = explained + [f"Подсказка платформы: {h}" for h in hints]
             logger.warning("❌ Платформа: неверный ответ (%s)%s", answer,
                            f"; подсказка: {hints[0][:300]}" if hints else "")
             # разбор ошибки уйдёт в базу знаний, когда станет известен итог задания
@@ -1908,6 +2041,11 @@ class Agent:
 
     async def _handle_budget_exhausted(self, frame: Frame, state: PageState) -> StepResult:
         selected = TaskMemory.selected_options(state)
+        unanswered = self._unanswered_groups(state)
+        if selected and unanswered:
+            return await self._wait_for_human(
+                f"бюджет задания ({MAX_STEPS_PER_TASK} шагов) исчерпан, а ответ выбран не во всех вопросах "
+                f"страницы (без ответа: {unanswered}) — неполный ответ не отправляю")
         if selected and self._memory.submit_failures == 0:
             logger.warning(
                 "Бюджет задания исчерпан — отправляю текущий выбор: %s",
@@ -1916,6 +2054,26 @@ class Agent:
             await self._do_submit(frame, state, None)
             return StepResult.ACTED
         return await self._wait_for_human(f"бюджет задания ({MAX_STEPS_PER_TASK} шагов) исчерпан, ответ не найден")
+
+    @staticmethod
+    def _unanswered_groups(state: PageState) -> int:
+        """Сколько групп radio на странице без выбранного варианта (Ozon: до 10 вопросов на странице)."""
+        groups: dict[str, bool] = {}
+        for e in state.visible_elements:
+            if e.kind == ElementKind.OPTION and e.choice_type == "radio" and e.group and e.container == "":
+                groups[e.group] = groups.get(e.group, False) or e.is_selected
+        return sum(1 for answered in groups.values() if not answered)
+
+    @staticmethod
+    def _first_unanswered_options(state: PageState) -> list[ParsedElement]:
+        """Первый вариант каждой группы radio без ответа — чтобы модель нашла пропущенный вопрос."""
+        answered = {e.group for e in state.visible_elements if e.group and e.is_selected}
+        first: dict[str, ParsedElement] = {}
+        for e in state.visible_elements:
+            if (e.kind == ElementKind.OPTION and e.choice_type == "radio" and e.group and e.container == ""
+                    and e.group not in answered):
+                first.setdefault(e.group, e)
+        return list(first.values())
 
     async def _wait_for_human(self, reason: str) -> StepResult:
         """Агент сам не справится: сказать почему и ждать, пока человек не сменит задание."""

@@ -207,6 +207,30 @@ OZON_LOGIN_URL = "https://sso.ozon.test/auth/ozonid"
 OZON_LOGIN = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>OZON</title></head><body>
 <h1>Войдите по номеру телефона</h1><label>Телефон <input id="phone" type="tel" placeholder="+7 000 000-00-00"></label>
 <button type="button">Войти</button></body></html>"""
+# вход в окне поверх страницы: «Продолжить» отправило бы SMS (агент нажимает такие кнопки в окнах новостей)
+OZON_LOGIN_DIALOG = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>OZON ID</title></head><body>
+<div role="dialog" aria-modal="true" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center">
+<form style="width:400px;height:260px;background:#fff;padding:24px" onsubmit="event.preventDefault()">
+<h2>Войдите по номеру телефона</h2><input id="phone" type="tel" placeholder="+7 000 000-00-00">
+<button type="button" onclick="window.__sent = (window.__sent || 0) + 1">Продолжить</button></form></div></body></html>"""
+# код из SMS — четыре поля type=text (так поля кода часто делают): без tel/password в разметке
+OZON_LOGIN_CODE = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>OZON ID</title></head><body>
+<div role="dialog" aria-modal="true" style="position:fixed;inset:0;display:flex;align-items:center;justify-content:center">
+<form style="width:400px;height:260px;background:#fff;padding:24px" onsubmit="event.preventDefault()">
+<h2>Введите код из SMS</h2>""" + "".join(
+    '<input type="text" inputmode="numeric" autocomplete="one-time-code" maxlength="1" style="width:40px">'
+    for _ in range(4)) + """<button type="button" onclick="window.__sent = (window.__sent || 0) + 1">Подтвердить</button>
+</form></div></body></html>"""
+# окно САМОГО задания с полем ввода и словами «номер телефона» — не вход в аккаунт
+OZON_TASK_DIALOG = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Ozon.Task</title></head><body>
+<h1>Проверка карточки организации</h1><div role="dialog" aria-modal="true" style="position:fixed;inset:0;
+display:flex;align-items:center;justify-content:center"><form style="width:480px;height:260px;background:#fff;
+padding:24px" onsubmit="event.preventDefault()"><h2>Уточните данные</h2><p>Найдите на сайте организации номер телефона
+и впишите его в поле.</p><input id="org" type="text" placeholder="Телефон организации">
+<button type="button">Сохранить</button></form></div></body></html>"""
+OZON_CABINET = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Ozon Profit</title></head><body>
+<h1>Задания</h1><a id="go" href="https://task.ozon.test/task/demo?instruction=0" target="_blank">Начать задания</a>
+</body></html>"""
 
 
 def use_platform(monkeypatch, adapter, target_url: str) -> None:
@@ -215,10 +239,15 @@ def use_platform(monkeypatch, adapter, target_url: str) -> None:
     import browser_controller
     import dom_parser
 
+    import config
+
     for module in (agent, browser_controller, dom_parser):
         for name, value in adapter.settings.items():
             if hasattr(module, name):
                 monkeypatch.setattr(module, name, value)
+        extra = tuple(adapter.settings.get("EXTRA_DENY_SUBSTRINGS", ()))
+        if extra and hasattr(module, "FINISH_DENY_SUBSTRINGS"):
+            monkeypatch.setattr(module, "FINISH_DENY_SUBSTRINGS", config._DENY_COMMON + extra)
     monkeypatch.setattr(browser_controller, "TARGET_URL", target_url)
 
 
@@ -237,14 +266,24 @@ def ozon_routes(answers: list) -> Callable[[BrowserContext], Awaitable[None]]:
                 if path == "/api/answers":
                     answers.append(json.loads(route.request.post_data or "[]"))
                     await route.fulfill(status=200, content_type="application/json", body="{}")
+                elif path.startswith("/lazy/"):          # миниатюра, которую браузер ещё не загрузил
+                    await route.abort()
                 elif path.startswith("/static/"):
                     await route.fulfill(status=200, content_type="image/png", body=png_bytes(path))
+                elif path.endswith("/expired"):          # сессия истекла: вход окном поверх задания
+                    await html(OZON_LOGIN_DIALOG)
+                elif path.endswith("/expired-code"):
+                    await html(OZON_LOGIN_CODE)
+                elif path.endswith("/org-dialog"):
+                    await html(OZON_TASK_DIALOG)
                 elif path.startswith("/task/"):
                     await html((FIXTURES / "ozon_task.html").read_text(encoding="utf-8"))
                 else:
                     await html((FIXTURES / "ozon_projects.html").read_text(encoding="utf-8"))
             elif host == "sso.ozon.test":
-                await html(OZON_LOGIN)
+                await html(OZON_LOGIN_DIALOG if path.endswith("/dialog") else OZON_LOGIN)
+            elif host == "profit.ozon.test":
+                await html(OZON_CABINET)
             else:
                 await route.abort()
 

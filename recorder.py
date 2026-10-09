@@ -260,6 +260,7 @@ class Recorder:
         self._stop = asyncio.Event()
         self._background: set[asyncio.Task] = set()
         self._watched_pages: set[int] = set()
+        self._active_hint: Optional[Page] = None    # вкладка с последним действием человека / новая вкладка
         self._external_shots = 0
         self._nav_count = 0
         self.snapshots = 0
@@ -309,7 +310,7 @@ class Recorder:
 
     async def _loop(self) -> None:
         while not self._stop.is_set() and self.snapshots < _MAX_SNAPSHOTS:
-            if self._browser.is_closed():
+            if self._browser.is_closed() and not self._adopt_open_tab():
                 logger.info("Окно браузера закрыто — завершаю запись")
                 break
             try:
@@ -351,6 +352,7 @@ class Recorder:
 
     async def _tick(self) -> None:
         await self._collect_events()
+        await self._follow_active_tab()
         frame, where = await self._pick_frame()
         state = await DomParser(frame).parse(quiet=True)
         signature = self._signature(state, frame, where)
@@ -365,6 +367,41 @@ class Recorder:
         await self._collect_events()      # действия до смены экрана — к старому снимку
         self._close_current()
         await self._save_snapshot(frame, where, state, signature)
+
+    def _adopt_open_tab(self) -> bool:
+        """Записываемую вкладку закрыли — запись продолжается в любой открытой вкладке окна."""
+        try:
+            pages = [p for p in self._browser.context.pages if not p.is_closed()]
+        except (AssertionError, PlaywrightError):
+            return False
+        if not pages:
+            return False
+        self._browser.adopt_page(pages[-1])
+        return True
+
+    async def _follow_active_tab(self) -> None:
+        """Записывается вкладка, которую человек сейчас видит: кабинет Ozon открывает проекты в новых
+        вкладках, поиск в интернете — тоже. В обычном окне видна только вкладка на переднем плане; если
+        видимых несколько (два окна, окно без интерфейса) — та, где было последнее действие или которая
+        только что открылась."""
+        browser = self._browser
+        visible: list[Page] = []
+        for page in [p for p in browser.context.pages if not p.is_closed()]:
+            try:
+                state = await asyncio.wait_for(page.evaluate("() => document.visibilityState"), timeout=2.0)
+            except (PlaywrightError, asyncio.TimeoutError):
+                continue
+            if state == "visible":
+                visible.append(page)
+        if len(visible) == 1:
+            active = visible[0]
+        elif self._active_hint is not None and self._active_hint in visible:
+            active = self._active_hint
+        else:
+            return
+        if active is not browser.page:
+            browser.adopt_page(active)
+            logger.info("   🗂 записываю вкладку: %s", active.url[:120])
 
     async def _pick_frame(self) -> tuple[Frame, str]:
         """Фрейм задания по FRAME_KEYWORDS; если его нет — крупнейший видимый iframe
@@ -430,9 +467,11 @@ class Recorder:
                 continue
             frames.append(f.url)
             self._frames_seen[f.url] = self._frames_seen.get(f.url, 0) + 1
+        pages = self._browser.context.pages
         meta = {
             "n": self.snapshots,
             "time": datetime.now().isoformat(timespec="seconds"),
+            "tab": pages.index(page) if page in pages else -1,   # номер вкладки окна (0 — первая)
             "where": where,                       # task | iframe | main
             "page_url": page.url,
             "frame_url": frame.url,
@@ -498,14 +537,15 @@ class Recorder:
     async def _collect_events(self) -> None:
         pages = list(self._browser.context.pages)
         for page_index, page in enumerate(pages):
-            frames = page.frames if page is self._browser.page else [page.main_frame]
-            for frame in frames:
+            for frame in page.frames:
                 if frame.is_detached():
                     continue
                 try:
                     events = await frame.evaluate(_JS_PULL_EVENTS)
                 except PlaywrightError:
                     continue
+                if events:
+                    self._active_hint = page
                 for event in events:
                     event["page"] = page_index
                     self._attach(event)
@@ -545,6 +585,7 @@ class Recorder:
 
     def _on_new_page(self, page: Page) -> None:
         self._watch_page(page)
+        self._active_hint = page              # новую вкладку человек обычно сразу смотрит
         self._log_navigation(page, page.url, "new_tab")
 
     def _on_navigated(self, page: Page, frame: Frame) -> None:

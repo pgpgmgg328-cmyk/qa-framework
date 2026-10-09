@@ -144,6 +144,7 @@ class ParsedElement(BaseModel):
     value:        str          = Field("",   description="Текущее значение поля ввода")
     input_type:   str          = Field("",   description="text/textarea/number/select/…")
     choice_type:  str          = Field("",   description="radio/checkbox для OPTION")
+    group:        str          = Field("",   description="Группа radio (name) — один ответ на группу")
     options:      list[str]    = Field(default_factory=list, description="Варианты нативного select")
     container:    str          = Field("",   description="dialog/popup/''")
     selectable:   bool         = Field(False, description="Папку можно выбрать как ответ")

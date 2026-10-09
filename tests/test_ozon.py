@@ -20,7 +20,7 @@ import agent as agent_module
 from adapters import get_platform
 from adapters.ozon_profit import OzonProfitAdapter
 from adapters.twork import TWorkAdapter
-from agent import Agent, StepResult, _url_tail
+from agent import Agent, StepResult, TaskIdentity, _url_tail
 from browser_controller import BrowserController
 from dom_parser import DomParser, render_page
 from knowledge import KnowledgeBase
@@ -120,13 +120,35 @@ def test_platform_settings_override_values_copied_from_twork_env_example():
     # своё значение в .env сильнее площадки
     own = _config_in_subprocess(PLATFORM="ozon", TARGET_URL="https://task.ozon.ru/?activeOnly=true")
     assert own["TARGET_URL"] == "https://task.ozon.ru/?activeOnly=true"
+    # адрес T-Work в любом виде: с «/», из адресной строки, прежний t-work.ru
+    for old in ("https://twork.tbank.ru/", "https://twork.tbank.ru/orders", "https://t-work.ru"):
+        assert _config_in_subprocess(PLATFORM="ozon", TARGET_URL=old)["TARGET_URL"] == "https://task.ozon.ru"
+        assert _config_in_subprocess(PLATFORM="", TARGET_URL=old)["TARGET_URL"] == old
+
+
+def test_main_frame_switched_off_on_ozon_is_a_startup_error():
+    """ALLOW_MAIN_FRAME=false (строка из .env.example) на Ozon: задание агент не нашёл бы никогда —
+    не тихое ожидание, а понятная ошибка при запуске."""
+    code = "import config; config.validate_config(require_llm=False)"
+    root = Path(__file__).resolve().parents[1]
+    bad = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, encoding="utf-8",
+                         env={**os.environ, "PLATFORM": "ozon", "ALLOW_MAIN_FRAME": "false"})
+    assert bad.returncode != 0 and "ALLOW_MAIN_FRAME" in bad.stderr
+    ok = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, encoding="utf-8",
+                        env={**os.environ, "PLATFORM": "", "ALLOW_MAIN_FRAME": "false"})
+    assert ok.returncode == 0, ok.stderr
 
 
 def test_task_url_is_checked_without_domain(monkeypatch):
     """«/task» в домене task.ozon.ru — не страница задания: иначе список проектов не узнаётся."""
-    assert _url_tail("https://task.ozon.ru/?sortBy=X") == "/?sortby=x"
+    assert _url_tail("https://task.ozon.ru/?sortBy=X") == "/"
     use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL)
     assert not agent_module._is_task_url("https://task.ozon.ru/")
+    # адрес возврата на задание в параметрах страницы входа — не страница задания
+    assert not agent_module._is_task_url("https://sso.ozon.ru/auth/ozonid?redirect=https://task.ozon.ru/task/bd75")
+    assert not agent_module._is_task_url("https://sso.ozon.ru/auth#https://task.ozon.ru/task/bd75")
+    # инструкция проекта, открытая во вкладке
+    assert not agent_module._is_task_url("https://task.ozon.ru/task/bd75/instruction")
     assert not agent_module._is_task_url("https://profit.ozon.ru/cabinet/tasks")
     assert agent_module._is_task_url("https://task.ozon.ru/task/bd75")
     # T-Work: как раньше
@@ -175,6 +197,27 @@ def test_task_page_snapshot_hides_site_header_and_reads_instruction_window(monke
     assert any("«Джем Ягодная Поляна клубничный 400г»" in line for line in lines[jam:juice])
     assert len(options(plain, "Нет нужного варианта")) == 2
     assert all(e.choice_type == "radio" for e in options(plain, "Нет нужного варианта"))
+
+
+def test_bad_selector_from_env_is_dropped_alone(monkeypatch):
+    """Селектор, который браузер не понимает (синтаксис Playwright :has-text), отбрасывается один —
+    шапка по-прежнему скрыта, окно инструкции по-прежнему диалог."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL)
+    import dom_parser
+    monkeypatch.setattr(dom_parser, "PAGE_SKIP_SELECTORS",
+                        OzonProfitAdapter.settings["PAGE_SKIP_SELECTORS"] + ('button:has-text("Обучение")',))
+    monkeypatch.setattr(dom_parser, "DIALOG_SELECTORS",
+                        OzonProfitAdapter.settings["DIALOG_SELECTORS"] + ('div:has-text("Инструкция")',))
+
+    async def scenario():
+        async with ozon_page(OZON_TASK_URL) as page:
+            await page.wait_for_function("() => !!document.querySelector('[data-testid=InstructionPopup]')")
+            return await DomParser(page.main_frame).parse()
+
+    state = run(scenario())
+    assert state.dialog_open
+    labels = {e.text for e in state.visible_elements}
+    assert not labels & {"Обучение", "Статистика", "Чат с заказчиком"}
 
 
 def test_projects_list_is_orders_list_and_done_screen_ends_order(monkeypatch):
@@ -274,6 +317,333 @@ def test_agent_does_not_touch_login_or_projects_list(tmp_path, monkeypatch):
             phone = await page.evaluate("() => (document.getElementById('phone') || {}).value || ''")
         return results, llm, phone
 
-    for url in (OZON_LOGIN_URL, OZON_PROJECTS_URL):
+    login_back = OZON_LOGIN_URL + "?redirect=https://task.ozon.test/task/demo"
+    for url in (OZON_LOGIN_URL, login_back, OZON_PROJECTS_URL):
         results, llm, phone = run(steps(url))
-        assert results == [StepResult.WAITING] * 3 and llm.calls == [] and phone == ""
+        assert results == [StepResult.WAITING] * 3 and llm.calls == [] and phone == "", url
+
+
+def test_login_window_buttons_are_not_pressed(tmp_path, monkeypatch):
+    """Вход в окне поверх страницы: «Продолжить» в нём агент не нажимает (как кнопку окна новостей)."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_LOGIN_URL + "/dialog")
+    monkeypatch.setattr(agent_module, "FRAME_LOAD_WAIT", 0.1)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), [])
+        async with agent._browser:
+            page = agent._browser.page
+            await page.wait_for_load_state("load")
+            results = [await agent._step() for _ in range(3)]
+            sent = await page.evaluate("() => window.__sent || 0")
+        return results, llm, sent
+
+    results, llm, sent = run(scenario())
+    assert results == [StepResult.WAITING] * 3 and llm.calls == [] and sent == 0
+
+
+@pytest.mark.parametrize("variant", ["expired", "expired-code"])
+def test_login_window_over_task_page_waits_for_human(tmp_path, monkeypatch, variant):
+    """Сессия истекла — вход окном поверх страницы задания (телефон type=tel; код из SMS в полях
+    type=text): кнопки окна не нажимаются, модель не зовётся, в поля ничего не вводится."""
+    use_platform(monkeypatch, OzonProfitAdapter, f"https://task.ozon.test/task/demo/{variant}")
+    monkeypatch.setattr(agent_module, "FRAME_LOAD_WAIT", 0.1)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), [])
+        async with agent._browser:
+            page = agent._browser.page
+            await page.wait_for_load_state("load")
+            results = [await agent._step() for _ in range(3)]
+            sent = await page.evaluate("() => window.__sent || 0")
+            typed = await page.evaluate("() => [...document.querySelectorAll('input')].map((i) => i.value).join('')")
+        return results, llm, sent, typed
+
+    results, llm, sent, typed = run(scenario())
+    assert results == [StepResult.WAITING] * 3 and llm.calls == [] and sent == 0 and typed == ""
+
+
+def test_task_window_about_phone_number_is_not_a_login(tmp_path, monkeypatch):
+    """Окно задания «найдите номер телефона и впишите в поле» — работа для модели, а не вход."""
+    use_platform(monkeypatch, OzonProfitAdapter, "https://task.ozon.test/task/demo/org-dialog")
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), [])
+        async with agent._browser:
+            await agent._browser.page.wait_for_load_state("load")
+            for _ in range(3):
+                await agent._step()
+                if llm.calls:
+                    break
+        return llm
+
+    llm = run(scenario())
+    assert llm.calls and llm.calls[0][0].dialog_open
+
+
+def test_budget_exhausted_does_not_send_partial_page(tmp_path, monkeypatch):
+    """Лимит шагов на задание кончился, а ответ выбран не во всех вопросах страницы: агент не
+    отправляет неполный ответ (пустые блоки — неверные ответы), а просит человека."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL + "?instruction=0")
+    monkeypatch.setattr(agent_module, "MAX_STEPS_PER_TASK", 2)
+    monkeypatch.setattr(agent_module, "MAX_IDLE_SECONDS", 1)
+    answers: list = []
+
+    def policy(state: PageState, ctx: DecisionContext) -> LLMDecision:
+        jam = options(state, "Джем Ягодная Поляна клубничный 400г")[0]
+        if jam.is_selected:
+            return LLMDecision.skip("ищу ответ для второго товара")
+        return LLMDecision(reasoning="сценарий", action=ActionType.CLICK, target_index=jam.index, target_text=jam.text)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, answers)
+        async with agent._browser:
+            page = agent._browser.page
+            await page.wait_for_selector("[data-testid=TasksSendButton]")
+            for _ in range(6):
+                await agent._step()
+            state = await DomParser(page.main_frame).parse()
+        return state
+
+    state = run(scenario())
+    assert answers == []
+    assert Agent._unanswered_groups(state) == 1
+    assert {e.group for e in state.visible_elements if e.kind == ElementKind.OPTION} == {"result_0_0", "result_0_1"}
+
+
+def test_model_submit_with_unanswered_block_is_held_back(tmp_path, monkeypatch):
+    """Модель отметила ответ только в первом блоке и нажала «Отправить»: агент не отправляет, а
+    говорит модели, какой вопрос без ответа; ответ на все блоки — уходит."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL + "?instruction=0")
+    answers: list = []
+
+    def policy(state: PageState, ctx: DecisionContext) -> LLMDecision:
+        jam = options(state, "Джем Ягодная Поляна клубничный 400г")[0]
+        if not any("ответ нужен в КАЖДОМ" in n for n in ctx.notes):
+            return answer(click(jam), state=state)                 # забыла второй товар
+        no_juice = options(state, "Нет нужного варианта")[-1]
+        return answer(click(no_juice), state=state)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, answers)
+        async with agent._browser:
+            await agent._browser.page.wait_for_selector("[data-testid=TasksSendButton]")
+            for _ in range(6):
+                await agent._step()
+                if answers:
+                    break
+        return llm
+
+    llm = run(scenario())
+    assert answers == [["plu:1001", "__no_match__"]]
+    notes = [n for _, ctx in llm.calls for n in ctx.notes if "ответ нужен в КАЖДОМ" in n]
+    assert notes and "Без ответа: 1" in notes[0] and "Сок Солнечный Сад" in notes[0]
+
+
+def test_rejected_answer_toast_is_a_wrong_answer(tmp_path, monkeypatch):
+    """Тренировка Ozon не принимает неверный ответ: задание то же, всплывает «Ошибка — Для отправки
+    ответа необходимо решить все задания». Агент понимает это как «неверно», говорит модели и не
+    повторяет ответ; верный — уходит."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL + "?instruction=0&check=1")
+    answers: list = []
+
+    def policy(state: PageState, ctx: DecisionContext) -> LLMDecision:
+        if "Джем Ягодная Поляна" not in state.task_text:
+            return answer(click(options(state, "Да")[0]), state=state)
+        no_juice = options(state, "Нет нужного варианта")[-1]
+        jam = options(state, "Джем Ягодная Поляна клубничный 300г" if not ctx.feedback
+                      else "Джем Ягодная Поляна клубничный 400г")[0]
+        return answer(click(jam), click(no_juice), state=state)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, answers)
+        await asyncio.wait_for(agent.run(), timeout=90)
+        return agent, llm
+
+    agent, llm = run(scenario())
+    assert answers == [["plu:1001", "__no_match__"], ["1"]] and agent._wrong_total == 1
+    fixed = next(ctx for _, ctx in llm.calls if ctx.feedback)
+    assert any("НЕВЕРНЫЙ" in f and "необходимо решить все задания" in f for f in fixed.feedback)
+    assert fixed.wrong_answers and "300г" in fixed.wrong_answers[0]
+
+
+def test_revealed_questions_gallery_thumbnails_and_skip_button(monkeypatch):
+    """«Да» открывает новые вопросы — это то же задание; миниатюры галереи (ещё не загружены) — фото
+    для модели, одно фото дважды не считается; «Пропустить» модель не видит."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL)
+
+    async def scenario():
+        async with ozon_page(OZON_TASK_URL + "?instruction=0&mode=reveal") as page:
+            await page.wait_for_selector("[data-testid=TasksSendButton]")
+            before = await DomParser(page.main_frame).parse()
+            await page.get_by_text("Да", exact=True).click()
+            await page.wait_for_selector("text=Нет ошибок")
+            after = await DomParser(page.main_frame).parse()
+            return before, after
+
+    before, after = run(scenario())
+    assert TaskIdentity.of(before).same_task(TaskIdentity.of(after), submitted=False)
+    srcs = [i.src for i in before.images]
+    assert len(srcs) == 4 and sum("/lazy/thumb-" in s for s in srcs) == 3
+    text, shown = render_page(before)
+    assert not any("Пропустить" in e.text for e in shown) and "Отправить" in {e.text for e in shown}
+
+
+def test_agent_keeps_answer_when_question_is_revealed(tmp_path, monkeypatch):
+    """Ответ «Да» открыл вопрос — агент не считает это новым заданием: память и план сохраняются,
+    модель отвечает на открывшийся вопрос, ответ уходит целиком."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL + "?instruction=0&mode=reveal&check=1")
+    answers: list = []
+
+    def policy(state: PageState, ctx: DecisionContext) -> LLMDecision:
+        ok = options(state, "Нет ошибок")
+        if not ok:
+            return LLMDecision(reasoning="сценарий", action=ActionType.CLICK, plan="фото читаемое, сверю цену",
+                               target_index=options(state, "Да")[0].index, target_text="Да")
+        return answer(click(ok[0]), state=state)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, answers)
+        await asyncio.wait_for(agent.run(), timeout=90)
+        return llm
+
+    llm = run(scenario())
+    assert answers == [["yes", "ok"]]
+    second = llm.calls[1][1]
+    assert second.plan == "фото читаемое, сверю цену" and second.history
+
+
+def test_agent_that_has_worked_takes_no_new_tabs(tmp_path, monkeypatch):
+    """Агент уже решал (вкладку проекта закрыли — он вернулся в кабинет), а человек открыл проект
+    (экзамен) в новой вкладке для себя: агент его не забирает."""
+    use_platform(monkeypatch, OzonProfitAdapter, "https://profit.ozon.test/cabinet/")
+    monkeypatch.setattr(agent_module, "FRAME_LOAD_WAIT", 0.1)
+    answers: list = []
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), answers)
+        agent._tab_follow = False                         # как после первого задания
+        async with agent._browser:
+            browser = agent._browser
+            cabinet = browser.page
+            async with browser.context.expect_page() as info:
+                await cabinet.click("#go")
+            users_tab = await info.value
+            await users_tab.wait_for_selector("[data-testid=TasksSendButton]")
+            results = [await agent._step() for _ in range(3)]
+            return results, browser.page is cabinet, llm
+
+    results, stayed, llm = run(scenario())
+    assert stayed and results == [StepResult.WAITING] * 3 and llm.calls == [] and answers == []
+
+
+def test_project_in_users_own_tab_is_not_taken(tmp_path, monkeypatch):
+    """Агент ждёт на списке проектов, а человек в другой вкладке сам решает проект (экзамен): агент
+    его вкладку не забирает и ответов не отправляет."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_PROJECTS_URL)
+    monkeypatch.setattr(agent_module, "FRAME_LOAD_WAIT", 0.1)
+    answers: list = []
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), answers)
+        async with agent._browser:
+            browser = agent._browser
+            agents_tab = browser.page
+            users_tab = await browser.context.new_page()
+            await users_tab.goto(OZON_TASK_URL + "?instruction=0")
+            await users_tab.wait_for_selector("[data-testid=TasksSendButton]")
+            results = [await agent._step() for _ in range(3)]
+            return results, browser.page is agents_tab, llm
+
+    results, stayed, llm = run(scenario())
+    assert stayed and results == [StepResult.WAITING] * 3 and llm.calls == [] and answers == []
+
+
+def test_closing_project_tab_returns_to_cabinet_only(tmp_path, monkeypatch):
+    """Вкладку проекта закрыли: агент продолжает в кабинете (другой сайт), но не во вкладке того же
+    сайта заданий — там может работать человек; если остались только такие, окно для агента закрыто."""
+    use_platform(monkeypatch, OzonProfitAdapter, "https://profit.ozon.test/cabinet/")
+
+    async def scenario():
+        agent, _ = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), [])
+        async with agent._browser:
+            browser = agent._browser
+            cabinet = browser.page
+            project = await browser.context.new_page()
+            await project.goto(OZON_TASK_URL + "?instruction=0")
+            browser.adopt_page(project)
+            await project.close()
+            back_to_cabinet = not browser.is_closed() and browser.page is cabinet
+
+            users_tab = await browser.context.new_page()
+            await users_tab.goto(OZON_PROJECTS_URL)
+            project = await browser.context.new_page()
+            await project.goto(OZON_TASK_URL + "?instruction=0")
+            browser.adopt_page(project)
+            await cabinet.close()
+            await project.close()
+            stopped = browser.is_closed()
+            return back_to_cabinet, stopped
+
+    back_to_cabinet, stopped = run(scenario())
+    assert back_to_cabinet and stopped
+
+
+def test_project_opened_in_new_tab_is_followed(tmp_path, monkeypatch):
+    """Кабинет открывает проект в новой вкладке — агент переходит в неё и решает задание."""
+    use_platform(monkeypatch, OzonProfitAdapter, "https://profit.ozon.test/cabinet/")
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, lambda *a: LLMDecision.skip("-"), [])
+        async with agent._browser:
+            browser = agent._browser
+            async with browser.context.expect_page() as info:
+                await browser.page.click("#go")                  # человек открыл проект
+            tab = await info.value
+            await tab.wait_for_selector("[data-testid=TasksSendButton]")
+            for _ in range(4):
+                await agent._step()
+                if llm.calls:
+                    break
+            return browser.page is tab, llm
+
+    followed, llm = run(scenario())
+    assert followed and llm.calls and "Джем Ягодная Поляна" in llm.calls[0][0].task_text
+
+
+NOTIFICATIONS = ("<div class='ozi__backdrop__backdrop__H2ks_'></div><div class='ozi__window__root__lcYqb'>"
+                 "<div class='ozi__window__window__lcYqb' data-testid='NotificationsPopup'>"
+                 "<div class='ozi-heading-400'>Уведомления</div>"
+                 + "".join(f"<p>Начислено вознаграждение за проект «Проверка ценников {i}». Выплата поступит на "
+                           "карту в течение трёх рабочих дней. Подробности — в разделе «Статистика».</p>"
+                           for i in range(8))
+                 + "</div><button type='button' class='ozi__window__closeIcon__lcYqb' onclick=\"document."
+                   "getElementById('ozi-window-teleport-target').innerHTML=''\">×</button></div>")
+
+
+def test_notifications_window_does_not_replace_instruction(tmp_path, monkeypatch):
+    """Инструкция проекта прочитана; на следующей странице человек открыл «Уведомления» — окно Ozon
+    того же вида, длинное: в базе знаний остаётся инструкция, а не уведомления."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL)
+
+    def policy(state: PageState, ctx: DecisionContext) -> LLMDecision:
+        firsts: dict[str, ParsedElement] = {}           # первый вариант в каждом блоке
+        for e in state.visible_elements:
+            if e.kind == ElementKind.OPTION:
+                firsts.setdefault(e.group, e)
+        return answer(*(click(e) for e in firsts.values()), state=state)
+
+    async def scenario():
+        agent, llm = make_agent(tmp_path, policy, [])
+        async with agent._browser:
+            page = agent._browser.page
+            while not llm.calls:
+                await agent._step()                # инструкция прочитана, первая страница отправлена
+            await page.wait_for_function("() => document.body.innerText.includes('Морс Северный Бор')")
+            await page.evaluate("(h) => { document.getElementById('ozi-window-teleport-target').innerHTML = h; }",
+                                NOTIFICATIONS)
+            for _ in range(3):
+                await agent._step()
+        return "\n".join(f.read_text(encoding="utf-8") for f in (tmp_path / "knowledge").glob("*.md"))
+
+    saved = run(scenario())
+    assert "Сравнение названий товаров" in saved and "Начислено вознаграждение" not in saved

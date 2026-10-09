@@ -9,6 +9,7 @@ sys.path.insert(0, str(ROOT))
 
 os.environ.update({
     "HEADLESS": "true",
+    "PLATFORM": "twork",                    # площадка из .env (PLATFORM=ozon) тестам не мешает: Ozon — use_platform
     "OPENROUTER_API_KEY": "test-key",
     "LLM_MODEL": "openai/gpt-5.4-mini",     # одна модель; лестницу задают тесты лестницы
     "LLM_OUTAGE_WAIT": "0",                 # недоступность OpenRouter — без ожидания (тесты ожидания сами)

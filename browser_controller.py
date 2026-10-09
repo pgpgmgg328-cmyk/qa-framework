@@ -28,6 +28,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import (
     Browser,
@@ -458,7 +459,20 @@ class BrowserController:
         await self.stop()
 
     def is_closed(self) -> bool:
+        if self._page is not None and self._page.is_closed() and ALLOW_MAIN_FRAME and self._context is not None:
+            # Ozon: закрыта вкладка проекта, а кабинет в том же окне открыт — работа не закончена.
+            # Вкладки того же сайта заданий не берём: в них человек может решать проект сам
+            closed_host = (urlsplit(self._page.url).hostname or "").lower()
+            others = [p for p in self._context.pages
+                      if not p.is_closed() and (urlsplit(p.url).hostname or "").lower() != closed_host]
+            if others:
+                self.adopt_page(others[-1])
         return self._page is None or self._page.is_closed()
+
+    def adopt_page(self, page: Page) -> None:
+        """Работать дальше в другой вкладке того же окна (Ozon: кабинет открывает проект в новой)."""
+        self._page = page
+        self._cdp = None             # CDP-сессия привязана к прежней вкладке
 
     # ------------------------------------------------------------------
     # Свёрнутое окно
@@ -472,7 +486,7 @@ class BrowserController:
         warned = False
         failures = 0
         searches, next_search = 0, 0.0
-        while self._page is not None and not self._page.is_closed():
+        while not self.is_closed():          # is_closed: вкладка проекта закрыта — сторож в кабинете
             try:
                 if api is not None and self._guard is None and time.monotonic() >= next_search:
                     # страница могла как раз перезагружаться — несколько попыток с паузой

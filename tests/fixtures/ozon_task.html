@@ -7,7 +7,9 @@
      шапка сайта, заголовок проекта, таймер, блоки-карточки с <label><input type=radio>, одна
      кнопка «Отправить», окно инструкции без role="dialog" (открывается само при первом заходе,
      с задержкой), экран «закончились задачи». Товары и бренды вымышлены.
-     ?instruction=0 — окно инструкции само не открывается. -->
+     ?instruction=0 — окно инструкции само не открывается; ?check=1 — тренировка проверяет ответ (неверный —
+     задание то же и уведомление «Ошибка … необходимо решить все задания», как на сайте); ?mode=reveal —
+     страница, где «Да» открывает новые вопросы, и галерея с полосой миниатюр (ещё не загружены). -->
 <style>
   body { margin: 0; font: 15px/1.4 Arial, sans-serif; }
   .ozi__header__header__9Lsuq { height: 96px; border-bottom: 1px solid #ddd; padding: 8px 24px; }
@@ -24,12 +26,15 @@
   .ozi__window__root__lcYqb { position: fixed; top: 0; right: 0; bottom: 0; width: 560px; background: #fff;
                               overflow: auto; padding: 24px; }
   ._figure img { width: 240px; height: 160px; display: block; }
+  ._thumbs img { width: 32px; height: 32px; margin-right: 4px; }
+  #ozi-notifications-container { position: fixed; top: 16px; right: 16px; width: 360px; }
 </style>
 </head>
 <body>
 <div id="__nuxt"></div>
 <div id="teleports"></div>
 <div id="ozi-window-teleport-target" class="ozi__window__target__lcYqb"></div>
+<div id="ozi-notifications-container" class="ozi__notification__list__RlNr7"></div>
 <script>
 const PAGES = [
   [
@@ -50,6 +55,12 @@ const PAGES = [
   ],
 ];
 const params = new URLSearchParams(location.search);
+if (params.get('mode') === 'reveal') {
+  PAGES.splice(0, PAGES.length, [{ kind: 'reveal', photo: '/static/ozon-photo-2.png',
+    thumbs: ['/lazy/thumb-1.jpg', '/lazy/thumb-2.jpg', '/lazy/thumb-3.jpg', '/static/ozon-photo-2.png'] }]);
+}
+// правильные ответы тренировки (?check=1)
+const EXPECTED = params.get('mode') === 'reveal' ? [['yes', 'ok']] : [['plu:1001', '__no_match__'], ['1']];
 let page = 0;
 window.__answers = [];
 
@@ -76,6 +87,12 @@ function card(task, i) {
       + text('', 'Выберете название, которое соответсвует товару:', 'ozi-body-500')
       + '<div class="_group_3j9x5_6">' + task.options.map(([v, l]) => radio(name, v, l)).join('')
       + radio(name, '__no_match__', 'Нет нужного варианта') + '</div>';
+  } else if (task.kind === 'reveal') {
+    body = `<div class="_figure"><figure><img data-testid="UiImage" src="${task.photo}" alt=""></figure></div>`
+      + `<div class="_thumbs">${task.thumbs.map((t) => `<img data-testid="UiImage" src="${t}" alt="">`).join('')}</div>`
+      + text('', 'Фото ценника читаемое?', 'ozi-body-500')
+      + '<div class="_group_3j9x5_6" onchange="reveal(this)">' + radio(name, 'yes', 'Да') + radio(name, 'no', 'Нет') + '</div>'
+      + '<div id="more"></div>';
   } else {
     body = `<div class="_figure"><figure><img data-testid="UiImage" src="${task.photo}" alt=""></figure></div>`
       + text('Товар 1', task.first, 'ozi-heading-200') + text('', 'Ссылка на товар:') + link(task.link1) + divider()
@@ -123,6 +140,7 @@ function render() {
       </div></div></div>
       <div class="_container_ijpdw_2">${tasks.map(card).join('')}</div>
       <div class="_actionsContainer_1l70j_16"><div class="_actions_1l70j_16">
+        <button data-testid="TasksSkipButton" class="ozi__button__button___8pxO" onclick="window.__skipped = true">Пропустить <span>0/10</span></button>
         <button data-testid="TasksSendButton" class="ozi__button__button___8pxO ozi__button__primary___8pxO" onclick="send()">Отправить</button>
         <p class="_caption_1l70j_30 ozi-body-500" data-testid="TasksPageControlsHint">Отправленные задачи сохраняются в статистике</p>
       </div></div></div>`;
@@ -133,11 +151,32 @@ function render() {
 function send() {
   const groups = [...new Set([...document.querySelectorAll('input[type=radio]')].map((i) => i.name))];
   const answers = groups.map((g) => (document.querySelector(`input[name="${g}"]:checked`) || {}).value || '');
+  if (params.get('check') && JSON.stringify(answers) !== JSON.stringify(EXPECTED[page])) {
+    window.__rejected = (window.__rejected || 0) + 1;
+    notify();                                  // как на сайте: задание то же, всплывает «Ошибка»
+    return;
+  }
   window.__answers.push(answers);
   fetch('/api/answers', { method: 'POST', body: JSON.stringify(answers) }).catch(() => {});
   page += 1;
   document.getElementById('__nuxt').innerHTML = '';          // как на сайте: блоки пропадают и приходят новые
   setTimeout(render, 300);
+}
+
+function reveal(group) {
+  const more = group.parentElement.querySelector('#more');
+  const yes = group.querySelector('input[value="yes"]').checked;
+  more.innerHTML = yes ? text('', 'Цена на ценнике совпадает с текстом?', 'ozi-body-500')
+    + '<div class="_group_3j9x5_6">' + radio('price_check', 'ok', 'Нет ошибок') + radio('price_check', 'bad', 'Есть ошибки') + '</div>' : '';
+}
+
+function notify() {
+  const box = document.getElementById('ozi-notifications-container');
+  box.innerHTML = `<div data-v-app=""><div class="ozi__notification-template__notification__L414N ozi__notification-template__warning__L414N">
+    <div class="_notification_50q5m_4"><h6 class="_title_50q5m_10">Ошибка</h6>
+    <p class="_text_50q5m_16">Для отправки ответа необходимо решить все задания</p></div></div></div>`;
+  clearTimeout(window.__toast);
+  window.__toast = setTimeout(() => { box.innerHTML = ''; }, 4000);
 }
 
 function openInstruction() {

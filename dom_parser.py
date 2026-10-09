@@ -112,6 +112,7 @@ HINT_SELECTORS: tuple[str, ...] = (
 _JS_MAX_ELEMENTS = 1500
 
 _GENERATION = itertools.count(1)
+_WARNED_SELECTORS: set[str] = set()     # неверные селекторы из .env — предупреждение один раз
 
 # Таймеры и обратный отсчёт не должны менять отпечаток задания:
 # «04:59», «1:02:03», «59 сек», «осталось 3 мин»
@@ -218,8 +219,12 @@ _JS_SNAPSHOT = r"""
     // ------------------------------------------------- 1. кандидаты
     let selectorOk = true;
     try { document.createElement('div').matches(args.selectors); } catch (e) { selectorOk = false; }
-    // селекторы площадки из .env: ошибочный селектор не должен ронять снимок
-    const validSel = (s) => { if (!s) return ''; try { document.createElement('div').matches(s); return s; } catch (e) { return ''; } };
+    // селекторы площадки из .env проверяются по одному: ошибочный отбрасывается (и попадает в лог),
+    // а не отключает весь список и не роняет снимок
+    const badSelectors = [];
+    const validSel = (list) => (list || []).filter((s) => {
+        try { document.createElement('div').matches(s); return true; } catch (e) { badSelectors.push(s); return false; }
+    }).join(', ');
     // части страницы вне задания (шапка сайта, чат): модель их не видит и не нажимает
     const SKIP_SEL = validSel(args.skipSel);
     const skipped = (el) => !!SKIP_SEL && !!el.closest && !!el.closest(SKIP_SEL);
@@ -866,13 +871,14 @@ _JS_SNAPSHOT = r"""
                 value = fieldVal;
             }
         }
-        let choiceType = '';
+        let choiceType = '', group = '';
         if (kind === 'OPTION' || kind === 'FOLDER') {
             choiceType = choiceTypeOf(el) || (rec.control ? choiceTypeOf(rec.control) : '');
-            if (!choiceType) {
-                const c = ownQuery(el, 'input[type="radio"], input[type="checkbox"]');
-                if (c) choiceType = inputTypeOf(c);
-            }
+            const c = (tagOf(el) === 'input' ? el : null) || (rec.control && tagOf(rec.control) === 'input' ? rec.control : null)
+                || ownQuery(el, 'input[type="radio"], input[type="checkbox"]');
+            if (!choiceType && c) choiceType = inputTypeOf(c);
+            // группа radio (name): на одной странице Ozon — до 10 вопросов, у каждого своя
+            if (c && inputTypeOf(c) === 'radio') group = String(attr(c, 'name') || '');
         }
         let href = '';
         const link = tag === 'a' ? el : (el.querySelector ? el.querySelector('a[href]') : null);
@@ -880,7 +886,7 @@ _JS_SNAPSHOT = r"""
         const aux = inMediaWidget(el) || isPagerControl(el, norm(text));
         elements.push({
             uid, tag, kind, text, placeholder,
-            value: String(value).slice(0, 2000), inputType, choiceType, options,
+            value: String(value).slice(0, 2000), inputType, choiceType, group, options,
             selected: kind !== 'INPUT' && kind !== 'DROPDOWN' ? selectedOf(el, rec) : false,
             disabled: disabledOf(el, rec),
             expanded: (kind === 'FOLDER' || kind === 'DROPDOWN') ? !!rec.expanded : null,
@@ -896,8 +902,19 @@ _JS_SNAPSHOT = r"""
     if (topOcc && topN >= 2) overlay = describe(topOcc);
 
     // --------------------------------------------- 9. медиа: фото и аудио
-    const images = [], imageIndex = new Map();
+    const images = [], imageIndex = new Map(), srcIndex = new Map();
     const IMG_SKIP_RE = /(^|[_-])(icon|logo|avatar|emoji|badge|flag|spinner|loader)([_-]|$)/i;
+    const RASTER_RE = /\.(jpe?g|png|webp|avif)(\?|#|$)/i;
+    // полоса миниатюр галереи: рядом (общий предок до 4 уровней) ещё ≥2 картинки с другими адресами
+    const inStrip = (n) => {
+        for (let a = flatParent(n), depth = 0; a && depth < 4; a = flatParent(a), depth++) {
+            if (!a.querySelectorAll) continue;
+            const srcs = new Set();
+            for (const i of a.querySelectorAll('img')) srcs.add(i.currentSrc || i.src || '');
+            if (srcs.size >= 3) return true;
+        }
+        return false;
+    };
     for (const n of ALL) {
         if (tagOf(n) !== 'img' || images.length >= 120) continue;
         if (skipped(n)) continue;
@@ -908,8 +925,17 @@ _JS_SNAPSHOT = r"""
         if (n.checkVisibility && !n.checkVisibility({ checkVisibilityCSS: true, visibilityProperty: true })) continue;
         const r = n.getBoundingClientRect();
         const nw = n.naturalWidth || 0, nh = n.naturalHeight || 0;
-        if (!((nw >= 64 && nh >= 64) || (r.width >= 48 && r.height >= 48))) continue;
+        // Ozon: под каруселью — полоса мелких миниатюр со ВСЕМИ фото товара, а слайды карусели
+        // браузер рисует лишь первые 2–3. Миниатюра за краем экрана ещё не загружена (размер 0) —
+        // это не иконка: фото агент скачивает по адресу сам
+        const thumb = nw === 0 && RASTER_RE.test(src) && inStrip(n);
+        if (!((nw >= 64 && nh >= 64) || (r.width >= 48 && r.height >= 48) || thumb)) continue;
+        // миниатюра повторяет уже показанное фото — то же фото, а не новое (крупные одинаковые фото в
+        // разных карточках остаются отдельными: модель должна видеть, что снимок общий)
+        const small = r.width < 48 || r.height < 48;
+        if (small && srcIndex.has(src)) { imageIndex.set(n, srcIndex.get(src)); continue; }
         const k = images.length + 1;
+        srcIndex.set(src, k);
         const uid = GEN + '-i' + k;
         n.setAttribute(A_MEDIA, uid);
         imageIndex.set(n, k);
@@ -961,7 +987,14 @@ _JS_SNAPSHOT = r"""
     const noticeKind = (el) => {
         const ap = String(attr(el, 'data-appearance') || attr(el, 'appearance') || '').toLowerCase();
         for (const key of Object.keys(APPEARANCE)) if (ap.includes(key)) return APPEARANCE[key];
-        const toks = noticeTokens(el).join(' ');
+        // вид — и по вложенным элементам: у Ozon сообщение — контейнер уведомлений, а «warning» стоит
+        // на вложенной плашке (ozi__notification-template__warning__…)
+        let all = noticeTokens(el);
+        if (el.querySelectorAll) for (const c of el.querySelectorAll('[class]')) {
+            all = all.concat(noticeTokens(c));
+            if (all.length > 80) break;
+        }
+        const toks = all.join(' ');
         if (/(error|invalid|danger|negative|fail)/i.test(toks)) return 'error';
         if (/warning/i.test(toks)) return 'warning';
         if (/success|positive/i.test(toks)) return 'success';
@@ -975,6 +1008,14 @@ _JS_SNAPSHOT = r"""
         if (tag === 'tui-notification' || tag === 'tui-alert' || tag === 'tui-error') return true;
         if (role === 'alert' || role === 'status') return true;
         return noticeTokens(el).some((t) => /(^|[_-])(notification|toast|alert|error|warning|hint)([_-]|$)/i.test(t));
+    };
+    // всплывающее уведомление закреплено на экране (position: fixed), сообщение у поля — нет
+    const fixedOf = (n) => {
+        for (let a = n, depth = 0; a && a.nodeType === 1 && depth < 6; a = flatParent(a), depth++) {
+            if (a === document.body) break;
+            if (styleOf(a).position === 'fixed') return true;
+        }
+        return false;
     };
     const notices = [], noticeIndex = new Map();
     try {
@@ -991,7 +1032,7 @@ _JS_SNAPSHOT = r"""
             if (n.closest && n.closest('tui-hint, [role="tooltip"]')) continue;
             const t = textOf(n, keptSet, 800);
             if (t.length < 3) continue;
-            const where = (n.closest && n.closest('tui-alerts, tui-alert, [class*="toast" i]')) ? 'toast'
+            const where = ((n.closest && n.closest('tui-alerts, tui-alert, [class*="toast" i]')) || fixedOf(n)) ? 'toast'
                 : (n.closest && n.closest(DIALOG_SEL)) ? 'dialog' : 'inline';
             noticeIndex.set(n, notices.length);
             notices.push({ kind: noticeKind(n), text: t, where });
@@ -1252,7 +1293,7 @@ _JS_SNAPSHOT = r"""
         reader: sinks.main, dialog: sinks.dialog, popup: sinks.popup, toast: sinks.toast,
         notices, images, audios,
         captcha, loading, dialogLoading, localLoading, dialogOpen, dialogFrames,
-        overlay, imageSrc, scrollables,
+        overlay, imageSrc, scrollables, badSelectors,
     });
 }
 """
@@ -1303,11 +1344,16 @@ class DomParser:
                 "max": _JS_MAX_ELEMENTS,
                 "selectors": INTERACTIVE_SELECTOR,
                 "pointer": True,
-                "dialogSel": ", ".join(DIALOG_SELECTORS),
-                "skipSel": ", ".join(PAGE_SKIP_SELECTORS),
+                "dialogSel": list(DIALOG_SELECTORS),
+                "skipSel": list(PAGE_SKIP_SELECTORS),
             },
         )
         raw: dict = json.loads(payload)
+        for bad in raw.get("badSelectors") or []:
+            if bad not in _WARNED_SELECTORS:
+                _WARNED_SELECTORS.add(bad)
+                logger.warning("Селектор %r из DIALOG_SELECTORS / PAGE_SKIP_SELECTORS браузер не понимает — "
+                               "он пропущен, остальные работают. Исправьте его в .env", bad)
 
         elements = self._build_elements(raw.get("elements") or [])
         notices = [
@@ -1431,6 +1477,7 @@ class DomParser:
                 value=str(raw.get("value", "")),
                 input_type=str(raw.get("inputType", "")),
                 choice_type=str(raw.get("choiceType", "")),
+                group=str(raw.get("group", "")),
                 options=[str(o) for o in raw.get("options") or []],
                 container=str(raw.get("container", "")),
                 selectable=bool(raw.get("selectable", False)),
