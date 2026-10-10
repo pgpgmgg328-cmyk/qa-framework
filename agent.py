@@ -1549,8 +1549,19 @@ class Agent:
             if i > 0:
                 await self._browser.wait_settle(frame)
                 fresh = await DomParser(frame).parse(quiet=True)
-                mem.verify(fresh)
+                mem.verify(fresh)               # итог прошлого действия — до проверки пакета (она его читает)
                 reason = self._batch_break_reason(current, fresh, last_status, last_target)
+                if reason == "задание сменилось":
+                    # Ozon после клика перерисовывает карточку: за 350 мс тишины страница бывает
+                    # недорисована и выглядит другой — проверяем ещё раз, когда она догрузится
+                    await self._browser.wait_for_network_idle_and_dom(frame, timeout_ms=3000)
+                    fresh = await DomParser(frame).parse(quiet=True)
+                    reason = self._batch_break_reason(current, fresh, last_status, last_target)
+                    if reason == "задание сменилось":
+                        a, b = TaskIdentity.of(current), TaskIdentity.of(fresh)
+                        logger.info("Пакет: задание выглядит другим — исчезли строки %s, появились %s, фото общих: %s",
+                                    sorted(a.lines - b.lines)[:3], sorted(b.lines - a.lines)[:3],
+                                    len(a.media & b.media))
                 if reason is None and target is not None:
                     remapped = fresh.by_key(target.key)
                     if remapped is None:

@@ -89,12 +89,17 @@ async (args) => {
         }
         return null;
     };
+    // все фото задания скачиваются разом (браузер сам ограничит число запросов к одному сайту):
+    // по одному 36 фото товара шли 15–40 с
+    const items = args.jobs.flatMap((job) => job.items);
+    const loaded = await Promise.all(items.map((item) => bitmapOf(item).catch(() => null)));
+    const bitmapByItem = new Map(items.map((item, i) => [item, loaded[i]]));
     const results = [];
     for (const job of args.jobs) {
         const bitmaps = [];
         const failed = [];
         for (const item of job.items) {
-            const b = await bitmapOf(item);
+            const b = bitmapByItem.get(item);
             if (b && b.width > 0) bitmaps.push([item.n, b]); else failed.push(item.n);
         }
         if (!bitmaps.length) { results.push({ ok: false, failed }); continue; }
@@ -209,7 +214,8 @@ class MediaManager:
         images = state.images[:VISION_MAX_IMAGES]
         if not images:
             return [], []
-        key = (state.content_hash, tuple(i.src for i in images))
+        # по набору фото, а не по тексту страницы: ответ, открывший вопрос, фото не меняет — не качаем заново
+        key = (tuple(i.src for i in images), inspection_task(state) or coverage_task(state))
         cached = self._vision_cache.get(key)
         if cached is not None:
             return cached
