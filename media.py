@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Optional
@@ -35,11 +36,25 @@ from config import (
     VISION_MAX_IMAGES,
     VISION_DETAIL_MAX,
     VISION_SINGLE_MAX,
+    IMAGE_URL_REWRITE,
 )
 from dom_parser import coverage_task, inspection_task, photo_groups
 from models import AudioClip, LLMUnavailable, MediaAudio, MediaImage, PageState, VisionImage
 
 logger = logging.getLogger("twork.media")
+
+
+def download_url(src: str) -> str:
+    """Адрес, по которому фото скачивается для модели: CDN площадки отдаёт уменьшенную копию
+    (IMAGE_URL_REWRITE; Ozon: …/wc1000/… — 24 КБ вместо 0,5–2 МБ оригинала, модели больше
+    1024 px не нужно). Ошибка в шаблоне из .env — адрес как есть."""
+    if " => " not in IMAGE_URL_REWRITE:
+        return src
+    pattern, _, replacement = IMAGE_URL_REWRITE.partition(" => ")
+    try:
+        return re.sub(pattern, replacement, src)
+    except re.error:
+        return src
 
 # (bytes, имя файла, mime) → текст расшифровки или None
 Transcriber = Callable[[bytes, str, str], Awaitable[Optional[str]]]
@@ -268,7 +283,7 @@ class MediaManager:
         Проверка качества по фото (клининг, грязь, дефекты): до VISION_DETAIL_MAX фото — по одному:
         на коллаже фото занимает ~390 px, и пыль, остатки скотча, грязь у основания не видны."""
         def item(img: MediaImage) -> dict:
-            return {"n": img.n, "uid": img.uid, "src": img.src}
+            return {"n": img.n, "uid": img.uid, "src": download_url(img.src)}
 
         wanted = {i.n for i in images}
         detail = inspection_task(state) or coverage_task(state)
@@ -309,7 +324,7 @@ class MediaManager:
 
         async def one(img: MediaImage) -> Optional[tuple[int, str, str]]:
             async with sem:
-                data, mime = await self.fetch_bytes(frame, img.src, in_page=False)
+                data, mime = await self.fetch_bytes(frame, download_url(img.src), in_page=False)
                 if not data:
                     return None
                 return img.n, base64.b64encode(data).decode("ascii"), mime or "image/jpeg"

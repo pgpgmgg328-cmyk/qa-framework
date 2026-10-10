@@ -70,6 +70,7 @@ class TaskMemory:
     repeated_forbidden: int = 0
     submit_failures: int = 0
     loading_waits: int = 0
+    photo_waits: int = 0                                         # ждали фото задания (вариант «фото не загружается»)
     image_b64: Optional[str] = None
     image_src: str = ""
     image_checked: bool = False

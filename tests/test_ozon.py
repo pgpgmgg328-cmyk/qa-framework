@@ -647,3 +647,51 @@ def test_notifications_window_does_not_replace_instruction(tmp_path, monkeypatch
 
     saved = run(scenario())
     assert "Сравнение названий товаров" in saved and "Начислено вознаграждение" not in saved
+
+
+def test_photo_question_waits_for_a_loaded_photo():
+    """Вариант «Фото не загружается»: пока на странице нет ни одного загруженного фото (Ozon дорисовывает
+    фото позже вопроса), агент не отвечает; незагруженные миниатюры при загруженном фото — не повод ждать."""
+    from models import MediaImage
+
+    option = ParsedElement(index=0, kind=ElementKind.OPTION, text="Фото не загружается")
+    state = PageState(elements=[option])
+    loaded = MediaImage(n=1, src="https://cdn.test/a.jpg", width=640, height=480)
+    lazy_thumb = MediaImage(n=2, src="https://cdn.test/b.jpg", width=0, height=0)
+    assert Agent._photo_pending(state)
+    assert Agent._photo_pending(state.model_copy(update={"images": [lazy_thumb]}))
+    assert not Agent._photo_pending(state.model_copy(update={"images": [loaded, lazy_thumb]}))
+    other = state.model_copy(update={"elements": [ParsedElement(index=0, kind=ElementKind.OPTION, text="Да")]})
+    assert not Agent._photo_pending(other)
+
+
+def test_knowledge_of_ozon_project_survives_restart(tmp_path):
+    """Вид задания Ozon — ключ по адресу проекта («u…»): инструкция и разборы ошибок, записанные в
+    knowledge/, читаются при следующем запуске (раньше файл отбрасывался: «нет метки pool»)."""
+    from knowledge import PoolKnowledge
+
+    kb = KnowledgeBase(str(tmp_path))
+    pool = PoolKnowledge(key="u1e264f4abcd", title="Выбор одинаковых названий товаров", signature=["f:да"])
+    kb._pools[pool.key] = pool
+    kb.save_instruction(pool, "Сравните бренд, вкус и вес. " * 20, "диалог «Инструкция»")
+    kb.add_lesson(pool, "Задание «джем»: 300 г вместо 400 г — другой товар.")
+    again = KnowledgeBase(str(tmp_path))
+    again._load()
+    restored = again._pools.get("u1e264f4abcd")
+    assert restored is not None and "Сравните бренд" in restored.instruction and restored.lessons
+
+
+def test_ozon_product_photos_are_downloaded_resized(monkeypatch):
+    """Фото товаров Ozon (ir.ozone.ru) скачиваются копией …/wc1000/… (24 КБ вместо 0,5–2 МБ): при
+    медленной связи с Ozon оригиналы шли по 10–30 с. Остальные адреса — как есть."""
+    import media
+
+    monkeypatch.setattr(media, "IMAGE_URL_REWRITE", OzonProfitAdapter.settings["IMAGE_URL_REWRITE"])
+    assert (media.download_url("https://ir.ozone.ru/s3/multimedia-1-v/7080087955.jpg")
+            == "https://ir.ozone.ru/s3/multimedia-1-v/wc1000/7080087955.jpg")
+    already = "https://ir.ozone.ru/s3/multimedia-1-v/wc500/7080087955.jpg"
+    assert media.download_url(already) == already
+    other = "https://cdn1.ozonusercontent.com/s3/ozon-crowd-public-storage/135_d05.jpg"
+    assert media.download_url(other) == other
+    monkeypatch.setattr(media, "IMAGE_URL_REWRITE", "")
+    assert media.download_url("https://ir.ozone.ru/s3/multimedia-1-v/7080087955.jpg").endswith("/7080087955.jpg")

@@ -153,6 +153,7 @@ def _exam_outcome(text: str) -> Optional[bool]:
         return True
     return None
 _INSTRUCTION_RE = re.compile(r"инструкц", re.IGNORECASE)
+_PHOTO_FAIL_RE = re.compile(r"фото.{0,20}не\s*(загруж|открыва|отображ)", re.IGNORECASE)
 # окно входа в аккаунт (сессия истекла): в аккаунт входит только человек
 # («номер телефона» сюда не входит: «найдите номер телефона организации» — обычное задание)
 _LOGIN_RE = re.compile(r"(войти|войдите|вход в (аккаунт|профиль|ozon)|авториз|ozon id|код из (sms|смс)|"
@@ -569,6 +570,14 @@ class Agent:
             self._tab_follow = False        # агент начал работать — дальше только своя вкладка
             self._mark_order_start()
 
+        # 8а. Среди ответов есть «Фото не загружается», а фото на странице ещё нет или оно грузится:
+        # Ozon дорисовывает фото позже вопроса — модель выбрала бы «не загружается». Ждём до ~10 с
+        if self._photo_pending(state) and self._memory.photo_waits < 5:
+            self._memory.photo_waits += 1
+            logger.info("Фото задания ещё не загрузилось — жду, прежде чем отвечать")
+            await asyncio.sleep(2.0)
+            return StepResult.IDLE
+
         # 9. Знания о виде задания: инструкция и подсказки «?» (один раз за запуск)
         if await self._maybe_open_instruction(frame, state):
             return StepResult.IDLE
@@ -627,6 +636,14 @@ class Agent:
             e.kind == ElementKind.BUTTON and _label_matches(e.text, ORDERS_BUTTON_TEXTS)
             for e in state.elements
         )
+
+    @staticmethod
+    def _photo_pending(state: PageState) -> bool:
+        """В ответах есть «Фото не загружается», а загруженного фото на странице нет."""
+        about_photo = any(e.kind == ElementKind.OPTION and _PHOTO_FAIL_RE.search(e.text or "")
+                          for e in state.visible_elements)
+        # ни одного загруженного фото (миниатюры за краем экрана не в счёт — они не грузятся до прокрутки)
+        return about_photo and not any(i.width for i in state.images)
 
     @staticmethod
     def _login_window(state: PageState) -> bool:

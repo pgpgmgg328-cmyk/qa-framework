@@ -389,6 +389,9 @@ ORDERS_DONE_TEXTS: tuple[str, ...] = _site_list("ORDERS_DONE_TEXTS", ())
 # (Ozon пишет «Для отправки ответа необходимо решить все задания»: неполный ответ агент не отправляет,
 # значит, это неверный)
 WRONG_ANSWER_TEXTS: tuple[str, ...] = _site_list("WRONG_ANSWER_TEXTS", ())
+# Уменьшенная копия фото с CDN площадки: «регулярное выражение => замена» для адреса (пусто — оригинал).
+# Ozon отдаёт копию шириной 1000 px по …/wc1000/… — в 10–40 раз меньше оригинала
+IMAGE_URL_REWRITE: str = os.getenv("IMAGE_URL_REWRITE", _site("IMAGE_URL_REWRITE", "")).strip()
 # Вид задания (инструкция, разборы ошибок, статистика тренировки) — по адресу страницы, если он
 # совпадает с этим регулярным выражением (Ozon: /task/<id> — проект). Пусто — по структуре формы
 POOL_URL_RE: str = os.getenv("POOL_URL_RE", _site("POOL_URL_RE", "")).strip()

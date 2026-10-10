@@ -43,6 +43,8 @@ class OzonProfitAdapter(PlatformAdapter):
         # вид задания — проект (/task/<id>): варианты ответа здесь — названия товаров, а не категории,
         # и по структуре формы каждая страница выглядела бы новым видом
         "POOL_URL_RE": r"/task/[^/?#]+",
+        # фото товаров (ir.ozone.ru): уменьшенная копия …/wc1000/… — 24 КБ вместо 0,5–2 МБ (проверено)
+        "IMAGE_URL_REWRITE": r"^(https://ir\.ozone\.ru/s3/[^/]+/)(?!wc\d+/)([^/?#]+\.(?:jpe?g|png|webp))$ => \1wc1000/\2",
         # классы Ozon UI с хэшем на конце (ozi__window__window__lcYqb) — поэтому «*=»
         "DIALOG_SELECTORS": ('[class*="ozi__window__window"]',),
         "PAGE_SKIP_SELECTORS": (

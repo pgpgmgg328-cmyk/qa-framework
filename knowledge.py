@@ -413,7 +413,7 @@ def _render(pool: PoolKnowledge) -> str:
 
 def _parse(path: Path) -> PoolKnowledge:
     text = path.read_text(encoding="utf-8")
-    key = re.search(r"<!--\s*pool:\s*([0-9a-f]+)\s*-->", text)
+    key = re.search(r"<!--\s*pool:\s*([0-9a-z]+)\s*-->", text)     # Ozon: «u…» — ключ по адресу проекта
     if not key:
         raise ValueError("нет метки <!-- pool: … -->")
     sig = re.search(r"<!--\s*signature:\s*(\[.*?\])\s*-->", text)
