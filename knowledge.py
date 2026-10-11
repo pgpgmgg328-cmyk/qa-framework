@@ -426,11 +426,13 @@ def _parse(path: Path) -> PoolKnowledge:
     current: Optional[str] = None
     for line in text.splitlines():
         m = re.match(r"^##\s+(.+?)\s*$", line)
-        if m:
-            current = _SECTIONS.get(m.group(1).strip().lower())
-            if current:
-                sections.setdefault(current, [])
+        known = _SECTIONS.get(m.group(1).strip().lower()) if m else None
+        if known:
+            current = known
+            sections.setdefault(current, [])
             continue
+        # «## ОПИСАНИЕ ЗАДАНИЯ» внутри инструкции Ozon — её текст, а не конец раздела (раньше после
+        # перезапуска от инструкции в 36 тыс. символов оставалось 165)
         if current:
             sections[current].append(line)
     body = sections.get("instruction", [])

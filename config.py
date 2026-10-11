@@ -405,7 +405,10 @@ INSTRUCTION_WAIT: float = float(os.getenv("INSTRUCTION_WAIT", "25"))  # ждат
 READ_TOOLTIPS: bool = _env_bool("READ_TOOLTIPS", True)           # прочитать подсказки «?» у вариантов
 # Знания о виде заданий в каждом запросе, символов: инструкция — целиком (её не вытесняют уроки),
 # на разборы ошибок из тренировки остаётся не меньше KNOWLEDGE_LESSON_CHARS
-KNOWLEDGE_PROMPT_CHARS: int = int(os.getenv("KNOWLEDGE_PROMPT_CHARS", "14000"))
+# «14000» из .env.example на площадке с длинными инструкциями (Ozon — 40000) считается незаданным
+KNOWLEDGE_PROMPT_CHARS: int = int(_env_default(
+    "KNOWLEDGE_PROMPT_CHARS", str(_site("KNOWLEDGE_PROMPT_CHARS", 14000)),
+    ("14000",) if PLATFORM.key != DEFAULT_PLATFORM else ()))
 KNOWLEDGE_LESSON_CHARS: int = int(os.getenv("KNOWLEDGE_LESSON_CHARS", "3500"))
 
 # ---------------------------------------------------------------------------

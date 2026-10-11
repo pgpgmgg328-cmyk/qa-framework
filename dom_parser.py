@@ -1095,6 +1095,20 @@ _JS_SNAPSHOT = r"""
         return false;
     };
     let muted = 0;
+    // 2–4 блока стоят в один ряд (верх общий, каждый правее предыдущего), каждый широкий и с текстом
+    const columnsOf = (el) => {
+        if (!el.children || el.children.length < 2 || el.children.length > 4) return null;
+        const kids = [...el.children].filter((c) => rendered(c));
+        if (kids.length < 2 || kids.length > 4 || kids.some((c) => keptSet.has(c))) return null;
+        const rs = kids.map((c) => c.getBoundingClientRect());
+        if (rs.some((r) => r.width < 160 || r.height < 40)) return null;
+        for (let i = 1; i < rs.length; i++) {
+            if (rs[i].left < rs[i - 1].right - 2) return null;
+            if (Math.min(rs[i].bottom, rs[0].bottom) - Math.max(rs[i].top, rs[0].top) < 20) return null;
+        }
+        if (kids.some((c) => !meaningful(textOf(c, null, 60)) && !(c.querySelector && c.querySelector('img')))) return null;
+        return kids;
+    };
     const walk = (node) => {
         if (budget <= 0) return;
         if (node.nodeType === 3) { if (!muted) cur += node.nodeValue; return; }
@@ -1155,7 +1169,14 @@ _JS_SNAPSHOT = r"""
         if (st.display === 'table-cell') cur += ' ';
         const mute = fieldWraps.has(el);
         if (mute) muted++;
-        for (const ch of flatChildren(el)) walk(ch);
+        // колонки рядом (Ozon: два товара слева и справа) — подписываем, иначе характеристики двух
+        // товаров идут одним сплошным текстом и модель не знает, чьи они
+        const cols = columnsOf(el);
+        for (const ch of flatChildren(el)) {
+            const k = cols ? cols.indexOf(ch) : -1;
+            if (k >= 0) { flush(); pushLine(`‖ столбец ${k + 1} из ${cols.length}${k === 0 ? ' (слева)' : k === cols.length - 1 ? ' (справа)' : ''}`); }
+            walk(ch);
+        }
         if (mute) muted--;
         if (st.display === 'table-cell') cur += ' ';
         if (block) flush();

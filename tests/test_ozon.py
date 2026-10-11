@@ -673,12 +673,16 @@ def test_knowledge_of_ozon_project_survives_restart(tmp_path):
     kb = KnowledgeBase(str(tmp_path))
     pool = PoolKnowledge(key="u1e264f4abcd", title="Выбор одинаковых названий товаров", signature=["f:да"])
     kb._pools[pool.key] = pool
-    kb.save_instruction(pool, "Сравните бренд, вкус и вес. " * 20, "диалог «Инструкция»")
+    # у инструкций Ozon свои заголовки «## …» — раньше файл обрывал инструкцию на первом из них
+    instruction = ("Сравните бренд, вкус и вес. " * 20 + "\n## ОПИСАНИЕ ЗАДАНИЯ\nТовары одинаковые, если совпадают "
+                   "атрибуты.\n### Книги\nСверяйте ISBN.")
+    kb.save_instruction(pool, instruction, "диалог «Инструкция»")
     kb.add_lesson(pool, "Задание «джем»: 300 г вместо 400 г — другой товар.")
     again = KnowledgeBase(str(tmp_path))
     again._load()
     restored = again._pools.get("u1e264f4abcd")
     assert restored is not None and "Сравните бренд" in restored.instruction and restored.lessons
+    assert "Сверяйте ISBN" in restored.instruction and "## ОПИСАНИЕ ЗАДАНИЯ" in restored.instruction
 
 
 def test_ozon_product_photos_are_downloaded_resized(monkeypatch):
@@ -695,3 +699,39 @@ def test_ozon_product_photos_are_downloaded_resized(monkeypatch):
     assert media.download_url(other) == other
     monkeypatch.setattr(media, "IMAGE_URL_REWRITE", "")
     assert media.download_url("https://ir.ozone.ru/s3/multimedia-1-v/7080087955.jpg").endswith("/7080087955.jpg")
+
+
+SIDE_BY_SIDE = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><style>
+body { font: 15px Arial; width: 1100px; } ._container_1sdun_2 { display: flex; gap: 24px; }
+._list_1ynrc_8 { flex: 1; } ._divider_1uuh4_2 { margin: 12px 0; font-weight: bold; }
+</style></head><body><h1>Валидация товаров Ozon (без ссылок)</h1>
+<div class="_divider_1uuh4_2"><div data-testid="FieldLabel">Характеристики</div></div>
+<div class="_container_1sdun_2">
+  <div class="_list_1ynrc_8"><div data-testid="UIText"><div data-testid="FieldLabel">Бренд</div>
+    <p data-testid="UITextContent">Чистый Дом</p></div><div data-testid="UIText"><div data-testid="FieldLabel">Вес товара, г</div>
+    <p data-testid="UITextContent">50</p></div></div>
+  <div class="_list_1ynrc_8"><div data-testid="UIText"><div data-testid="FieldLabel">Вес товара, г</div>
+    <p data-testid="UITextContent">70</p></div></div>
+</div>
+<label><input type="radio" name="r1" value="same"> Одинаковые товары</label>
+<label><input type="radio" name="r1" value="diff"> Разные товары</label>
+</body></html>"""
+
+
+def test_side_by_side_products_are_marked_as_columns():
+    """«Валидация товаров»: характеристики двух товаров — в двух колонках рядом. Без пометок модель
+    видела их одним списком и не знала, где кончается первый товар («Вес 50 … Вес 70»)."""
+    async def scenario():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(**launch_options())
+            page = await browser.new_page(viewport={"width": 1280, "height": 900})
+            await page.set_content(SIDE_BY_SIDE)
+            state = await DomParser(page.main_frame).parse(quiet=True)
+            await browser.close()
+            return state
+
+    text, _ = render_page(run(scenario()))
+    lines = text.splitlines()
+    left, right = lines.index("‖ столбец 1 из 2 (слева)"), lines.index("‖ столбец 2 из 2 (справа)")
+    assert left < lines.index("Чистый Дом") < lines.index("50") < right < lines.index("70")
+    assert sum("столбец" in line for line in lines) == 2          # варианты ответа колонками не считаются
