@@ -469,6 +469,22 @@ class BrowserController:
                 self.adopt_page(others[-1])
         return self._page is None or self._page.is_closed()
 
+    async def visible_page(self, hint: Optional[Page] = None) -> Optional[Page]:
+        """Вкладка, которую человек сейчас видит. В обычном окне видна только вкладка на переднем плане;
+        если видимых несколько (два окна, окно без интерфейса) — hint (последнее действие, новая
+        вкладка), иначе None — не знаем."""
+        visible: list[Page] = []
+        for page in [p for p in self.context.pages if not p.is_closed()]:
+            try:
+                state = await asyncio.wait_for(page.evaluate("() => document.visibilityState"), timeout=2.0)
+            except (PlaywrightError, asyncio.TimeoutError):
+                continue
+            if state == "visible":
+                visible.append(page)
+        if len(visible) == 1:
+            return visible[0]
+        return hint if hint is not None and hint in visible else None
+
     def adopt_page(self, page: Page) -> None:
         """Работать дальше в другой вкладке того же окна (Ozon: кабинет открывает проект в новой)."""
         self._page = page

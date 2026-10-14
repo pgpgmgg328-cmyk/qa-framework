@@ -148,6 +148,9 @@ def parse_models(text: str) -> tuple[str, ...]:
 DEFAULT_MODELS = "google/gemini-3.1-flash-lite,openai/gpt-5.4-mini"
 LLM_MODELS: tuple[str, ...] = parse_models(os.getenv("LLM_MODEL", "")) or parse_models(DEFAULT_MODELS)
 LLM_MODEL: str = LLM_MODELS[0]
+# Режим помощника (--assist): модель подсказок в текстовых заданиях. Пусто — первая модель LLM_MODEL.
+# В текстовом задании нет фото — запрос маленький, и сильная модель обходится недорого
+ASSIST_MODEL: str = openrouter_model(os.getenv("ASSIST_MODEL", "")) or LLM_MODEL
 # Лестница: переход к следующей модели, когда в тренировке у текущей верно с первого раза меньше
 # этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели или раньше, если
 # порог уже недостижим). Модель, к которой перешли, решает не меньше LADDER_MIN_TASKS заданий,

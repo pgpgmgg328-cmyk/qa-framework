@@ -111,6 +111,9 @@ HINT_SELECTORS: tuple[str, ...] = (
 # Сколько элементов максимум размечает JS (показ LLM ограничен MAX_ELEMENTS)
 _JS_MAX_ELEMENTS = 1500
 
+# панель режима помощника (--assist) поверх страницы задания: в снимок она не входит
+ASSIST_PANEL_ID = "ai-assist-panel"
+
 _GENERATION = itertools.count(1)
 _WARNED_SELECTORS: set[str] = set()     # неверные селекторы из .env — предупреждение один раз
 
@@ -1366,7 +1369,7 @@ class DomParser:
                 "selectors": INTERACTIVE_SELECTOR,
                 "pointer": True,
                 "dialogSel": list(DIALOG_SELECTORS),
-                "skipSel": list(PAGE_SKIP_SELECTORS),
+                "skipSel": list(PAGE_SKIP_SELECTORS) + [f"#{ASSIST_PANEL_ID}"],   # панель помощника — не страница
             },
         )
         raw: dict = json.loads(payload)

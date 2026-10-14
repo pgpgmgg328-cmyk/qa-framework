@@ -380,27 +380,11 @@ class Recorder:
         return True
 
     async def _follow_active_tab(self) -> None:
-        """Записывается вкладка, которую человек сейчас видит: кабинет Ozon открывает проекты в новых
-        вкладках, поиск в интернете — тоже. В обычном окне видна только вкладка на переднем плане; если
-        видимых несколько (два окна, окно без интерфейса) — та, где было последнее действие или которая
-        только что открылась."""
-        browser = self._browser
-        visible: list[Page] = []
-        for page in [p for p in browser.context.pages if not p.is_closed()]:
-            try:
-                state = await asyncio.wait_for(page.evaluate("() => document.visibilityState"), timeout=2.0)
-            except (PlaywrightError, asyncio.TimeoutError):
-                continue
-            if state == "visible":
-                visible.append(page)
-        if len(visible) == 1:
-            active = visible[0]
-        elif self._active_hint is not None and self._active_hint in visible:
-            active = self._active_hint
-        else:
-            return
-        if active is not browser.page:
-            browser.adopt_page(active)
+        """Записывается вкладка, которую человек сейчас видит (кабинет Ozon открывает проекты в новых
+        вкладках, поиск в интернете — тоже)."""
+        active = await self._browser.visible_page(self._active_hint)
+        if active is not None and active is not self._browser.page:
+            self._browser.adopt_page(active)
             logger.info("   🗂 записываю вкладку: %s", active.url[:120])
 
     async def _pick_frame(self) -> tuple[Frame, str]:

@@ -65,10 +65,16 @@ def parse_args() -> argparse.Namespace:
         help="режим записи: агент ничего не нажимает, сохраняет экраны и ваши действия",
     )
     parser.add_argument(
+        "--assist", action="store_true",
+        help="режим помощника: решаете вы, в текстовых заданиях модель подсвечивает ответ и объясняет его",
+    )
+    parser.add_argument(
         "--url", default=None,
         help="с --record: открыть другую площадку вместо TARGET_URL (например, https://profit.ozon.ru)",
     )
     args = parser.parse_args()
+    if args.assist and args.record:
+        parser.error("--assist и --record одновременно нельзя: оба открывают одно окно браузера")
     if args.url and not args.record:
         parser.error("--url работает только вместе с --record. Решать задания на другой площадке: "
                      "PLATFORM=ozon в .env (адрес — TARGET_URL)")
@@ -84,7 +90,7 @@ if __name__ == "__main__":
     except ValueError as exc:
         logger.error("Конфигурация некорректна: %s", exc)
         sys.exit(2)
-    log_path = enable_file_log("record" if args.record else "agent")
+    log_path = enable_file_log("record" if args.record else "assist" if args.assist else "agent")
     if log_path is not None:
         logger.info("Лог работы пишется в файл %s", log_path)
     try:
@@ -92,6 +98,10 @@ if __name__ == "__main__":
             from recorder import record
 
             asyncio.run(record(args.url))
+        elif args.assist:
+            from assistant import assist
+
+            asyncio.run(assist())
         else:
             asyncio.run(main())
     except KeyboardInterrupt:
