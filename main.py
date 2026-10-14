@@ -1,6 +1,8 @@
 """main.py — точка входа агента v4.
 
   python main.py            — агент решает задания сам
+  python main.py --assist   — помощник: решаете вы, в текстовых заданиях ИИ подсвечивает ответ
+  python main.py --platform ozon …  — площадка на этот запуск (иначе — PLATFORM из .env)
   python main.py --record   — режим записи: вы решаете задания вручную, агент
                               сохраняет экраны и ваши действия (ключ API не нужен)
   python main.py --record --url https://profit.ozon.ru
@@ -11,9 +13,24 @@
 import argparse
 import asyncio
 import logging
+import os
 import sys
 
-from config import enable_file_log, validate_config
+
+def _platform_from_argv(argv: list[str]) -> str:
+    """--platform читается до config.py: настройки площадки берутся при его импорте."""
+    for i, arg in enumerate(argv):
+        if arg.startswith("--platform="):
+            return arg.split("=", 1)[1]
+        if arg == "--platform" and i + 1 < len(argv):
+            return argv[i + 1]
+    return ""
+
+
+if _platform_from_argv(sys.argv[1:]):
+    os.environ["PLATFORM"] = _platform_from_argv(sys.argv[1:])       # сильнее строки PLATFORM в .env
+
+from config import enable_file_log, validate_config  # noqa: E402
 
 logger = logging.getLogger("twork.main")
 
@@ -67,6 +84,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--assist", action="store_true",
         help="режим помощника: решаете вы, в текстовых заданиях модель подсвечивает ответ и объясняет его",
+    )
+    parser.add_argument(
+        "--platform", default=None, metavar="twork|ozon",
+        help="площадка на этот запуск (вместо строки PLATFORM в .env)",
     )
     parser.add_argument(
         "--url", default=None,

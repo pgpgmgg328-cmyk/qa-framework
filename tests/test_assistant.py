@@ -109,3 +109,52 @@ def test_instruction_opened_by_human_is_saved(tmp_path, monkeypatch):
     assert seen[-1] == "открыто окно"
     saved = "\n".join(f.read_text(encoding="utf-8") for f in (tmp_path / "knowledge").glob("*.md"))
     assert "Сравнение названий товаров" in saved
+
+
+def test_twork_task_in_frame_gets_hints(tmp_path, monkeypatch):
+    """T-Work: задание во фрейме klecks-operator — подсветка и панель внутри фрейма, без кликов."""
+    from tests.helpers import install_routes, workspace_url
+
+    monkeypatch.setattr("browser_controller.TARGET_URL", workspace_url("quiz"))
+
+    class YesYes:
+        calls = 0
+
+        async def decide(self, state: PageState, context: DecisionContext) -> LLMDecision:
+            YesYes.calls += 1
+            yes = [e for e in state.elements if e.text == "Да" and e.kind == ElementKind.OPTION]
+            return LLMDecision(reasoning="холодильник новый, гарантия 2 года", confidence=0.95,
+                               action=ActionType.CLICK, target_index=yes[0].index, target_text="Да",
+                               next_actions=[PlannedAction(action=ActionType.CLICK, target_index=yes[1].index,
+                                                           target_text="Да")])
+
+    async def scenario():
+        assistant = Assistant(browser=BrowserController(on_context=install_routes), llm=YesYes(),
+                              knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        async with assistant._browser:
+            seen = await ticks(assistant, "подсказка")
+            frame = await assistant._browser.find_target_frame()
+            hinted = await frame.eval_on_selector_all("[data-ai-hint]", "els => els.length")
+            panel = await frame.inner_text(f"#{ASSIST_PANEL_ID}")
+            checked = await frame.eval_on_selector_all("input:checked", "els => els.length")
+            return seen, hinted, panel, checked
+
+    seen, hinted, panel, checked = run(scenario())
+    assert seen[-1] == "подсказка" and YesYes.calls == 1
+    assert hinted == 2 and "Ответ: «Да»; «Да»" in panel and checked == 0
+
+
+def test_platform_flag_is_read_before_settings():
+    """--platform на один запуск: читается до config.py (настройки площадки берутся при импорте)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from main import _platform_from_argv
+
+    assert _platform_from_argv(["--assist", "--platform", "twork"]) == "twork"
+    assert _platform_from_argv(["--platform=ozon", "--assist"]) == "ozon"
+    assert _platform_from_argv(["--assist"]) == ""
+    out = subprocess.run([sys.executable, "main.py", "--platform", "avito", "--assist"],
+                         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8")
+    assert out.returncode == 2 and "PLATFORM='avito'" in out.stderr + out.stdout
