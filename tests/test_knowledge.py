@@ -49,6 +49,41 @@ def test_similar_form_reuses_knowledge(tmp_path):
     assert unrelated.instruction == ""
 
 
+def test_task_data_in_options_does_not_split_the_kind(tmp_path):
+    """T-Work «Правильно ли определены характеристики товара»: в вариантах — данные товара («Бренд "PEBEO" -
+    ВЕРНЫЙ.»). Ключ вида от них не зависит; вид, сохранённый прежде с данными в ключе, находится по
+    заголовку задания и разделам формы — его разборы ошибок не теряются (иначе каждое задание — «новый
+    вид», и агент на каждом заново открывает инструкцию)."""
+    from dom_parser import DomParser
+    from models import ElementKind, ParsedElement
+
+    def options(*texts):
+        return [ParsedElement(index=i, uid=f"1-{i}", key=f"opt||{t}", text=t, kind=ElementKind.OPTION,
+                              choice_type="checkbox") for i, t in enumerate(texts)]
+
+    title = "Правильно ли определены характеристики товара: КАТЕГОРИЯ, БРЕНД И ПРОДУКТ."
+    heads = ["## " + title, "### Выберете правильные варианты"]
+    first = DomParser._pool(heads, options('Категория "Канцелярия | Маркеры" - ВЕРНАЯ.', 'Бренд «Пример» - ВЕРНЫЙ.',
+                                           "Верных вариантов нет"), "")
+    second = DomParser._pool(heads, options('Категория "Сантехника | Сушилки" - ВЕРНАЯ.', 'Бренд «Другой» - ВЕРНЫЙ.',
+                                            "Верных вариантов нет"), "")
+    assert first[0] == second[0] and "f:бренд … - верный" in first[2]
+
+    # вид, записанный прежней версией с данными товара в ключе и в признаках
+    h = [f"h:{title.lower()}", "h:выберете правильные варианты"]
+    kb = KnowledgeBase(str(tmp_path))
+    old = kb.for_state(pool_state("0000aaaa1111", title, h + ["f:бренд пример - верный", "f:продукт маркер - верный",
+                                                              "f:категория канцелярия | маркеры - верная"]))
+    kb.add_lesson(old, "Полотенцедержатель для полотенцесушителя — верный продукт.")
+    fresh = KnowledgeBase(str(tmp_path))
+    pool = fresh.for_state(pool_state("bbbb2222cccc", title, h + ["f:бренд … - верный", "f:продукт … - верный",
+                                                                  "f:категория … - верная", "f:верных вариантов нет"]))
+    assert pool.key == "0000aaaa1111" and len(pool.lessons) == 1
+    # Ozon: вид — проект по адресу (ключ «u…»), одинаковый заголовок другого проекта — не тот же вид
+    ozon = fresh.for_state(pool_state("u0123456789a", title, h + ["f:да", "f:нет"]))
+    assert ozon is not pool and not ozon.lessons
+
+
 def test_general_notes_are_always_included(tmp_path):
     (tmp_path / "_general.md").write_text("Если фото не загрузилось — фото нет.", encoding="utf-8")
     kb = KnowledgeBase(str(tmp_path))

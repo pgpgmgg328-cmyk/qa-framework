@@ -679,8 +679,10 @@ def test_transcription_during_block_is_postponed_not_failed(monkeypatch):
 
 
 def test_pdf_instruction_is_rewritten_by_the_model(monkeypatch):
-    """Инструкция в PDF: файл уходит модели (file), текст — из её ответа, расход учитывается."""
-    use_model(monkeypatch, "google/gemini-3.1-flash-lite", "openai/gpt-5.4-mini")
+    """Инструкция в PDF: файл уходит модели (file), текст — из её ответа, расход учитывается. Модель —
+    DOCUMENT_MODEL (Gemini читает PDF сама), а не первая из лестницы: GLM PDF не понимает — OpenRouter
+    платно распознавал скан, а GLM возвращала 35 символов."""
+    use_model(monkeypatch, "z-ai/glm-5.3-flash", "openai/gpt-6-luna")
     body = completion("Инструкция. Для каждой поверхности банкомата должны быть фото.")
     body[1]["usage"] = {"prompt_tokens": 900, "completion_tokens": 40, "total_tokens": 940, "cost": 0.0003}
     with fake_openai([body]) as (url, requests):

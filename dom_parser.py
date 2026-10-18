@@ -1584,7 +1584,7 @@ class DomParser:
         heads = sorted({re.sub(r"\d+", "", normalize_text(_heading_text(h)))
                         for h in content if 2 < len(_heading_text(h)) <= 80})
         fields = sorted({
-            re.sub(r"\d+", "", normalize_text(e.caption or e.placeholder or e.text))
+            re.sub(r"\d+", "", normalize_text(_QUOTED.sub("…", e.caption or e.placeholder or e.text)))
             for e in elements
             if not e.aux and e.container not in ("dialog", "popup") and (
                 (e.kind == ElementKind.OPTION and e.choice_type)
@@ -1633,6 +1633,9 @@ class DomParser:
             hints.append(f"Список {span} прокручивается: ниже ещё ~{below}px, выше ~{above}px ({kind}).")
         return hints
 
+
+# данные задания в тексте варианта («Бренд "PEBEO" - ВЕРНЫЙ.») — не часть вида задания
+_QUOTED = re.compile(r'"[^"\n]{1,200}"|«[^»\n]{1,200}»|“[^”\n]{1,200}”|„[^“”\n]{1,200}[“”]')
 
 _PANEL_HEADINGS = re.compile(r"^(тренировка|экзамен|обучение|цена задания|задание)\b", re.IGNORECASE)
 

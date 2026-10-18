@@ -219,6 +219,10 @@ if TRANSCRIBE_MODELS in ((), ("openai/gpt-4o-transcribe", "openai/whisper-1")):
     # пусто или значение из прежнего .env.example — как по умолчанию: сначала запись слушает Gemini
     TRANSCRIBE_MODELS = parse_models(DEFAULT_TRANSCRIBE)
 TRANSCRIBE_LANGUAGE: str = os.getenv("TRANSCRIBE_LANGUAGE", "ru")
+# Инструкции в PDF (скан без текста) переписывает в текст эта модель — один раз на вид заданий. Нужна
+# модель, которая читает PDF сама (Gemini): остальным OpenRouter сначала платно распознаёт скан, а GLM
+# к тому же тратит весь ответ на обдумывание и возвращает пустой текст
+DOCUMENT_MODEL: str = openrouter_model(os.getenv("DOCUMENT_MODEL", "")) or "google/gemini-3.1-flash-lite"
 # Модель, которая решает задание и умеет слушать (Gemini), получает и саму запись звонка, а не
 # только расшифровку: человек или автоответчик — слышно по голосу. До AUDIO_TO_MODEL_MB мегабайт
 # на запись; минута звонка — около 2 тыс. токенов (≈ $0.001 у Gemini 3.1 Flash-Lite)

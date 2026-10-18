@@ -35,6 +35,7 @@ import openai
 from pydantic import ValidationError
 
 from config import (
+    DOCUMENT_MODEL,
     LLM_CHECK_BELOW,
     LLM_CHECK_MODEL,
     LLM_MAX_RETRIES,
@@ -1099,8 +1100,9 @@ class LLMConnector:
     async def read_document(self, data: bytes, filename: str = "instruction.pdf",
                             mime: str = "application/pdf") -> Optional[str]:
         """Текст документа (инструкция в PDF): модель переписывает его дословно. Один раз на вид
-        заданий — дальше текст хранится в knowledge/."""
-        model = self.models[0] if self.models else LLM_MODEL
+        заданий — дальше текст хранится в knowledge/. Модель — DOCUMENT_MODEL (читает PDF сама),
+        не первая из лестницы: GLM и подобные PDF не понимают."""
+        model = DOCUMENT_MODEL if self._openrouter else (self.models[0] if self.models else LLM_MODEL)
         content = [{"type": "text", "text": _READ_DOC_PROMPT},
                    {"type": "file", "file": {"filename": filename, "file_data":
                                              f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"}}]

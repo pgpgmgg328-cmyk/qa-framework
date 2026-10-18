@@ -158,10 +158,30 @@ class KnowledgeBase:
                         state.pool_title, best.title, best_score * 100)
             self._pools[state.pool_key] = best
             return best
+        twin = self._same_title(state)
+        if twin is not None:
+            logger.info("Вид задания «%s»: те же заголовок и разделы формы — использую его знания", twin.title)
+            self._pools[state.pool_key] = twin
+            return twin
         pool = PoolKnowledge(key=state.pool_key, title=state.pool_title or "Задание",
                              signature=list(state.pool_signature))
         self._pools[state.pool_key] = pool
         return pool
+
+    def _same_title(self, state: PageState) -> Optional[PoolKnowledge]:
+        """Вид с тем же длинным заголовком задания и теми же заголовками формы — тот же вид, даже если
+        в тексте вариантов данные задания («Бренд PEBEO - верный»): из них ключ не совпадает.
+        Из нескольких таких — тот, о котором больше известно. Вид по адресу (Ozon, ключ «u…») — только по
+        адресу: проекты с одинаковым заголовком там разные."""
+        if state.pool_key.startswith("u"):
+            return None
+        heads = {p for p in state.pool_signature if p.startswith("h:")}
+        title = normalize_text(state.pool_title)
+        if len(title) < 15 or not heads:
+            return None
+        same = [c for c in {id(c): c for c in self._pools.values()}.values()
+                if normalize_text(c.title) == title and {p for p in c.signature if p.startswith("h:")} == heads]
+        return max(same, key=lambda c: (c.has_instruction, len(c.lessons), c.train_total), default=None)
 
     # ------------------------------------------------------------------
     # Обновление
