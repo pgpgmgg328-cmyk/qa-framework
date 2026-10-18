@@ -112,7 +112,10 @@ def parse_args() -> argparse.Namespace:
 if __name__ == "__main__":
     args = parse_args()
     try:
-        validate_config(require_llm=not args.record)
+        from config import GEMINI_API_KEY
+
+        # помощник с ключом Google AI Studio ходит в Gemini напрямую — ключ OpenRouter ему не нужен
+        validate_config(require_llm=not args.record and not (args.assist and GEMINI_API_KEY))
     except ValueError as exc:
         logger.error("Конфигурация некорректна: %s", exc)
         sys.exit(2)

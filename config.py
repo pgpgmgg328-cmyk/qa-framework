@@ -151,6 +151,13 @@ LLM_MODEL: str = LLM_MODELS[0]
 # Режим помощника (--assist): модель подсказок в текстовых заданиях. Пусто — первая модель LLM_MODEL.
 # В текстовом задании нет фото — запрос маленький, и сильная модель обходится недорого
 ASSIST_MODEL: str = openrouter_model(os.getenv("ASSIST_MODEL", "")) or LLM_MODEL
+# Бесплатный ключ Gemini API (Google AI Studio, aistudio.google.com): помощник ходит в Gemini напрямую,
+# баланс OpenRouter не тратится. Из России — через VPN или LLM_PROXY. Модель — GEMINI_MODEL, по умолчанию
+# ASSIST_MODEL без «google/» (google/gemini-3.1-flash-lite → gemini-3.1-flash-lite)
+GEMINI_API_KEY: str = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta/openai/"
+GEMINI_MODEL: str = (os.getenv("GEMINI_MODEL", "").strip()
+                     or (ASSIST_MODEL.split("/", 1)[1] if ASSIST_MODEL.startswith("google/") else "gemini-2.5-flash"))
 # Лестница: переход к следующей модели, когда в тренировке у текущей верно с первого раза меньше
 # этой доли ответов (решение — после LADDER_MIN_TASKS заданий на этой модели или раньше, если
 # порог уже недостижим). Модель, к которой перешли, решает не меньше LADDER_MIN_TASKS заданий,

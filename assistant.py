@@ -21,7 +21,7 @@ from playwright.async_api import Error as PlaywrightError, Frame
 
 from agent import Agent, TaskIdentity, _INSTRUCTION_RE, _is_task_url
 from browser_controller import BrowserController, is_connection_lost
-from config import ASSIST_MODEL, MAX_STEPS_PER_TASK
+from config import ASSIST_MODEL, GEMINI_API_KEY, GEMINI_MODEL, MAX_STEPS_PER_TASK
 from dom_parser import ASSIST_PANEL_ID, DomParser, _plain_text
 from knowledge import KnowledgeBase
 from models import ActionType, DecisionContext, ElementKind, LLMDecision, PageState
@@ -112,7 +112,9 @@ class Assistant:
     def __init__(self, *, browser: Optional[BrowserController] = None, llm: Optional[LLMConnector] = None,
                  knowledge: Optional[KnowledgeBase] = None, interval: float = 1.0) -> None:
         self._browser = browser or BrowserController(headless=False)
-        self._llm = llm or LLMConnector()
+        # ключ Google AI Studio — напрямую в Gemini (баланс OpenRouter не тратится), иначе OpenRouter
+        self._llm = llm or (LLMConnector(provider="gemini") if GEMINI_API_KEY else LLMConnector())
+        self._model = GEMINI_MODEL if getattr(self._llm, "provider", "") == "gemini" else ASSIST_MODEL
         self._knowledge = knowledge or KnowledgeBase()
         self._interval = interval
         self._identity: Optional[TaskIdentity] = None
@@ -130,7 +132,7 @@ class Assistant:
         logger.info("=" * 60)
         logger.info("РЕЖИМ ПОМОЩНИКА. Решаете вы; в текстовых заданиях модель (%s) подсвечивает ответ «← ИИ» "
                     "и объясняет его в панели справа вверху. Помощник ничего не нажимает. Задания с фото, "
-                    "записью и поиском — ваши, подсказки там нет.", ASSIST_MODEL)
+                    "записью и поиском — ваши, подсказки там нет.", self._model)
         logger.info("Закончить: закройте окно браузера или нажмите Ctrl+C в терминале.")
         logger.info("=" * 60)
         async with self._browser:
@@ -212,7 +214,7 @@ class Assistant:
 
     async def _ask(self, state: PageState) -> tuple[list[str], LLMDecision]:
         pool = self._knowledge.for_state(state)
-        context = DecisionContext(knowledge=self._knowledge.prompt_text(pool), model=ASSIST_MODEL,
+        context = DecisionContext(knowledge=self._knowledge.prompt_text(pool), model=self._model,
                                   step_in_task=1, steps_left=MAX_STEPS_PER_TASK)
         started = time.monotonic()
         decision = await self._llm.decide(state, context)
@@ -237,8 +239,7 @@ class Assistant:
             el = next((e for e in state.elements if e.text == step.target_text), el)
         return el
 
-    @staticmethod
-    def _panel(state: PageState, keys: list[str], decision: LLMDecision) -> tuple[str, list[str]]:
+    def _panel(self, state: PageState, keys: list[str], decision: LLMDecision) -> tuple[str, list[str]]:
         labels = [state.by_key(k).label() for k in keys if state.by_key(k) is not None]
         if not labels:
             return "ИИ: без подсказки", [decision.reasoning or decision.observation or "Модель не выбрала ответ."]
@@ -248,7 +249,7 @@ class Assistant:
             lines.append(f"Почему: {why}")
         lines.append(f"Уверенность: {round(decision.confidence * 100)}%"
                      + (" — проверьте сами" if decision.confidence < 0.7 else ""))
-        return f"ИИ ({ASSIST_MODEL.split('/')[-1]})", lines
+        return f"ИИ ({self._model.split('/')[-1]})", lines
 
     def _how_to(self, state: PageState, reason: str) -> tuple[str, list[str]]:
         """Задание с фото или поиском — решает человек; панель — выжимка инструкции «как решать»
@@ -263,7 +264,7 @@ class Assistant:
         task = self._briefing.get(pool.key)
         brief = getattr(self._llm, "brief_instruction", None)
         if task is None and brief is not None:
-            self._briefing[pool.key] = asyncio.create_task(brief(pool.instruction, ASSIST_MODEL))
+            self._briefing[pool.key] = asyncio.create_task(brief(pool.instruction, self._model))
         elif task is not None and task.done():
             text = None if task.cancelled() or task.exception() else task.result()
             if text:

@@ -49,6 +49,8 @@ from config import (
     LLM_TIMEOUT,
     LLM_VISION,
     LLM_VISION_DETAIL,
+    GEMINI_API_KEY,
+    GEMINI_BASE_URL,
     OPENROUTER_API_KEY,
     OPENROUTER_BASE_URL,
     OPENROUTER_REFERER,
@@ -496,14 +498,19 @@ class DecisionParseError(ValueError):
 class LLMConnector:
     """Клиент OpenRouter (OpenAI-совместимый API)."""
 
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "openrouter") -> None:
+        # provider="gemini" — напрямую в Gemini API по бесплатному ключу Google AI Studio (режим помощника):
+        # баланс OpenRouter не тратится; поля, которые понимает только OpenRouter, не отправляются
+        self.provider = provider
+        self._openrouter = provider == "openrouter"
         self._client = openai.AsyncOpenAI(
-            api_key=OPENROUTER_API_KEY,
-            base_url=OPENROUTER_BASE_URL,
+            api_key=OPENROUTER_API_KEY if self._openrouter else GEMINI_API_KEY,
+            base_url=OPENROUTER_BASE_URL if self._openrouter else GEMINI_BASE_URL,
             timeout=LLM_TIMEOUT,          # v2: дефолт SDK 600 с — зависший запрос блокировал агента
             max_retries=LLM_MAX_RETRIES,  # 429/5xx/обрывы соединения — с экспоненциальной паузой
             # необязательные заголовки OpenRouter (атрибуция приложения)
-            default_headers={"HTTP-Referer": OPENROUTER_REFERER, "X-Title": "T-Work Agent"},
+            default_headers=({"HTTP-Referer": OPENROUTER_REFERER, "X-Title": "T-Work Agent"}
+                             if self._openrouter else None),
             http_client=_proxy_client(LLM_PROXY) if LLM_PROXY else None,
         )
         self._vision_enabled = True
@@ -523,7 +530,7 @@ class LLMConnector:
         self._last_error: Optional[Exception] = None
         self._last_usage: Any = None
         logger.info(
-            "LLM (OpenRouter): %s%s%s",
+            "LLM (%s): %s%s%s", "OpenRouter" if self._openrouter else "Gemini API, ключ Google AI Studio",
             f"модель {LLM_MODEL}" if len(LLM_MODELS) == 1 else "лестница моделей " + " → ".join(LLM_MODELS),
             f", перепроверка: {LLM_CHECK_MODEL}" if LLM_CHECK_MODEL else "",
             f", через прокси {_hide_password(LLM_PROXY)}" if LLM_PROXY else "",
@@ -801,10 +808,11 @@ class LLMConnector:
         }
         if params.temperature:
             kwargs["temperature"] = temperature
-        extra: dict[str, Any] = {"usage": {"include": True}}          # точная стоимость вызова в ответе
-        if params.reasoning:
-            extra["reasoning"] = {"effort": params.reasoning[0]}
-        kwargs["extra_body"] = extra
+        if self._openrouter:
+            extra: dict[str, Any] = {"usage": {"include": True}}      # точная стоимость вызова в ответе
+            if params.reasoning:
+                extra["reasoning"] = {"effort": params.reasoning[0]}
+            kwargs["extra_body"] = extra
         self._last_error = None
         try:
             response = await self._call(lambda: self._client.chat.completions.create(**kwargs), patience)
@@ -1113,8 +1121,9 @@ class LLMConnector:
         kwargs: dict[str, Any] = {
             "model": model, "max_tokens": 1200, "temperature": 0.0,
             "messages": [{"role": "user", "content": _BRIEF_PROMPT + "\n\nИНСТРУКЦИЯ:\n" + instruction[:60000]}],
-            "extra_body": {"usage": {"include": True}},
         }
+        if self._openrouter:
+            kwargs["extra_body"] = {"usage": {"include": True}}
         try:
             response = await self._call(lambda: self._client.chat.completions.create(**kwargs))
         except (openai.OpenAIError, LLMUnavailable) as exc:

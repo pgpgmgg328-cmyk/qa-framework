@@ -261,3 +261,32 @@ def test_photo_task_shows_how_to_solve_from_instruction(tmp_path, monkeypatch):
     restored = KnowledgeBase(str(tmp_path / "knowledge"))
     restored._load()
     assert any("Другой вес" in p.brief for p in restored._pools.values())        # переживает перезапуск
+
+
+def test_gemini_key_sends_requests_to_google_without_openrouter_fields(tmp_path, monkeypatch):
+    """Ключ Google AI Studio (GEMINI_API_KEY): помощник ходит в Gemini API напрямую — адрес Google,
+    модель Gemini, без полей OpenRouter; баланс OpenRouter не участвует. Сеть не нужна: отправка подменена."""
+    import types
+
+    import assistant as assistant_module
+    import openrouter_connector
+
+    monkeypatch.setattr(openrouter_connector, "GEMINI_API_KEY", "test-gemini-key")
+    llm = openrouter_connector.LLMConnector(provider="gemini")
+    assert "generativelanguage.googleapis.com" in str(llm._client.base_url)
+    sent: list[dict] = []
+
+    async def fake_create(**kwargs):
+        sent.append(kwargs)
+        message = types.SimpleNamespace(content="• Сверяйте бренд\n• Другой вес — другой товар")
+        return types.SimpleNamespace(choices=[types.SimpleNamespace(message=message)], usage=None)
+
+    monkeypatch.setattr(llm._client.chat.completions, "create", fake_create)
+    brief = run(llm.brief_instruction("Сравнивайте бренд и вес. " * 30, "gemini-3.1-flash-lite"))
+    assert brief.startswith("• Сверяйте бренд")
+    assert sent[0]["model"] == "gemini-3.1-flash-lite" and "extra_body" not in sent[0]
+
+    monkeypatch.setattr(assistant_module, "GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setattr(openrouter_connector, "GEMINI_API_KEY", "test-gemini-key")
+    helper = Assistant(browser=object(), knowledge=KnowledgeBase(str(tmp_path)))
+    assert helper._llm.provider == "gemini" and not helper._model.startswith("google/")
