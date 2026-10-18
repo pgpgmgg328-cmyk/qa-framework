@@ -86,7 +86,7 @@ def parse_args() -> argparse.Namespace:
         help="режим помощника: решаете вы, в текстовых заданиях модель подсвечивает ответ и объясняет его",
     )
     parser.add_argument(
-        "--platform", default=None, metavar="twork|ozon",
+        "--platform", default=None, metavar="twork|ozon|yandex",
         help="площадка на этот запуск (вместо строки PLATFORM в .env)",
     )
     parser.add_argument(
@@ -96,6 +96,11 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.assist and args.record:
         parser.error("--assist и --record одновременно нельзя: оба открывают одно окно браузера")
+    from config import PLATFORM
+
+    if not (args.assist or args.record) and not PLATFORM.agent_ready:
+        parser.error(f"на площадке {PLATFORM.title} агент сам задания пока не решает — запустите помощника: "
+                     f"--assist --platform {PLATFORM.key}")
     if args.url and not args.record:
         parser.error("--url работает только вместе с --record. Решать задания на другой площадке: "
                      "PLATFORM=ozon в .env (адрес — TARGET_URL)")

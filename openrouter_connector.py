@@ -1106,6 +1106,25 @@ class LLMConnector:
             self.usage.add(usage, model_price(model))
         return ((response.choices[0].message.content or "").strip() if response.choices else "") or None
 
+    async def brief_instruction(self, instruction: str, model: str = "") -> Optional[str]:
+        """Выжимка инструкции проекта «как решать»: 5–8 коротких правил для человека (режим помощника,
+        задания с фото и поиском). Один раз на вид заданий — дальше хранится в knowledge/."""
+        model = model or (self.models[0] if self.models else LLM_MODEL)
+        kwargs: dict[str, Any] = {
+            "model": model, "max_tokens": 1200, "temperature": 0.0,
+            "messages": [{"role": "user", "content": _BRIEF_PROMPT + "\n\nИНСТРУКЦИЯ:\n" + instruction[:60000]}],
+            "extra_body": {"usage": {"include": True}},
+        }
+        try:
+            response = await self._call(lambda: self._client.chat.completions.create(**kwargs))
+        except (openai.OpenAIError, LLMUnavailable) as exc:
+            logger.warning("Выжимка инструкции моделью %s не получена: %s", model, _short_error(exc))
+            return None
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            self.usage.add(usage, model_price(model))
+        return ((response.choices[0].message.content or "").strip() if response.choices else "") or None
+
     async def _transcribe_by_listening(self, model: str, data: bytes, filename: str) -> Optional[str]:
         """Расшифровка моделью, которая слушает запись (Gemini): кроме слов, она отмечает гудки,
         автоответчик и синтезированный голос — для заданий «прослушайте звонок» это важно."""
@@ -1247,6 +1266,12 @@ _LISTEN_PROMPT = (
     "Больше ничего от себя не добавляй и не пересказывай.")
 
 
+_BRIEF_PROMPT = (
+    "Ниже — инструкция к проекту разметки. Человек решает задания сам и хочет короткую памятку: "
+    "как решать правильно. Напиши 5–8 пунктов по-русски, каждый — одна строка, начинается с «• ». "
+    "Только главное: что проверять и в каком порядке, частые ловушки, когда какой вариант ответа. "
+    "Без вступления и без заключения."
+)
 _READ_DOC_PROMPT = (
     "Это инструкция к заданиям разметки. Перепиши её текст полностью и дословно, по порядку: заголовки, "
     "абзацы, списки (каждый пункт с новой строки), таблицы — строками «| … |». Ничего не сокращай, не "

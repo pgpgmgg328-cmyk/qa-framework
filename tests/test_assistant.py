@@ -158,3 +158,106 @@ def test_platform_flag_is_read_before_settings():
     out = subprocess.run([sys.executable, "main.py", "--platform", "avito", "--assist"],
                          cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8")
     assert out.returncode == 2 and "PLATFORM='avito'" in out.stderr + out.stdout
+
+
+def test_yandex_task_in_foreign_frame_gets_hints(tmp_path, monkeypatch):
+    """Яндекс Задания: задание во фрейме другого домена (iframe-tasks.yandex), «Отправить» и «Выйти» —
+    на основной странице. Подсказки — внутри фрейма; подсказки клавиш («1», «q»…) модель не видит;
+    «Есть замечания» открывает флажки — модель спрашивается заново и подсказывает нарушение."""
+    from adapters.yandex_tasks import YandexTasksAdapter
+    from dom_parser import render_page
+    from tests.helpers import YANDEX_TASK_URL, install_yandex_routes
+
+    use_platform(monkeypatch, YandexTasksAdapter, YANDEX_TASK_URL)
+
+    class Moderator:
+        def __init__(self) -> None:
+            self.calls: list[PageState] = []
+
+        async def decide(self, state: PageState, context: DecisionContext) -> LLMDecision:
+            self.calls.append(state)
+            ok = [e for e in state.elements if e.text == "Всё хорошо"]
+            bad = [e for e in state.elements if e.text == "Есть замечания"]
+            steps = [(ok[0], "Всё хорошо"), (bad[1], "Есть замечания")]
+            banned = [e for e in state.visible_elements if e.text == "Запрещенная услуга"]
+            if banned:
+                steps.append((banned[0], "Запрещенная услуга"))
+            first, *rest = steps
+            return LLMDecision(reasoning="курсовые на заказ — запрещённая услуга", confidence=0.85,
+                               action=ActionType.CLICK, target_index=first[0].index, target_text=first[1],
+                               next_actions=[PlannedAction(action=ActionType.CLICK, target_index=e.index, target_text=t)
+                                             for e, t in rest])
+
+    async def scenario():
+        llm = Moderator()
+        assistant = Assistant(browser=BrowserController(on_context=install_yandex_routes), llm=llm,
+                              knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        async with assistant._browser:
+            await ticks(assistant, "подсказка")
+            frame = await assistant._browser.find_target_frame()
+            first = await frame.eval_on_selector_all("[data-ai-hint]", "els => els.map((e) => e.innerText.trim())")
+            # человек отметил «Есть замечания» во второй задаче — открылись флажки нарушений
+            await frame.locator(".task").nth(1).get_by_text("Есть замечания").click()
+            for _ in range(20):
+                await assistant.tick()
+                if len(llm.calls) > 1 and await frame.eval_on_selector_all("[data-ai-hint]", "els => els.length") == 3:
+                    break
+                await assistant._browser.page.wait_for_timeout(150)
+            second = await frame.eval_on_selector_all("[data-ai-hint]", "els => els.map((e) => e.innerText.trim())")
+            sent = await assistant._browser.page.evaluate("() => window.__sent || 0")
+            return frame.url, first, second, llm, sent
+
+    url, first, second, llm, sent = run(scenario())
+    assert "iframe-tasks.yandex" in url
+    assert first == ["Всё хорошо", "Есть замечания"]
+    assert len(llm.calls) == 2 and "Запрещенная услуга" in second and sent == 0
+    text, shown = render_page(llm.calls[0])
+    lines = text.splitlines()
+    assert "q" not in lines and "1" not in lines                       # подсказки клавиш — не текст задания
+    assert not any(e.text in ("Отправить", "Выйти") for e in shown)    # кнопки основной страницы — не во фрейме
+    assert "Курсовая на заказ недорого" in text and "Название услуги" in text
+
+
+def test_photo_task_shows_how_to_solve_from_instruction(tmp_path, monkeypatch):
+    """Задание с фото — ответ за человеком, но панель показывает выжимку инструкции «как решать»:
+    модель делает её один раз на вид заданий, дальше она берётся из базы знаний."""
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_TASK_URL)       # окно инструкции откроется само
+
+    class Briefer(ScriptedLLM):
+        def __init__(self) -> None:
+            super().__init__()
+            self.briefs: list[str] = []
+
+        async def brief_instruction(self, instruction: str, model: str = "") -> str:
+            self.briefs.append(instruction)
+            return "• Сравнивайте бренд, вкус и вес\n• Другой вес — другой товар"
+
+    async def scenario():
+        llm = Briefer()
+        assistant = Assistant(browser=BrowserController(on_context=ozon_routes([])), llm=llm,
+                              knowledge=KnowledgeBase(str(tmp_path / "knowledge")))
+        async with assistant._browser:
+            page = assistant._browser.page
+            await page.wait_for_selector("[data-testid=InstructionPopup]")
+            await ticks(assistant, "открыто окно")                     # инструкцию прочитал
+            await page.keyboard.press("Escape")
+            await ticks(assistant, "подсказка")
+            await page.click("[data-testid=TasksSendButton]")
+            await page.wait_for_selector("text=Морс Северный Бор")
+            for _ in range(30):
+                await assistant.tick()
+                panel = await page.inner_text(f"#{ASSIST_PANEL_ID}")
+                if "Другой вес" in panel:
+                    break
+                await page.wait_for_timeout(150)
+            return panel, llm
+
+    panel, llm = run(scenario())
+    assert "Задание ваше — как решать" in panel and "• Сравнивайте бренд, вкус и вес" in panel
+    assert "на странице фото" in panel
+    assert len(llm.briefs) == 1 and "Сравнение названий товаров" in llm.briefs[0]
+    saved = "\n".join(f.read_text(encoding="utf-8") for f in (tmp_path / "knowledge").glob("*.md"))
+    assert "## Как решать" in saved and "Другой вес — другой товар" in saved
+    restored = KnowledgeBase(str(tmp_path / "knowledge"))
+    restored._load()
+    assert any("Другой вес" in p.brief for p in restored._pools.values())        # переживает перезапуск

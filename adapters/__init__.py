@@ -17,6 +17,8 @@ class PlatformAdapter:
 
     key: ClassVar[str] = ""
     title: ClassVar[str] = ""
+    # агент-автомат здесь проверен; False — только помощник (--assist) и запись (--record)
+    agent_ready: ClassVar[bool] = True
     # имя настройки config.py → значение по умолчанию на этой площадке (тип — как у настройки)
     settings: ClassVar[dict[str, Any]] = {}
 
@@ -28,8 +30,9 @@ class PlatformAdapter:
 def platforms() -> dict[str, type[PlatformAdapter]]:
     from adapters.ozon_profit import OzonProfitAdapter
     from adapters.twork import TWorkAdapter
+    from adapters.yandex_tasks import YandexTasksAdapter
 
-    return {a.key: a for a in (TWorkAdapter, OzonProfitAdapter)}
+    return {a.key: a for a in (TWorkAdapter, OzonProfitAdapter, YandexTasksAdapter)}
 
 
 def get_platform(name: str) -> type[PlatformAdapter]:

@@ -113,6 +113,8 @@ _JS_MAX_ELEMENTS = 1500
 
 # панель режима помощника (--assist) поверх страницы задания: в снимок она не входит
 ASSIST_PANEL_ID = "ai-assist-panel"
+# пометка колонок в снимке («‖ столбец 1 из 2 (слева)», см. columnsOf в _JS_SNAPSHOT)
+COLUMN_MARK = "‖ столбец"
 
 _GENERATION = itertools.count(1)
 _WARNED_SELECTORS: set[str] = set()     # неверные селекторы из .env — предупреждение один раз
@@ -1673,7 +1675,7 @@ def _plain_text(lines: list[str]) -> str:
     out = []
     for line in lines:
         text = _PH_RE.sub(" ", line).strip()
-        if text:
+        if text and not text.startswith(COLUMN_MARK):        # «‖ столбец 1 из 2» — для модели, не текст
             out.append(re.sub(r"\s{2,}", " ", text))
     return "\n".join(out)
 

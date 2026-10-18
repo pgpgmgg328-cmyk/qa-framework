@@ -120,6 +120,7 @@ class Assistant:
         self._pending: Optional[asyncio.Task] = None
         self._hint: Optional[tuple[list[str], LLMDecision]] = None   # ключи элементов, решение модели
         self._asked = 0
+        self._briefing: dict[str, asyncio.Task] = {}   # вид задания → выжимка инструкции в работе
         self._stop = asyncio.Event()
 
     def stop(self) -> None:
@@ -184,7 +185,8 @@ class Assistant:
         reason = not_text_reason(state)
         if reason:
             self._form = form
-            await self._draw(frame, state, [], "Задание ваше", [f"Подсказки нет: {reason}."], muted=True)
+            title, lines = self._how_to(state, reason)
+            await self._draw(frame, state, [], title, lines, muted=True)
             return "не текстовое"
 
         if form != self._form:                               # новое задание или ответ открыл вопросы
@@ -247,6 +249,30 @@ class Assistant:
         lines.append(f"Уверенность: {round(decision.confidence * 100)}%"
                      + (" — проверьте сами" if decision.confidence < 0.7 else ""))
         return f"ИИ ({ASSIST_MODEL.split('/')[-1]})", lines
+
+    def _how_to(self, state: PageState, reason: str) -> tuple[str, list[str]]:
+        """Задание с фото или поиском — решает человек; панель — выжимка инструкции «как решать»
+        (делается один раз на вид заданий и хранится в knowledge/)."""
+        head = f"Ответ — ваш: {reason}."
+        pool = self._knowledge.for_state(state)
+        if pool is not None and pool.brief:
+            return "Задание ваше — как решать", [head, *pool.brief.splitlines()]
+        if pool is None or not pool.has_instruction:
+            return "Задание ваше", [head, "Откройте «Инструкцию» проекта — прочитаю правила и коротко покажу, "
+                                          "как решать."]
+        task = self._briefing.get(pool.key)
+        brief = getattr(self._llm, "brief_instruction", None)
+        if task is None and brief is not None:
+            self._briefing[pool.key] = asyncio.create_task(brief(pool.instruction, ASSIST_MODEL))
+        elif task is not None and task.done():
+            text = None if task.cancelled() or task.exception() else task.result()
+            if text:
+                self._knowledge.save_brief(pool, text)
+                logger.info("📘 Выжимка инструкции «%s» сохранена", pool.title[:60])
+                return "Задание ваше — как решать", [head, *pool.brief.splitlines()]
+            # не повторяем каждую секунду: до следующего запуска помощника — без выжимки
+            return "Задание ваше", [head, "Выжимку инструкции сделать не удалось (модель не ответила)."]
+        return "Задание ваше", [head, "Читаю инструкцию проекта — сейчас покажу, как решать."]
 
     def _read_instruction(self, state: PageState) -> None:
         """Человек открыл инструкцию — в базу знаний (один раз на вид заданий)."""

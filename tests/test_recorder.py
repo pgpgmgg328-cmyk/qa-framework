@@ -80,3 +80,34 @@ def test_recorder_captures_screens_actions_and_tabs(tmp_path):
     with zipfile.ZipFile(parts[0]) as archive:
         names = archive.namelist()
     assert any(n.endswith("frame.html") for n in names) and any(n.endswith("session.json") for n in names)
+
+
+def test_login_page_is_not_recorded(tmp_path, monkeypatch):
+    """Вход в аккаунт (Ozon ID, Яндекс ID): экран не записывается, введённые телефон и код — «***»."""
+    from adapters.ozon_profit import OzonProfitAdapter
+    from tests.helpers import OZON_LOGIN_URL, OZON_TASK_URL, ozon_routes, use_platform
+
+    use_platform(monkeypatch, OzonProfitAdapter, OZON_LOGIN_URL)
+
+    async def scenario():
+        controller = BrowserController(on_context=ozon_routes([]), headless=True)
+        recorder = Recorder(browser=controller, out_dir=tmp_path, interval=0.3)
+        task = asyncio.create_task(recorder.run())
+        await _wait(lambda: controller._page is not None and not controller.page.is_closed())
+        page = controller.page
+        await page.wait_for_selector("#phone")
+        await page.click("#phone")
+        await page.keyboard.type("+7 999 123-45-67")
+        await asyncio.sleep(1.2)
+        await page.goto(OZON_TASK_URL + "?instruction=0")
+        await _wait(lambda: recorder.snapshots >= 1)
+        recorder.stop()
+        await task
+
+    run(scenario())
+    session = next(p for p in tmp_path.iterdir() if p.is_dir())
+    everything = "".join(f.read_text(encoding="utf-8", errors="ignore") for f in session.rglob("*")
+                         if f.is_file() and f.suffix in (".json", ".txt", ".html", ".jsonl"))
+    assert "999 123" not in everything and "999123" not in everything
+    metas = [json.loads(m.read_text(encoding="utf-8")) for m in session.glob("*/meta.json")]
+    assert metas and not any("sso." in m["page_url"] for m in metas)

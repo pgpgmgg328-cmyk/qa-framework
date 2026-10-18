@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Workspace</title>
+<!-- Копия СТРУКТУРЫ фрейма задания Яндекс Заданий (https://iframe-tasks.yandex/), снятой с записи:
+     div.task-suite > div.task[data-microtask-index], блоки «Категория» слева и «Название услуги»
+     справа, варианты — label.radio/label.checkbox с input, подсказка клавиши div.field__hotkey,
+     «Есть замечания» открывает флажки нарушений. Услуги вымышлены. -->
+<style>
+  body { margin: 0; font: 15px/1.4 Arial, sans-serif; }
+  .task { border: 1px solid #ddd; border-radius: 8px; margin: 12px; padding: 12px; }
+  .wrapper { display: flex; gap: 24px; }
+  .box { flex: 1; }
+  .categories { display: block; }
+  .categories__title, .categories__title_main { display: block; font-weight: bold; }
+  .field { display: flex; align-items: center; gap: 6px; margin: 4px 0; }
+  .field__hotkey { width: 18px; color: #888; font-size: 12px; }
+  .marks__row_second { display: none; }
+  .marks__row_second.open { display: block; }
+</style>
+</head>
+<body>
+<div class="task-suite"></div>
+<script>
+const TASKS = [
+  { category: 'Уборка и клининг > Мытьё окон', name: 'Мытьё окон в квартирах' },
+  { category: 'Репетиторы и обучение > Другое', name: 'Курсовая на заказ недорого' },
+];
+const VIOLATIONS = [['q', 'Не услуга'], ['w', 'Контактные данные'], ['e', 'Запрещенная услуга'], ['y', 'Неверная категория']];
+const field = (key, type, name, value, label) => `<div class="field field_type_${type}"><div class="field__hotkey">${key}</div>
+  <div class="field__impl"><label class="${type} ${type}_size_M"><span class="${type}__i"><input type="${type}" name="${name}" value="${value}"></span>
+  ${label}</label></div></div>`;
+document.querySelector('.task-suite').innerHTML = TASKS.map((t, i) => `
+  <div class="task" data-microtask-index="${i}"><div class="wrapper">
+    <div class="box box_left"><div class="categories"><span class="categories__title">Категория</span>
+      <span class="categories__info">${t.category}</span></div></div>
+    <div class="box box_right"><div class="categories"><span class="categories__title_main">Название услуги</span>
+      <span class="categories__info">${t.name}</span></div>
+      <div class="marks"><div class="marks__row_first">
+        ${field('1', 'radio', 'quality_' + i, 'OK', 'Всё хорошо')}${field('2', 'radio', 'quality_' + i, 'BAD', 'Есть замечания')}
+      </div><div class="marks__row_second">
+        ${VIOLATIONS.map(([k, v], j) => field(k, 'checkbox', 'v_' + i + '_' + j, 'on', v)).join('')}
+      </div></div>
+    </div></div></div>`).join('');
+document.querySelectorAll('.task').forEach((task) => task.addEventListener('change', () => {
+  const bad = task.querySelector('input[value="BAD"]').checked;
+  task.querySelector('.marks__row_second').classList.toggle('open', bad);
+}));
+</script>
+</body>
+</html>

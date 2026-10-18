@@ -292,6 +292,33 @@ def ozon_routes(answers: list) -> Callable[[BrowserContext], Awaitable[None]]:
     return install
 
 
+# ---------------------------------------------------------------------------
+# Яндекс Задания: основная страница https://tasks.yandex.test/task/<проект>/<id> — верхняя панель
+# («Инструкция», «Выйти», «Отправить») и фрейм задания с ДРУГОГО домена iframe-tasks.yandex.test
+# ---------------------------------------------------------------------------
+YANDEX_TASK_URL = "https://tasks.yandex.test/task/6100001/00006773ef--demo"
+YANDEX_WRAPPER = """<!doctype html><html lang="ru"><head><meta charset="utf-8"><title>Яндекс Задания</title></head>
+<body style="margin:0"><div style="height:56px;display:flex;gap:16px;align-items:center;padding:0 16px">
+<span>9:39</span><span>Модерация названий услуг</span><button type="button">Инструкция</button></div>
+<iframe src="https://iframe-tasks.yandex.test/" style="width:1000px;height:640px;border:0"></iframe>
+<div style="display:flex;justify-content:space-between;padding:8px 16px"><button type="button">Выйти</button>
+<button type="button" onclick="window.__sent = (window.__sent || 0) + 1">Отправить</button></div></body></html>"""
+
+
+async def install_yandex_routes(context: BrowserContext) -> None:
+    async def handle(route: Route) -> None:
+        host = urlsplit(route.request.url).hostname or ""
+        if host == "tasks.yandex.test":
+            await route.fulfill(status=200, content_type="text/html; charset=utf-8", body=YANDEX_WRAPPER)
+        elif host == "iframe-tasks.yandex.test":
+            await route.fulfill(status=200, content_type="text/html; charset=utf-8",
+                                body=(FIXTURES / "yandex_task.html").read_text(encoding="utf-8"))
+        else:
+            await route.abort()
+
+    await context.route("**/*", handle)
+
+
 def run(coro: Coroutine[Any, Any, Any]) -> Any:
     return asyncio.run(coro)
 

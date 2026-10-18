@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import logging
 import time
 import zipfile
@@ -237,6 +238,15 @@ def pack_session(session_dir: Path, limit_bytes: int = _PART_LIMIT_BYTES) -> lis
     return parts
 
 
+# Страницы входа в аккаунт (Яндекс ID, Ozon ID и т.п.): их экраны и ввод в запись не попадают
+_LOGIN_URL_RE = re.compile(r"(^https?://(passport|sso|id|auth|login)\.|/(auth|login|signin|oauth|passport)(/|\?|$))",
+                           re.IGNORECASE)
+
+
+def is_login_page(url: str) -> bool:
+    return bool(_LOGIN_URL_RE.search(url or ""))
+
+
 class Recorder:
     """Наблюдатель: снимает каждый новый экран и действия человека, сам ничего не нажимает."""
 
@@ -260,7 +270,8 @@ class Recorder:
         self._stop = asyncio.Event()
         self._background: set[asyncio.Task] = set()
         self._watched_pages: set[int] = set()
-        self._active_hint: Optional[Page] = None    # вкладка с последним действием человека / новая вкладка
+        self._active_hint: Optional[Page] = None
+        self._login_logged = False    # вкладка с последним действием человека / новая вкладка
         self._external_shots = 0
         self._nav_count = 0
         self.snapshots = 0
@@ -353,6 +364,12 @@ class Recorder:
     async def _tick(self) -> None:
         await self._collect_events()
         await self._follow_active_tab()
+        if is_login_page(self._browser.page.url):
+            if not self._login_logged:
+                self._login_logged = True
+                logger.info("   🔒 страница входа — не записываю (телефон, коды и пароли не сохраняются)")
+            return
+        self._login_logged = False
         frame, where = await self._pick_frame()
         state = await DomParser(frame).parse(quiet=True)
         signature = self._signature(state, frame, where)
@@ -530,8 +547,13 @@ class Recorder:
                     continue
                 if events:
                     self._active_hint = page
+                login = is_login_page(frame.url) or is_login_page(page.url)
                 for event in events:
                     event["page"] = page_index
+                    if login:          # вход в аккаунт: телефон, код из SMS, пароль не сохраняем
+                        for key in ("value", "text"):
+                            if event.get(key):
+                                event[key] = "***"
                     self._attach(event)
 
     def _attach(self, event: dict[str, Any]) -> None:

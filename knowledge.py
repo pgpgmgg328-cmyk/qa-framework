@@ -33,6 +33,7 @@ logger = logging.getLogger("twork.knowledge")
 
 _SECTIONS = {
     "инструкция": "instruction",
+    "как решать": "brief",
     "пояснения к вариантам": "tooltips",
     "уроки из тренировки": "lessons",
     "статистика тренировки": "stats",
@@ -62,6 +63,7 @@ class PoolKnowledge:
     path: Optional[Path] = None
     instruction: str = ""
     instruction_meta: str = ""
+    brief: str = ""                 # выжимка инструкции «как решать» (режим помощника)
     tooltips: dict[str, str] = field(default_factory=dict)
     lessons: list[str] = field(default_factory=list)
     notes: str = ""
@@ -185,6 +187,11 @@ class KnowledgeBase:
             logger.info("📘 Инструкция «%s» перечитана: было %d симв., стало %d", pool.title, before, len(text))
         else:
             logger.info("📘 Инструкция «%s» сохранена (%d симв.)", pool.title, len(text))
+        self._write(pool)
+
+    def save_brief(self, pool: PoolKnowledge, brief: str) -> None:
+        """Выжимка инструкции «как решать» (режим помощника) — один раз на вид заданий."""
+        pool.brief = brief.strip()
         self._write(pool)
 
     def save_tooltips(self, pool: PoolKnowledge, tips: dict[str, str]) -> None:
@@ -395,6 +402,9 @@ def _render(pool: PoolKnowledge) -> str:
             lines.append(f"_{pool.instruction_meta}_")
             lines.append("")
         lines.append(pool.instruction)
+    lines += ["", "## Как решать"]
+    if pool.brief:
+        lines.append(pool.brief)
     lines += ["", "## Пояснения к вариантам"]
     lines += [f"- «{k}»: {v}" for k, v in pool.tooltips.items()]
     lines += ["", "## Уроки из тренировки"]
@@ -440,6 +450,7 @@ def _parse(path: Path) -> PoolKnowledge:
         pool.instruction_meta = body[0].strip().strip("_")
         body = body[1:]
     pool.instruction = _clean_block("\n".join(body))
+    pool.brief = _clean_block("\n".join(sections.get("brief", [])))
     for line in sections.get("tooltips", []):
         m = re.match(r"^-\s*«(.+?)»:\s*(.+)$", line.strip())
         if m:
