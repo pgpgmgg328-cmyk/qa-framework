@@ -146,6 +146,7 @@ def test_twork_task_in_frame_gets_hints(tmp_path, monkeypatch):
 
 def test_platform_flag_is_read_before_settings():
     """--platform на один запуск: читается до config.py (настройки площадки берутся при импорте)."""
+    import os
     import subprocess
     import sys
     from pathlib import Path
@@ -156,7 +157,8 @@ def test_platform_flag_is_read_before_settings():
     assert _platform_from_argv(["--platform=ozon", "--assist"]) == "ozon"
     assert _platform_from_argv(["--assist"]) == ""
     out = subprocess.run([sys.executable, "main.py", "--platform", "avito", "--assist"],
-                         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8")
+                         cwd=Path(__file__).resolve().parents[1], capture_output=True, text=True, encoding="utf-8",
+                         env={**os.environ, "PYTHONIOENCODING": "utf-8"})   # вывод по-русски — не в кодировке консоли
     assert out.returncode == 2 and "PLATFORM='avito'" in out.stderr + out.stdout
 
 

@@ -7,7 +7,7 @@ import os
 import threading
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Optional
+from typing import Callable, Optional
 
 import openrouter_connector as oc
 from models import ActionType, DecisionContext, ElementKind, PageState, ParsedElement, VisionImage
@@ -42,9 +42,9 @@ BLOCKED = (403, {"success": False, "error": "Access denied by security policy."}
 
 @contextmanager
 def fake_openai(responses: list[tuple[int, dict]], models: Optional[list[dict]] = None,
-                key: Optional[dict] = None):
-    """Фейковый OpenRouter. POST — ответы по очереди из responses; GET /models — список моделей
-    с ценами; GET /key — расход и лимит ключа."""
+                key: Optional[dict] = None, respond: Optional[Callable[[dict], tuple[int, dict]]] = None):
+    """Фейковый OpenRouter. POST — ответы по очереди из responses (или respond(тело запроса));
+    GET /models — список моделей с ценами; GET /key — расход и лимит ключа."""
     requests: list[dict] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -71,7 +71,7 @@ def fake_openai(responses: list[tuple[int, dict]], models: Optional[list[dict]] 
                 body = {"_raw": raw}
             body["_path"] = self.path
             requests.append(body)
-            status, payload = responses.pop(0)
+            status, payload = respond(body) if respond else responses.pop(0)
             data = json.dumps(payload).encode()
             self.send_response(status)
             self.send_header("Content-Type", "application/json")
@@ -139,6 +139,32 @@ def test_reasoning_model_parameters_are_adapted(monkeypatch):
     assert "max_tokens" in requests[0] and "max_completion_tokens" in requests[1]
     assert "temperature" in requests[1] and "temperature" not in requests[2]
     assert all("reasoning_effort" not in r and r["reasoning"] == {"effort": "none"} for r in requests)
+
+
+def test_parallel_refusals_drop_one_reasoning_value(monkeypatch):
+    """Запросы идут параллельно и оба получают отказ на reasoning.effort=none (GLM с фото:
+    «Reasoning is mandatory») — вычеркнуть только none, а не всю очередь none → minimal → low."""
+    import asyncio
+
+    use_model(monkeypatch, "z-ai/glm-test")
+    both_sent = threading.Barrier(2, timeout=5)
+
+    def respond(body: dict) -> tuple[int, dict]:
+        if body["reasoning"]["effort"] == "none":
+            both_sent.wait()                    # оба запроса с none в пути одновременно
+            return bad_request("Reasoning is mandatory for this endpoint and cannot be disabled.")
+        return completion(json.dumps(VALID))
+
+    async def two():
+        return await asyncio.gather(connector.decide(state(), DecisionContext()),
+                                    connector.decide(state(), DecisionContext()))
+
+    with fake_openai([], respond=respond) as (url, requests):
+        connector = make_connector(monkeypatch, url)
+        decisions = run(two())
+    assert all(d.action == ActionType.OPEN for d in decisions)
+    assert sorted(r["reasoning"]["effort"] for r in requests) == ["minimal", "minimal", "none", "none"]
+    assert connector._params["z-ai/glm-test"].reasoning == ["minimal", "low"]
 
 
 def test_gpt5_models_get_their_parameters_at_once(monkeypatch):

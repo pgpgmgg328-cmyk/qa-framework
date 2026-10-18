@@ -808,20 +808,24 @@ class LLMConnector:
         }
         if params.temperature:
             kwargs["temperature"] = temperature
+        effort = params.reasoning[0] if params.reasoning else None
         if self._openrouter:
             extra: dict[str, Any] = {"usage": {"include": True}}      # точная стоимость вызова в ответе
-            if params.reasoning:
-                extra["reasoning"] = {"effort": params.reasoning[0]}
+            if effort:
+                extra["reasoning"] = {"effort": effort}
             kwargs["extra_body"] = extra
         self._last_error = None
         try:
             response = await self._call(lambda: self._client.chat.completions.create(**kwargs), patience)
         except openai.BadRequestError as exc:
             message = str(exc).lower()
-            if params.reasoning and "reasoning" in message:
-                dropped = params.reasoning.pop(0)
-                logger.info("Модель %s не принимает reasoning_effort=%s%s", model, dropped,
-                            f" — пробую {params.reasoning[0]}" if params.reasoning else " — отправляю без него")
+            if effort and "reasoning" in message:
+                # параллельные запросы получают отказ на одно и то же значение — вычеркнуть его один раз,
+                # а не всю очередь (иначе GLM с фото теряет и «low», который принимает)
+                if params.reasoning and params.reasoning[0] == effort:
+                    params.reasoning.pop(0)
+                    logger.info("Модель %s не принимает reasoning_effort=%s%s", model, effort,
+                                f" — пробую {params.reasoning[0]}" if params.reasoning else " — отправляю без него")
                 return await self._complete(messages, temperature, model, patience)
             if "max_tokens" in message and params.tokens_param == "max_tokens":
                 logger.warning("Модель %s требует max_completion_tokens — переключаюсь", model)

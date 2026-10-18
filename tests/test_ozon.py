@@ -100,7 +100,8 @@ def _config_in_subprocess(**env: str) -> dict:
             "'TARGET_URL', 'FRAME_KEYWORDS', 'ALLOW_MAIN_FRAME', 'TASK_URL_KEYWORDS', 'FINISH_BUTTON_TEXTS', "
             "'DIALOG_SELECTORS', 'PAGE_SKIP_SELECTORS', 'POOL_URL_RE')}, ensure_ascii=False))")
     out = subprocess.run([sys.executable, "-c", code], cwd=Path(__file__).resolve().parents[1],
-                         env={**os.environ, **env}, capture_output=True, text=True, encoding="utf-8", check=True)
+                         env={**os.environ, "PYTHONIOENCODING": "utf-8", **env},
+                         capture_output=True, text=True, encoding="utf-8", check=True)
     return json.loads(out.stdout.strip().splitlines()[-1])
 
 
@@ -132,10 +133,10 @@ def test_main_frame_switched_off_on_ozon_is_a_startup_error():
     code = "import config; config.validate_config(require_llm=False)"
     root = Path(__file__).resolve().parents[1]
     bad = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, encoding="utf-8",
-                         env={**os.environ, "PLATFORM": "ozon", "ALLOW_MAIN_FRAME": "false"})
+                         env={**os.environ, "PYTHONIOENCODING": "utf-8", "PLATFORM": "ozon", "ALLOW_MAIN_FRAME": "false"})
     assert bad.returncode != 0 and "ALLOW_MAIN_FRAME" in bad.stderr
     ok = subprocess.run([sys.executable, "-c", code], cwd=root, capture_output=True, text=True, encoding="utf-8",
-                        env={**os.environ, "PLATFORM": "", "ALLOW_MAIN_FRAME": "false"})
+                        env={**os.environ, "PYTHONIOENCODING": "utf-8", "PLATFORM": "", "ALLOW_MAIN_FRAME": "false"})
     assert ok.returncode == 0, ok.stderr
 
 
